@@ -17,7 +17,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "protect_core": True,
     "duplicate_policy": "new_number",
     "last_preset": "OldPopLounge",
-    "last_ocr_language": "영어",
+    "last_ocr_language": "자동 전체 언어 탐지",
 }
 
 THUMBNAIL_RESOLUTIONS: dict[str, tuple[int, int]] = {

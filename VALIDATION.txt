@@ -1,4 +1,4 @@
-CoverMorph Studio v0.5.3 validation
+CoverMorph Studio v0.5.4 validation
 
 Environment checked on this workstation:
 - Existing .venv reports Python 3.12.10 during pytest.
@@ -10,7 +10,7 @@ Completed:
 - requirements.txt install in existing .venv: PASS after network-restricted retry with approval
 - pip check: PASS
 - ruff check .: PASS
-- pytest: PASS, 47 passed and 1 optional AI test skipped
+- pytest: PASS, 50 passed and 1 optional AI test skipped
 - OpenCV smoke: PASS
   - CascadeClassifier loaded haarcascade_frontalface_default.xml
   - cv2.inpaint returned expected image shape
@@ -41,6 +41,9 @@ Completed:
   - 16:9 and 9:16 outputs have no black or white blank borders
   - protected pixel restoration
   - SDXL to natural extension to blur fallback order
+- Japanese OCR candidate test: PASS without model download using a deterministic Japanese detection fixture
+- OpenCV inpainting tests: PASS for NS/Telea comparison, adaptive padding, and feather blending
+- Shared preview/save renderer test: PASS for 16:9 and 9:16 output sizes
 - Settings tests: PASS
   - output folder save and restore
   - Korean and space path
@@ -48,8 +51,9 @@ Completed:
   - safe output folder open
   - corrupt settings.json recovery
 - GUI import and drag-and-drop package import smoke: PASS
-- Version check for v0.5.2 leftovers: PASS after this file update
+- Version check for v0.5.3 leftovers: PASS after this file update
 
 Not run on this workstation:
 - Full interactive GUI clicking/dragging test.
+- Actual EasyOCR Japanese weight inference for `ふたりが始まる。`, because Japanese weights were not cached.
 - Real SDXL, LaMa, and Real-ESRGAN model execution, because optional models/assets were not installed.

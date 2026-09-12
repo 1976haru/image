@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-title CoverMorph Studio v0.5.3 - Base Install
+title CoverMorph Studio v0.5.4 - Base Install
 cd /d "%~dp0"
 
 echo [1/5] Locating Python 3.11 or 3.12...

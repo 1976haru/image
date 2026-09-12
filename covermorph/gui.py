@@ -28,7 +28,7 @@ from .presets import PRESETS
 from .processor import (
     Rect,
     build_full_frame_outpaint_canvas,
-    detect_text_boxes_easyocr,
+    detect_text_boxes_multilang,
     inpaint_text_opencv,
     make_square,
     mask_pil_from_boxes,
@@ -75,8 +75,10 @@ OCR_LANGUAGE_LABELS = {
     "영어": ("en",),
     "한국어+영어": ("ko", "en"),
     "일본어+영어": ("ja", "en"),
+    "한국어+영어+일본어": ("ko", "en", "ja"),
+    "자동 전체 언어 탐지": ("en", "ja", "ko", "fr"),
 }
-PREVIEW_TABS = ["원본", "글자 제거 결과", "1:1 미리보기", "16:9 미리보기", "9:16 미리보기"]
+PREVIEW_TABS = ["원본", "OCR 마스크", "수동 마스크", "글자 제거 결과", "최종 결과", "1:1 미리보기", "16:9 미리보기", "9:16 미리보기"]
 OUTPUT_KEYS = {
     "square_1x1": "1:1 클린 커버",
     "thumbnail_16x9": "16:9 썸네일",
@@ -1199,7 +1201,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.status.configure(text="EasyOCR 준비 중입니다. 첫 실행이면 모델 다운로드가 진행될 수 있습니다.")
 
         def worker() -> None:
-            boxes = detect_text_boxes_easyocr(
+            boxes = detect_text_boxes_multilang(
                 img,
                 langs,
                 status_callback=lambda message: self.worker_queue.put({"type": "status", "message": message}),
@@ -1216,7 +1218,7 @@ class CoverMorphApp(_CoverMorphWindow):
                 return self.ai.inpaint(img, mask_pil_from_boxes(img.size, boxes))
             except Exception as exc:
                 write_exception(self.root_dir, "LaMa preview fallback", exc)
-        return inpaint_text_opencv(img, boxes), "OpenCV Telea"
+        return inpaint_text_opencv(img, boxes), "OpenCV NS/Telea (quality selected)"
 
     def preview_remove(self) -> None:
         state = self.current_state()
@@ -1340,8 +1342,26 @@ class CoverMorphApp(_CoverMorphWindow):
         base = state.clean_preview.copy() if state.clean_preview is not None else state.original.copy()
         if mode == "원본":
             return state.original.copy()
+        if mode == "OCR 마스크":
+            return self.overlay_mask(
+                state.original,
+                mask_pil_from_boxes(state.original.size, state.job.ocr_boxes),
+                "#facc15",
+            )
+        if mode == "수동 마스크":
+            return self.overlay_mask(
+                state.original,
+                mask_pil_from_boxes(state.original.size, state.job.manual_boxes),
+                "#fb7185",
+            )
         if mode == "글자 제거 결과":
             return base
+        if mode == "최종 결과":
+            if state.job.out_thumb:
+                return self.format_preview(state, base, "thumbnail", thumbnail_size(self.thumbnail_resolution.get()))
+            if state.job.out_shorts:
+                return self.format_preview(state, base, "shorts", (1080, 1920))
+            return make_square(base)
         if mode == "1:1 미리보기":
             return make_square(base)
         if mode == "16:9 미리보기":

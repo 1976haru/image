@@ -10,6 +10,7 @@ from covermorph.presets import PRESETS
 from covermorph.processor import (
     build_full_frame_outpaint_canvas,
     build_outpaint_canvas,
+    detect_text_boxes_multilang,
     inpaint_text_opencv,
     make_fit_original,
     make_shorts,
@@ -17,7 +18,9 @@ from covermorph.processor import (
     make_square,
     make_text_safe_landscape,
     mask_from_boxes,
+    merge_text_boxes,
     natural_background_extend,
+    render_full_frame_format,
     restore_protected_pixels,
     save_jpg,
 )
@@ -50,6 +53,22 @@ def test_mask_from_boxes() -> None:
     assert int(mask.max()) == 255
 
 
+def test_multilang_boxes_are_merged() -> None:
+    assert merge_text_boxes([[(10, 10, 40, 30)], [(35, 12, 60, 32)]]) == [(10, 10, 60, 32)]
+
+
+def test_japanese_ocr_candidate_and_removal_without_model_download(monkeypatch) -> None:
+    class FakeReader:
+        def readtext(self, _arr, detail=1, paragraph=False):
+            return [([(20, 20), (180, 20), (180, 55), (20, 55)], "ふたりが始まる。", 0.18)]
+
+    monkeypatch.setattr("covermorph.processor.easyocr_reader", lambda *_args, **_kwargs: FakeReader())
+    img = Image.new("RGB", (240, 100), (170, 170, 170))
+    boxes = detect_text_boxes_multilang(img, ("ja", "en"))
+    assert boxes
+    assert inpaint_text_opencv(img, boxes).size == img.size
+
+
 def test_opencv_text_removal_keeps_size() -> None:
     img = sample_image()
     out = inpaint_text_opencv(img, [(105, 165, 320, 240)])
@@ -67,6 +86,17 @@ def test_output_sizes() -> None:
     assert natural_background_extend(img, (1080, 1920), preset, "shorts").size == (1080, 1920)
     assert make_smart_crop(img, (1920, 1080)).size == (1920, 1080)
     assert make_fit_original(img, (1920, 1080)).size == (1920, 1080)
+
+
+def test_preview_renderer_is_shared_geometry_for_saved_formats() -> None:
+    img = sample_image()
+    preset = PRESETS["OldPopLounge"]
+    for kind, size in (("thumbnail", (1920, 1080)), ("shorts", (1080, 1920))):
+        preview, _ = render_full_frame_format(img, size, preset, kind, mode="natural")
+        saved_path = Path(".pytest_tmp") / f"{kind}_shared.jpg"
+        save_jpg(preview, saved_path)
+        with Image.open(saved_path) as saved:
+            assert saved.size == preview.size
 
 
 def test_jpg_save_and_reopen(tmp_path: Path) -> None:

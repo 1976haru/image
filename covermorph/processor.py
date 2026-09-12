@@ -43,7 +43,7 @@ def clear_easyocr_cache() -> None:
 def detect_text_boxes_easyocr(
     img: Image.Image,
     langs: Sequence[str] = ("en",),
-    min_conf: float = 0.22,
+    min_conf: float = 0.15,
     status_callback: StatusCallback | None = None,
 ) -> list[Rect]:
     try:
@@ -73,6 +73,57 @@ def detect_text_boxes_easyocr(
     return boxes
 
 
+def _boxes_overlap(left: Rect, right: Rect) -> bool:
+    intersection_width = max(0, min(left[2], right[2]) - max(left[0], right[0]))
+    intersection_height = max(0, min(left[3], right[3]) - max(left[1], right[1]))
+    intersection = intersection_width * intersection_height
+    if not intersection:
+        return False
+    left_area = max(1, (left[2] - left[0]) * (left[3] - left[1]))
+    right_area = max(1, (right[2] - right[0]) * (right[3] - right[1]))
+    return intersection / min(left_area, right_area) >= 0.10
+
+
+def merge_text_boxes(box_groups: Sequence[Sequence[Rect]]) -> list[Rect]:
+    """Merge overlapping OCR candidates from several language readers."""
+    merged: list[Rect] = []
+    for group in box_groups:
+        for box in group:
+            current = tuple(int(value) for value in box)
+            for index, existing in enumerate(merged):
+                if _boxes_overlap(existing, current):
+                    merged[index] = (
+                        min(existing[0], current[0]),
+                        min(existing[1], current[1]),
+                        max(existing[2], current[2]),
+                        max(existing[3], current[3]),
+                    )
+                    break
+            else:
+                merged.append(current)
+    return merged
+
+
+def detect_text_boxes_multilang(
+    img: Image.Image,
+    langs: Sequence[str],
+    status_callback: StatusCallback | None = None,
+) -> list[Rect]:
+    """Run the selected reader and language-specific helpers without aborting the job."""
+    requested = tuple(dict.fromkeys(langs))
+    groups: list[list[Rect]] = []
+    combinations = [requested]
+    for code in ("ja", "ko", "en", "fr"):
+        if code in requested and (code,) not in combinations:
+            combinations.append((code,))
+    for combination in combinations:
+        try:
+            groups.append(detect_text_boxes_easyocr(img, combination, status_callback=status_callback))
+        except (ImportError, RuntimeError, OSError, ValueError):
+            continue
+    return merge_text_boxes(groups)
+
+
 def mask_from_boxes(size: tuple[int, int], boxes: Sequence[Rect], dilation: int = 9) -> np.ndarray:
     width, height = size
     mask = np.zeros((height, width), dtype=np.uint8)
@@ -90,16 +141,50 @@ def mask_from_boxes(size: tuple[int, int], boxes: Sequence[Rect], dilation: int 
 
 
 def mask_pil_from_boxes(size: tuple[int, int], boxes: Sequence[Rect]) -> Image.Image:
-    return Image.fromarray(mask_from_boxes(size, boxes)).convert("L")
+    return Image.fromarray(adaptive_mask_from_boxes(size, boxes)).convert("L")
+
+
+def adaptive_mask_from_boxes(size: tuple[int, int], boxes: Sequence[Rect]) -> np.ndarray:
+    width, height = size
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for x1, y1, x2, y2 in boxes:
+        box_width = max(1, int(x2) - int(x1))
+        box_height = max(1, int(y2) - int(y1))
+        padding = max(3, min(48, int(max(box_width, box_height) * 0.14)))
+        left = max(0, min(width, int(x1) - padding))
+        top = max(0, min(height, int(y1) - padding))
+        right = max(0, min(width, int(x2) + padding))
+        bottom = max(0, min(height, int(y2) + padding))
+        if right > left and bottom > top:
+            cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
+    return mask
+
+
+def _inpaint_quality(candidate: np.ndarray, original: np.ndarray, mask: np.ndarray) -> float:
+    boundary = cv2.subtract(
+        cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1),
+        cv2.erode(mask, np.ones((5, 5), np.uint8), iterations=1),
+    )
+    pixels = boundary > 0
+    if not np.any(pixels):
+        return float("inf")
+    candidate_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+    original_gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(np.abs(candidate_gray[pixels].astype(np.float32) - original_gray[pixels].astype(np.float32))))
 
 
 def inpaint_text_opencv(img: Image.Image, boxes: Sequence[Rect], radius: int = 7) -> Image.Image:
     if not boxes:
         return img.copy()
     arr = pil_to_cv(img)
-    mask = mask_from_boxes(img.size, boxes, dilation=9)
-    result = cv2.inpaint(arr, mask, radius, cv2.INPAINT_TELEA)
-    return cv_to_pil(result)
+    mask = adaptive_mask_from_boxes(img.size, boxes)
+    ns = cv2.inpaint(arr, mask, max(3, radius), cv2.INPAINT_NS)
+    telea = cv2.inpaint(arr, mask, max(3, radius), cv2.INPAINT_TELEA)
+    result = ns if _inpaint_quality(ns, arr, mask) <= _inpaint_quality(telea, arr, mask) else telea
+    # A narrow feather hides the rectangular inpaint boundary without restoring text pixels.
+    soft_mask = cv2.GaussianBlur(mask, (0, 0), max(1.0, radius / 2)) / 255.0
+    blended = (result * soft_mask[..., None] + arr * (1.0 - soft_mask[..., None])).clip(0, 255).astype(np.uint8)
+    return cv_to_pil(blended)
 
 
 def detect_largest_face(img: Image.Image) -> Rect | None:
@@ -189,8 +274,17 @@ def _foreground_position(
 
 
 def _cover_background(img: Image.Image, size: tuple[int, int]) -> Image.Image:
-    bg = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS)
-    return bg.filter(ImageFilter.GaussianBlur(max(6, int(min(size) * 0.01))))
+    target_width, target_height = size
+    scale = min(target_width / img.width, target_height / img.height)
+    fg = img.resize(
+        (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    bg = Image.new("RGB", size, img.resize((1, 1), Image.Resampling.BILINEAR).getpixel((0, 0)))
+    x = (target_width - fg.width) // 2
+    y = (target_height - fg.height) // 2
+    _paste_axis_extensions(bg, fg, x, y)
+    return bg.filter(ImageFilter.GaussianBlur(max(2, int(min(size) * 0.003))))
 
 
 def _paste_axis_extensions(base: Image.Image, fg: Image.Image, x: int, y: int) -> None:

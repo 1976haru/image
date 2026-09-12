@@ -1,4 +1,4 @@
-# CoverMorph Studio v0.5.3
+# CoverMorph Studio v0.5.4
 
 CoverMorph Studio는 음원 커버 이미지를 `1:1` 클린 커버, `16:9` 유튜브 썸네일, `9:16` 숏츠/Reels/TikTok 이미지로 변환하는 Windows용 로컬 프로그램입니다. 기본 기능은 외부 API 없이 동작하며, 선택형 AI 도구를 설치하면 글자 제거, 업스케일, 자연 배경 확장을 더 고급 방식으로 처리합니다.
 
@@ -12,7 +12,7 @@ CoverMorph Studio는 음원 커버 이미지를 `1:1` 클린 커버, `16:9` 유�
 - 기본값인 `AI 자연 배경 확장`으로 16:9와 9:16 화면 전체 채우기
 - SDXL 실패 시 `자연 배경 확장` 이후 `블러 배경` 순서로 자동 fallback
 - EasyOCR 언어별 Reader 캐시: 영어, 한국어+영어, 일본어+영어
-- LaMa 선택형 글자 제거, 실패 시 OpenCV Telea fallback
+- LaMa 선택형 글자 제거, 실패 시 OpenCV NS/Telea 품질 비교 fallback
 - Real-ESRGAN 선택형 업스케일, 미설치 또는 실패 시 로컬 선명도 보정 fallback
 - 원본 핵심 영역 보호 및 SDXL 생성 후 보호 픽셀 복원
 - 출력 폴더, 출력 규격, 해상도, 프리셋, OCR 언어를 `config/settings.json`에 저장
@@ -36,7 +36,7 @@ CoverMorph Studio는 음원 커버 이미지를 `1:1` 클린 커버, `16:9` 유�
 INSTALL_AI_LAMA.bat
 ```
 
-LaMa가 설치되어 있으면 글자 제거에 우선 사용합니다. 실행 중 오류가 나면 프로그램은 멈추지 않고 OpenCV Telea로 전환합니다.
+LaMa가 설치되어 있으면 글자 제거에 우선 사용합니다. 실행 중 오류가 나면 프로그램은 멈추지 않고 OpenCV NS와 Telea 결과를 경계 품질로 비교해 선택합니다.
 
 ### SDXL AI 자연 배경 확장
 
@@ -202,8 +202,17 @@ Windows에서 `RUN_TESTS.bat`을 더블클릭하면 다음 검사를 실행합�
 BUILD_EXE.bat
 ```
 
-PyInstaller onedir 형태로 `dist\CoverMorphStudio_v0.5.3` 폴더가 생성됩니다. `customtkinter`, `tkinterdnd2`, 프리셋, `hub_manifest.json`, `tools` 안내 파일은 포함하지만, SDXL/LaMa 같은 대용량 선택형 AI 모델은 EXE에 강제로 포함하지 않습니다. EXE에서 Real-ESRGAN을 쓰려면 EXE 폴더 옆에 `tools` 폴더를 만들고 실행 파일과 모델을 넣으세요.
+PyInstaller onedir 형태로 `dist\CoverMorphStudio_v0.5.4` 폴더가 생성됩니다. `customtkinter`, `tkinterdnd2`, 프리셋, `hub_manifest.json`, `tools` 안내 파일은 포함하지만, SDXL/LaMa 같은 대용량 선택형 AI 모델은 EXE에 강제로 포함하지 않습니다. EXE에서 Real-ESRGAN을 쓰려면 EXE 폴더 옆에 `tools` 폴더를 만들고 실행 파일과 모델을 넣으세요.
 
 ## Playlist Studio Hub 연결
 
-`hub_manifest.json`의 버전은 `0.5.3`입니다. Playlist Studio Hub에서 로컬 앱을 등록할 때 이 저장소 폴더를 앱 경로로 지정하고, entrypoint가 `RUN.bat`인지 확인하세요.
+`hub_manifest.json`의 버전은 `0.5.4`입니다. Playlist Studio Hub에서 로컬 앱을 등록할 때 이 저장소 폴더를 앱 경로로 지정하고, entrypoint가 `RUN.bat`인지 확인하세요.
+
+## v0.5.4 안정화 변경
+
+- OCR 기본값은 `자동 전체 언어 탐지`이며 영어, 일본어, 한국어, 프랑스어 Reader를 조합별로 캐시합니다. 일본어가 포함되면 일본어 보조 Reader도 실행하고 겹친 박스를 병합합니다.
+- 글자 제거는 글자 크기 기반 마스크 패딩을 사용하고, LaMa -> OpenCV NS/Telea 비교 -> 주변 패치 fallback 순서로 처리합니다. 마스크 경계에는 feather를 적용합니다.
+- 9:16은 원본을 가로 기준으로 비율 유지 배치하고 위아래만 확장합니다. 전체 배경을 `ImageOps.fit`으로 늘리지 않으므로 원본 인물과 직선이 세로로 찌그러지지 않습니다. 16:9는 세로 기준으로 배치하고 좌우만 확장합니다.
+- 미리보기와 로컬 저장 fallback은 공통 `render_full_frame_format` 렌더러를 사용합니다. AI Outpainting이 실패하면 자연 edge extension, 마지막으로 Blur Canvas로 자동 전환하고 결과와 원인은 작업 JSON과 로그에 기록합니다.
+- 목록의 각 행에서 선택한 규격만 `개별 변환`할 수 있습니다. 완료 후 `결과 저장`으로 해당 행 결과만 다른 폴더로 내보내고 `폴더 열기`로 이미지별 결과 폴더를 열 수 있습니다.
+- 선택형 EasyOCR 일본어 가중치, LaMa, rembg, SDXL, Real-ESRGAN 실모델은 기본 설치에 포함되지 않습니다. 미설치/오류 시 기본 로컬 처리로 계속 진행합니다.

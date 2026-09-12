@@ -17,7 +17,7 @@ from .presets import PRESETS, ChannelPreset, preset_to_dict
 from .processor import (
     Rect,
     build_full_frame_outpaint_canvas,
-    detect_text_boxes_easyocr,
+    detect_text_boxes_multilang,
     inpaint_text_opencv,
     make_square,
     mask_pil_from_boxes,
@@ -245,7 +245,7 @@ def _detect_and_remove_text(
     if options.auto_remove_text:
         _emit(progress_callback, type="file_stage", status="OCR 처리 중")
         try:
-            detected_boxes = detect_text_boxes_easyocr(
+            detected_boxes = detect_text_boxes_multilang(
                 img,
                 options.ocr_languages,
                 status_callback=lambda message: _emit(progress_callback, type="status", message=message),
@@ -276,8 +276,8 @@ def _detect_and_remove_text(
 
     try:
         clean = inpaint_text_opencv(img, boxes)
-        metadata["text_removal_engine"] = "OpenCV Telea"
-        metadata["inpaint_engine"] = "OpenCV Telea"
+        metadata["text_removal_engine"] = "OpenCV NS/Telea (quality selected)"
+        metadata["inpaint_engine"] = "OpenCV NS/Telea (quality selected)"
         return clean, boxes, errors
     except Exception as exc:
         write_exception(root, "OpenCV inpaint failed", exc)

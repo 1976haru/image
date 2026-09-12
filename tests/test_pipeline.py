@@ -198,7 +198,7 @@ def test_job_json_contains_v053_metadata(tmp_path: Path) -> None:
     data = json.loads(job_json.read_text(encoding="utf-8"))
 
     assert result.status == "success"
-    assert data["program_version"] == __version__ == "0.5.3"
+    assert data["program_version"] == __version__ == "0.5.4"
     assert data["original_filename"] == "cover.jpg"
     assert data["ocr_languages"] == ["en"]
     assert data["text_removal_engine"] == "No text mask"
