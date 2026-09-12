@@ -27,6 +27,7 @@ from .processor import (
     restore_protected_pixels,
     save_jpg,
 )
+from .settings import resolve_duplicate_path, thumbnail_size
 
 DEFAULT_OUTPAINT_PROMPT = (
     "natural photographic continuation of the existing background, "
@@ -56,6 +57,8 @@ class PipelineOptions:
     out_square: bool = True
     out_thumb: bool = True
     out_shorts: bool = True
+    thumbnail_resolution: str = "1920x1080"
+    duplicate_policy: str = "new_number"
     use_sdxl: bool = False
     protect_person: bool = True
     outpaint_prompt: str = DEFAULT_OUTPAINT_PROMPT
@@ -68,6 +71,7 @@ class FileResult:
     status: str
     success_outputs: int
     failed_outputs: int
+    skipped_outputs: int = 0
     failed_file_names: list[str] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -136,6 +140,13 @@ def _base_metadata(
         "upscale_engine": "Skipped",
         "thumbnail_16x9_engine": "Skipped",
         "shorts_9x16_engine": "Skipped",
+        "thumbnail_resolution": options.thumbnail_resolution,
+        "duplicate_policy": options.duplicate_policy,
+        "selected_outputs": {
+            "square_1x1": options.out_square,
+            "thumbnail_16x9": options.out_thumb,
+            "shorts_9x16": options.out_shorts,
+        },
         "sdxl_fallback": False,
         "sdxl_failures": [],
         "person_protection": options.protect_person,
@@ -260,9 +271,10 @@ def _local_format(
     img: Image.Image,
     preset: ChannelPreset,
     kind: str,
+    size: tuple[int, int],
 ) -> tuple[Image.Image, str]:
     if kind == "thumbnail":
-        return make_text_safe_landscape(img, preset), "Blur Canvas"
+        return make_text_safe_landscape(img, preset, size), "Blur Canvas"
     return make_shorts(img, preset), "Blur Canvas"
 
 
@@ -280,11 +292,11 @@ def _outpaint_or_fallback(
     person_engine = "Disabled" if not options.protect_person else "Pending"
 
     if not options.use_sdxl:
-        local, engine = _local_format(img, preset, kind)
+        local, engine = _local_format(img, preset, kind, size)
         return local, engine, errors, person_engine
 
     if not ai.sdxl_available():
-        local, _engine = _local_format(img, preset, kind)
+        local, _engine = _local_format(img, preset, kind, size)
         write_log(root, f"SDXL unavailable for {kind}; Blur Canvas fallback was used.")
         error = _error(
             "sdxl_unavailable",
@@ -314,7 +326,7 @@ def _outpaint_or_fallback(
         return restore_protected_pixels(generated, protect), f"{engine} + {person_engine}", errors, person_engine
     except Exception as exc:
         write_exception(root, f"SDXL {kind} fallback", exc)
-        local, _engine = _local_format(img, preset, kind)
+        local, _engine = _local_format(img, preset, kind, size)
         errors.append(
             _error(
                 "sdxl_failed",
@@ -332,16 +344,28 @@ def _save_output(
     metadata: dict[str, Any],
     key: str,
     engine: str,
-) -> tuple[int, int, list[dict[str, str]]]:
+) -> tuple[int, int, int, list[dict[str, str]]]:
+    resolved_path = resolve_duplicate_path(path, metadata.get("duplicate_policy", "new_number"))
+    if resolved_path is None:
+        metadata["outputs"][key] = {
+            "status": "skipped",
+            "path": str(path),
+            "engine": engine,
+            "reason": "File already exists",
+        }
+        return 0, 0, 1, []
+
     try:
-        save_jpg(img, path)
-        metadata["output_files"][key] = str(path)
-        metadata["outputs"][key] = {"status": "success", "path": str(path), "engine": engine}
-        return 1, 0, []
+        save_jpg(img, resolved_path)
+        metadata["output_files"][key] = str(resolved_path)
+        metadata["outputs"][key] = {"status": "success", "path": str(resolved_path), "engine": engine}
+        if resolved_path != path:
+            metadata["outputs"][key]["original_path"] = str(path)
+        return 1, 0, 0, []
     except OSError as exc:
         write_exception(root, f"Save failed {path.name}", exc)
         metadata["outputs"][key] = {"status": "failed", "path": str(path), "engine": engine, "error": str(exc)}
-        return 0, 1, [_error("save_failed", f"Could not save {path.name}.", str(exc))]
+        return 0, 1, 0, [_error("save_failed", f"Could not save {path.name}.", str(exc))]
 
 
 def process_image_file(
@@ -359,6 +383,7 @@ def process_image_file(
     errors: list[dict[str, str]] = []
     success_outputs = 0
     failed_outputs = 0
+    skipped_outputs = 0
     failed_names: list[str] = []
 
     try:
@@ -368,7 +393,16 @@ def process_image_file(
         metadata["status"] = "failed"
         metadata["errors"].append(_error("output_folder_create_failed", "Output folder could not be created.", str(exc)))
         metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
-        return FileResult(source, item_dir, "failed", 0, 1, [source.name], metadata["errors"], metadata)
+        return FileResult(
+            source=source,
+            item_dir=item_dir,
+            status="failed",
+            success_outputs=0,
+            failed_outputs=1,
+            failed_file_names=[source.name],
+            errors=metadata["errors"],
+            metadata=metadata,
+        )
 
     try:
         _check_cancel(cancel_event)
@@ -381,21 +415,48 @@ def process_image_file(
         metadata["errors"] = errors
         metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
         _write_job_json(app_root, item_dir, metadata)
-        return FileResult(source, item_dir, "failed", 0, 1, [source.name], errors, metadata)
+        return FileResult(
+            source=source,
+            item_dir=item_dir,
+            status="failed",
+            success_outputs=0,
+            failed_outputs=1,
+            failed_file_names=[source.name],
+            errors=errors,
+            metadata=metadata,
+        )
     except UnidentifiedImageError as exc:
         errors.append(_error("corrupt_image", "Source image is damaged or unsupported.", str(exc)))
         metadata["status"] = "failed"
         metadata["errors"] = errors
         metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
         _write_job_json(app_root, item_dir, metadata)
-        return FileResult(source, item_dir, "failed", 0, 1, [source.name], errors, metadata)
+        return FileResult(
+            source=source,
+            item_dir=item_dir,
+            status="failed",
+            success_outputs=0,
+            failed_outputs=1,
+            failed_file_names=[source.name],
+            errors=errors,
+            metadata=metadata,
+        )
     except OSError as exc:
         errors.append(_error("read_error", "Source image could not be read.", str(exc)))
         metadata["status"] = "failed"
         metadata["errors"] = errors
         metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
         _write_job_json(app_root, item_dir, metadata)
-        return FileResult(source, item_dir, "failed", 0, 1, [source.name], errors, metadata)
+        return FileResult(
+            source=source,
+            item_dir=item_dir,
+            status="failed",
+            success_outputs=0,
+            failed_outputs=1,
+            failed_file_names=[source.name],
+            errors=errors,
+            metadata=metadata,
+        )
 
     clean, _boxes, text_errors = _detect_and_remove_text(
         app_root,
@@ -424,7 +485,7 @@ def process_image_file(
         path = item_dir / f"{source.stem}_clean_1x1_1400x1400.jpg"
         try:
             _check_cancel(cancel_event)
-            ok, fail, save_errors = _save_output(
+            ok, fail, skipped, save_errors = _save_output(
                 app_root,
                 make_square(clean),
                 path,
@@ -434,6 +495,7 @@ def process_image_file(
             )
             success_outputs += ok
             failed_outputs += fail
+            skipped_outputs += skipped
             errors.extend(save_errors)
             if fail:
                 failed_names.append(path.name)
@@ -452,7 +514,9 @@ def process_image_file(
             }
 
     if options.out_thumb:
-        path = item_dir / f"{source.stem}_thumb_16x9_1920x1080.jpg"
+        thumb_size = thumbnail_size(options.thumbnail_resolution)
+        thumb_width, thumb_height = thumb_size
+        path = item_dir / f"{source.stem}_thumbnail_16x9_{thumb_width}x{thumb_height}.jpg"
         try:
             _check_cancel(cancel_event)
             thumb, engine, outpaint_errors, person_engine = _outpaint_or_fallback(
@@ -462,15 +526,16 @@ def process_image_file(
                 preset,
                 options,
                 "thumbnail",
-                (1920, 1080),
+                thumb_size,
                 preset.person_anchor_16x9,
             )
             metadata["thumbnail_16x9_engine"] = engine
             metadata["person_protection_engine"] = person_engine
             errors.extend(outpaint_errors)
-            ok, fail, save_errors = _save_output(app_root, thumb, path, metadata, "thumbnail_16x9", engine)
+            ok, fail, skipped, save_errors = _save_output(app_root, thumb, path, metadata, "thumbnail_16x9", engine)
             success_outputs += ok
             failed_outputs += fail
+            skipped_outputs += skipped
             errors.extend(save_errors)
             if fail:
                 failed_names.append(path.name)
@@ -507,9 +572,10 @@ def process_image_file(
             if metadata["person_protection_engine"] in {"Pending", "Disabled"}:
                 metadata["person_protection_engine"] = person_engine
             errors.extend(outpaint_errors)
-            ok, fail, save_errors = _save_output(app_root, shorts, path, metadata, "shorts_9x16", engine)
+            ok, fail, skipped, save_errors = _save_output(app_root, shorts, path, metadata, "shorts_9x16", engine)
             success_outputs += ok
             failed_outputs += fail
+            skipped_outputs += skipped
             errors.extend(save_errors)
             if fail:
                 failed_names.append(path.name)
@@ -534,7 +600,11 @@ def process_image_file(
     metadata["errors"] = errors
     metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
 
-    if success_outputs == 0:
+    metadata["skipped_outputs"] = skipped_outputs
+
+    if success_outputs == 0 and skipped_outputs > 0 and failed_outputs == 0:
+        status = "skipped"
+    elif success_outputs == 0:
         status = "failed"
         failed_names.append(source.name)
     elif errors or failed_outputs:
@@ -550,7 +620,17 @@ def process_image_file(
             f"inpaint={metadata['inpaint_engine']} | upscale={upscale_engine}"
         ),
     )
-    return FileResult(source, item_dir, status, success_outputs, failed_outputs, failed_names, errors, metadata)
+    return FileResult(
+        source=source,
+        item_dir=item_dir,
+        status=status,
+        success_outputs=success_outputs,
+        failed_outputs=failed_outputs,
+        skipped_outputs=skipped_outputs,
+        failed_file_names=failed_names,
+        errors=errors,
+        metadata=metadata,
+    )
 
 
 def process_files(
@@ -568,6 +648,7 @@ def process_files(
     failed_files = 0
     success_outputs = 0
     failed_outputs = 0
+    skipped_outputs = 0
 
     for index, source in enumerate(files, 1):
         if cancel_event is not None and cancel_event.is_set():
@@ -605,6 +686,7 @@ def process_files(
                 status="failed",
                 success_outputs=0,
                 failed_outputs=1,
+                skipped_outputs=0,
                 failed_file_names=[source.name],
                 errors=[_error("unexpected_error", "Unexpected processing error.", str(exc))],
                 metadata={},
@@ -613,10 +695,11 @@ def process_files(
         results.append(result)
         if result.status == "success":
             success_files += 1
-        else:
+        elif result.status != "skipped":
             failed_files += 1
         success_outputs += result.success_outputs
         failed_outputs += result.failed_outputs
+        skipped_outputs += result.skipped_outputs
         _emit(
             progress_callback,
             type="file_done",
@@ -628,6 +711,7 @@ def process_files(
             failed_files=failed_files,
             success_outputs=success_outputs,
             failed_outputs=failed_outputs,
+            skipped_outputs=skipped_outputs,
             failed_file_names=result.failed_file_names,
         )
 
@@ -640,5 +724,6 @@ def process_files(
         failed_files=failed_files,
         success_outputs=success_outputs,
         failed_outputs=failed_outputs,
+        skipped_outputs=skipped_outputs,
     )
     return results

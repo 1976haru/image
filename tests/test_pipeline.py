@@ -113,7 +113,7 @@ def test_corrupt_image_is_reported_and_json_is_written(tmp_path: Path) -> None:
     assert data["status"] == "failed"
 
 
-def test_job_json_contains_v051_metadata(tmp_path: Path) -> None:
+def test_job_json_contains_v052_metadata(tmp_path: Path) -> None:
     source = make_input(tmp_path / "cover.jpg")
     options = PipelineOptions(
         output_dir=tmp_path / "out",
@@ -129,7 +129,7 @@ def test_job_json_contains_v051_metadata(tmp_path: Path) -> None:
     data = json.loads(job_json.read_text(encoding="utf-8"))
 
     assert result.status == "success"
-    assert data["program_version"] == __version__ == "0.5.1"
+    assert data["program_version"] == __version__ == "0.5.2"
     assert data["original_filename"] == "cover.jpg"
     assert data["ocr_languages"] == ["en"]
     assert data["text_removal_engine"] == "No text mask"
@@ -138,6 +138,118 @@ def test_job_json_contains_v051_metadata(tmp_path: Path) -> None:
     assert data["shorts_9x16_engine"] == "Blur Canvas"
     assert data["status"] == "success"
     assert set(data["output_files"]) == {"square_1x1", "thumbnail_16x9", "shorts_9x16"}
+
+
+def test_thumbnail_only_generates_only_thumbnail(tmp_path: Path) -> None:
+    source = make_input(tmp_path / "cover.jpg")
+    options = PipelineOptions(
+        output_dir=tmp_path / "out",
+        auto_remove_text=False,
+        prefer_esrgan=False,
+        out_square=False,
+        out_thumb=True,
+        out_shorts=False,
+    )
+
+    result = process_image_file(source, options, BaseFakeAI(), tmp_path)
+
+    assert result.success_outputs == 1
+    assert set(result.metadata["output_files"]) == {"thumbnail_16x9"}
+    assert "_thumbnail_16x9_1920x1080" in Path(result.metadata["output_files"]["thumbnail_16x9"]).name
+
+
+def test_shorts_only_generates_only_shorts(tmp_path: Path) -> None:
+    source = make_input(tmp_path / "cover.jpg")
+    options = PipelineOptions(
+        output_dir=tmp_path / "out",
+        auto_remove_text=False,
+        prefer_esrgan=False,
+        out_square=False,
+        out_thumb=False,
+        out_shorts=True,
+    )
+
+    result = process_image_file(source, options, BaseFakeAI(), tmp_path)
+
+    assert result.success_outputs == 1
+    assert set(result.metadata["output_files"]) == {"shorts_9x16"}
+
+
+def test_thumbnail_and_shorts_generate_two_files_only(tmp_path: Path) -> None:
+    source = make_input(tmp_path / "cover.jpg")
+    options = PipelineOptions(
+        output_dir=tmp_path / "out",
+        auto_remove_text=False,
+        prefer_esrgan=False,
+        out_square=False,
+        out_thumb=True,
+        out_shorts=True,
+    )
+
+    result = process_image_file(source, options, BaseFakeAI(), tmp_path)
+
+    assert result.success_outputs == 2
+    assert set(result.metadata["output_files"]) == {"thumbnail_16x9", "shorts_9x16"}
+
+
+def test_all_three_output_formats_generate_three_files(tmp_path: Path) -> None:
+    source = make_input(tmp_path / "cover.jpg")
+    options = PipelineOptions(
+        output_dir=tmp_path / "out",
+        auto_remove_text=False,
+        prefer_esrgan=False,
+        out_square=True,
+        out_thumb=True,
+        out_shorts=True,
+    )
+
+    result = process_image_file(source, options, BaseFakeAI(), tmp_path)
+
+    assert result.success_outputs == 3
+    assert set(result.metadata["output_files"]) == {"square_1x1", "thumbnail_16x9", "shorts_9x16"}
+
+
+def test_thumbnail_resolution_1280x720(tmp_path: Path) -> None:
+    source = make_input(tmp_path / "cover.jpg")
+    options = PipelineOptions(
+        output_dir=tmp_path / "out",
+        auto_remove_text=False,
+        prefer_esrgan=False,
+        out_square=False,
+        out_thumb=True,
+        out_shorts=False,
+        thumbnail_resolution="1280x720",
+    )
+
+    result = process_image_file(source, options, BaseFakeAI(), tmp_path)
+    path = Path(result.metadata["output_files"]["thumbnail_16x9"])
+
+    assert path.name.endswith("_thumbnail_16x9_1280x720.jpg")
+    with Image.open(path) as reopened:
+        assert reopened.size == (1280, 720)
+
+
+def test_duplicate_new_number_policy(tmp_path: Path) -> None:
+    source = make_input(tmp_path / "cover.jpg")
+    output_dir = tmp_path / "out"
+    existing = output_dir / "cover" / "cover_thumbnail_16x9_1920x1080.jpg"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"existing")
+    options = PipelineOptions(
+        output_dir=output_dir,
+        auto_remove_text=False,
+        prefer_esrgan=False,
+        out_square=False,
+        out_thumb=True,
+        out_shorts=False,
+        duplicate_policy="new_number",
+    )
+
+    result = process_image_file(source, options, BaseFakeAI(), tmp_path)
+    path = Path(result.metadata["output_files"]["thumbnail_16x9"])
+
+    assert path.name == "cover_thumbnail_16x9_1920x1080_02.jpg"
+    assert existing.read_bytes() == b"existing"
 
 
 def test_thumbnail_failure_does_not_stop_shorts(tmp_path: Path, monkeypatch) -> None:

@@ -251,10 +251,14 @@ def paste_subject_on_canvas(
     return bg
 
 
-def make_text_safe_landscape(img: Image.Image, preset: Any) -> Image.Image:
+def make_text_safe_landscape(
+    img: Image.Image,
+    preset: Any,
+    size: tuple[int, int] = (1920, 1080),
+) -> Image.Image:
     out = paste_subject_on_canvas(
         img,
-        (1920, 1080),
+        size,
         anchor=preset.person_anchor_16x9,
         subject_ratio=preset.person_ratio_16x9,
         safe_ratio=preset.text_safe_ratio_16x9,
