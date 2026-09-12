@@ -17,12 +17,21 @@ class AIBackends:
         self._sdxl = None
 
     def lama_available(self) -> bool:
+        if self.lama_python() is not None:
+            return True
         try:
             import simple_lama_inpainting  # noqa: F401
 
             return True
         except Exception:
             return False
+
+    def lama_python(self) -> Path | None:
+        for relative in (".venv_lama/Scripts/python.exe", ".venv_lama/bin/python"):
+            candidate = self.app_root / relative
+            if candidate.is_file() and (self.app_root / ".venv_lama/READY").is_file():
+                return candidate
+        return None
 
     def _runtime_roots(self) -> list[Path]:
         roots = [self.app_root, Path(sys.executable).resolve().parent, Path.cwd()]
@@ -160,9 +169,32 @@ class AIBackends:
             num_inference_steps=max(10, min(60, int(steps))),
             guidance_scale=7.0,
         ).images[0]
-        return result.resize(canvas.size, Image.Resampling.LANCZOS).convert("RGB"), "SDXL Outpainting"
+        if result.size != work_size:
+            raise ValueError("SDXL returned unexpected dimensions; distorted output rejected")
+        restored = result.resize(canvas.size, Image.Resampling.LANCZOS).convert("RGB")
+        return Image.composite(restored, canvas.convert("RGB"), mask.convert("L")), "SDXL Outpainting"
 
     def inpaint(self, img: Image.Image, mask: Image.Image) -> tuple[Image.Image, str]:
+        if mask.size != img.size:
+            raise ValueError("Restoration mask size differs from source")
+        isolated = self.lama_python()
+        if isolated is not None:
+            with tempfile.TemporaryDirectory(prefix="covermorph_lama_") as directory:
+                path = Path(directory)
+                img.convert("RGB").save(path / "input.png")
+                mask.convert("L").save(path / "mask.png")
+                proc = subprocess.run(
+                    [str(isolated), str(self.app_root / "scripts" / "lama_worker.py"), str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    check=False,
+                )
+                if proc.returncode or not (path / "output.png").is_file():
+                    raise RuntimeError((proc.stderr or proc.stdout or "LaMa failed")[-2000:])
+                with Image.open(path / "output.png") as opened:
+                    result = opened.convert("RGB")
+                return self.merge_restoration(img, result, mask), "LaMa isolated"
         if not self.lama_available():
             raise RuntimeError("LaMa unavailable")
         from simple_lama_inpainting import SimpleLama
@@ -170,7 +202,13 @@ class AIBackends:
         if self._lama is None:
             self._lama = SimpleLama()
         result = self._lama(img.convert("RGB"), mask.convert("L"))
-        return result.convert("RGB"), "LaMa"
+        return self.merge_restoration(img, result, mask), "LaMa"
+
+    @staticmethod
+    def merge_restoration(img: Image.Image, result: Image.Image, mask: Image.Image) -> Image.Image:
+        if result.size != img.size or mask.size != img.size:
+            raise ValueError("Restoration dimensions changed; output rejected")
+        return Image.composite(result.convert("RGB"), img.convert("RGB"), mask.convert("L"))
 
     def upscale(
         self,

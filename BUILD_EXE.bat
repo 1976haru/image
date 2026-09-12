@@ -12,7 +12,7 @@ echo [1/3] Installing build packages...
 if errorlevel 1 goto build_error
 
 echo [2/3] Building EXE...
-".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --onedir --name "CoverMorphStudio_v0.5.4" --collect-all "customtkinter" --collect-all "tkinterdnd2" --add-data "presets;presets" --add-data "hub_manifest.json;." --add-data "tools\README.txt;tools" "app.py"
+".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --onedir --name "CoverMorphStudio_v0.5.4" --collect-all "customtkinter" --collect-all "tkinterdnd2" --add-data "presets;presets" --add-data "scripts;scripts" --add-data "hub_manifest.json;." --add-data "tools\README.txt;tools" "app.py"
 if errorlevel 1 goto build_error
 
 echo [3/3] Done.

@@ -7,11 +7,19 @@ if not exist ".venv\Scripts\python.exe" goto no_venv
 ".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 12) else 1)"
 if errorlevel 1 goto unsupported_python
 
-echo Installing LaMa inpainting packages...
-".venv\Scripts\python.exe" -m pip install -r "requirements_ai_lama.txt"
+echo Creating isolated LaMa environment...
+if not exist ".venv_lama\Scripts\python.exe" ".venv\Scripts\python.exe" -m venv ".venv_lama"
 if errorlevel 1 goto install_error
+if exist ".venv_lama\READY" del ".venv_lama\READY"
+".venv_lama\Scripts\python.exe" -m pip install "simple-lama-inpainting==0.1.2"
+if errorlevel 1 goto install_error
+".venv_lama\Scripts\python.exe" -m pip check
+if errorlevel 1 goto install_error
+".venv_lama\Scripts\python.exe" -c "from simple_lama_inpainting import SimpleLama; from PIL import Image; SimpleLama()(Image.new('RGB',(64,64)), Image.new('L',(64,64),255))"
+if errorlevel 1 goto install_error
+echo ready> ".venv_lama\READY"
 
-echo SUCCESS: LaMa installation completed.
+echo SUCCESS: Isolated LaMa installation and smoke test completed.
 pause
 exit /b 0
 
