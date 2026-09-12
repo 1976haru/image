@@ -1,0 +1,5 @@
+Pillow>=10.4
+numpy>=1.26
+opencv-python>=4.10
+customtkinter>=5.2
+easyocr>=1.7

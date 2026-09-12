@@ -1,0 +1,25 @@
+{
+  "app_id": "covermorph-studio",
+  "name": "CoverMorph Studio",
+  "version": "0.5.0",
+  "category": "image",
+  "entrypoint": "RUN.bat",
+  "description": "AI-assisted cover to clean-cover/thumbnail/shorts batch pipeline",
+  "capabilities": [
+    "ocr_text_detection",
+    "lama_inpainting_optional",
+    "opencv_fallback",
+    "realesrgan_ncnn_optional",
+    "sdxl_outpainting_optional",
+    "rembg_person_segmentation_optional",
+    "original_person_pixel_restore",
+    "person_protection",
+    "text_safe_zone",
+    "thumbnail_16x9",
+    "shorts_9x16",
+    "cover_1x1",
+    "batch_processing",
+    "before_after",
+    "logging"
+  ]
+}

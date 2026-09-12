@@ -1,0 +1,16 @@
+app.py: OK
+covermorph/logger.py: OK
+covermorph/gui.py: OK
+covermorph/ai_plugins.py: OK
+covermorph/__init__.py: OK
+covermorph/presets.py: OK
+covermorph/processor.py: OK
+CoverMorph Studio v0.5 validation
+
+- Python compileall: PASS
+- Outpaint canvas 1920x1080: PASS
+- Protected pixel compositing: PASS
+- 1:1 output 1400x1400: PASS
+- 16:9 output 1920x1080: PASS
+- 9:16 output 1080x1920: PASS
+- SDXL/rembg are optional and use automatic local fallback when unavailable.
