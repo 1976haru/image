@@ -1248,6 +1248,7 @@ class CoverMorphApp(_CoverMorphWindow):
         state.job.manual_boxes = ()
         state.job.ocr_boxes = ()
         state.clean_preview = None
+        state.result = None
         state.job.status = "대기"
         self.refresh_image_table()
         self.draw_preview()
@@ -1279,6 +1280,7 @@ class CoverMorphApp(_CoverMorphWindow):
         if img_x2 - img_x1 > 5 and img_y2 - img_y1 > 5:
             state.job.manual_boxes = (*state.job.manual_boxes, (img_x1, img_y1, img_x2, img_y2))
             state.clean_preview = None
+            state.result = None
         self.drag_start = None
         self.draw_preview()
 
@@ -1296,9 +1298,10 @@ class CoverMorphApp(_CoverMorphWindow):
             return
         try:
             preview = self.preview_image_for_state(state)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             write_exception(self.root_dir, "Preview render", exc)
             self.status.configure(text=f"미리보기 생성 실패: {exc}")
+            self.canvas.create_text(30, 40, text=str(exc), anchor="nw", fill="#cbd5e1", width=600)
             return
 
         canvas_width = max(100, self.canvas.winfo_width())
@@ -1380,6 +1383,12 @@ class CoverMorphApp(_CoverMorphWindow):
         preset = PRESETS.get(state.job.preset_name, PRESETS["OldPopLounge"])
         anchor = preset.person_anchor_16x9 if kind == "thumbnail" else preset.person_anchor_9x16
         mode = state.job.extension_mode
+        if mode == "ai_natural" and state.result is not None:
+            key = "thumbnail_16x9" if kind == "thumbnail" else "shorts_9x16"
+            result_path = state.result.metadata.get("output_files", {}).get(key)
+            if result_path:
+                with Image.open(result_path) as opened:
+                    return opened.convert("RGB")
         out, _engine = render_full_frame_format(
             img,
             size,

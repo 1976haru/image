@@ -150,7 +150,7 @@ def adaptive_mask_from_boxes(size: tuple[int, int], boxes: Sequence[Rect]) -> np
     for x1, y1, x2, y2 in boxes:
         box_width = max(1, int(x2) - int(x1))
         box_height = max(1, int(y2) - int(y1))
-        padding = max(3, min(48, int(max(box_width, box_height) * 0.14)))
+        padding = max(3, min(12, int(min(box_width, box_height) * 0.06)))
         left = max(0, min(width, int(x1) - padding))
         top = max(0, min(height, int(y1) - padding))
         right = max(0, min(width, int(x2) + padding))
@@ -178,6 +178,11 @@ def inpaint_text_opencv(img: Image.Image, boxes: Sequence[Rect], radius: int = 7
         return img.copy()
     arr = pil_to_cv(img)
     mask = adaptive_mask_from_boxes(img.size, boxes)
+    # Classical diffusion cannot reconstruct a large title over structured scenery.
+    # Refuse before producing the characteristic long streaks/triangular fills.
+    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    if np.mean(mask > 0) > 0.04 or float(distance.max()) > max(8, min(img.size) * 0.012):
+        raise ValueError("큰 글자 영역은 OpenCV로 자연스럽게 복원할 수 없습니다. LaMa 설치/실행 상태를 확인하세요.")
     ns = cv2.inpaint(arr, mask, max(3, radius), cv2.INPAINT_NS)
     telea = cv2.inpaint(arr, mask, max(3, radius), cv2.INPAINT_TELEA)
     result = ns if _inpaint_quality(ns, arr, mask) <= _inpaint_quality(telea, arr, mask) else telea
@@ -303,31 +308,16 @@ def _paste_axis_extensions(base: Image.Image, fg: Image.Image, x: int, y: int) -
         return
 
     visible = fg.crop((visible_left, visible_top, visible_right, visible_bottom))
-    strip = max(8, min(96, min(visible.size) // 5))
-
-    if crop_left > 0:
-        left_strip = visible.crop((0, 0, min(strip, visible.width), visible.height))
-        left_ext = ImageOps.mirror(left_strip).resize((crop_left, visible.height), Image.Resampling.BICUBIC)
-        base.paste(left_ext, (0, crop_top))
-    if crop_right < target_width:
-        right_strip = visible.crop((max(0, visible.width - strip), 0, visible.width, visible.height))
-        right_ext = ImageOps.mirror(right_strip).resize(
-            (target_width - crop_right, visible.height),
-            Image.Resampling.BICUBIC,
-        )
-        base.paste(right_ext, (crop_right, crop_top))
-    if crop_top > 0:
-        top_strip = visible.crop((0, 0, visible.width, min(strip, visible.height)))
-        top_ext = ImageOps.flip(top_strip).resize((visible.width, crop_top), Image.Resampling.BICUBIC)
-        base.paste(top_ext, (crop_left, 0))
-    if crop_bottom < target_height:
-        bottom_strip = visible.crop((0, max(0, visible.height - strip), visible.width, visible.height))
-        bottom_ext = ImageOps.flip(bottom_strip).resize(
-            (visible.width, target_height - crop_bottom),
-            Image.Resampling.BICUBIC,
-        )
-        base.paste(bottom_ext, (crop_left, crop_bottom))
-
+    # Reflect whole pixels; never enlarge a narrow strip into a wide region.
+    # This is a geometric preview, not AI-generated scenery.
+    pixels = np.asarray(visible.convert("RGB"))
+    padded = np.pad(
+        pixels,
+        ((crop_top, target_height - crop_bottom),
+         (crop_left, target_width - crop_right), (0, 0)),
+        mode="reflect" if min(visible.size) > 1 else "edge",
+    )
+    base.paste(Image.fromarray(padded), (0, 0))
 
 def _feather_mask(size: tuple[int, int], feather: int) -> Image.Image:
     width, height = size
@@ -481,6 +471,8 @@ def render_full_frame_format(
         if kind == "thumbnail":
             return make_text_safe_landscape(normalized, preset, size), "Blur Canvas"
         return make_shorts(normalized, preset), "Blur Canvas"
+    if mode == "ai_natural":
+        raise RuntimeError("AI 결과가 아직 없습니다. 개별 변환을 실행하고 AI 엔진 상태를 확인하세요.")
     return natural_background_extend(
         normalized,
         size,
@@ -553,7 +545,8 @@ def build_full_frame_outpaint_canvas(
             core_mask = ImageChops.lighter(core_mask, visible_person)
 
         visible_fg = fg.crop((crop_left, crop_top, crop_right, crop_bottom)).convert("RGBA")
-        protect.paste(visible_fg, (paste_x, paste_y), core_mask)
+        visible_fg.putalpha(core_mask)
+        protect.paste(visible_fg, (paste_x, paste_y))
 
         safe = max(10, int(min(size) * 0.018))
         protected_rect = (
@@ -606,13 +599,15 @@ def build_outpaint_canvas(
         mask = person_mask.convert("L").resize((fg_width, fg_height), Image.Resampling.LANCZOS)
     else:
         mask = Image.new("L", (fg_width, fg_height), 255)
-    protect.paste(fg.convert("RGBA"), (x, y), mask)
+    overlay = fg.convert("RGBA")
+    overlay.putalpha(mask)
+    protect.paste(overlay, (x, y))
     return base, gen_mask, protect
 
 
 def restore_protected_pixels(generated: Image.Image, protect: Image.Image) -> Image.Image:
     if protect.size != generated.size:
-        protect = protect.resize(generated.size, Image.Resampling.NEAREST)
+        raise ValueError("Generated image and protected pixels have different dimensions")
     out = generated.convert("RGBA")
     out.alpha_composite(protect.convert("RGBA"))
     return out.convert("RGB")

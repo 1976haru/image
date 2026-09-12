@@ -1,4 +1,12 @@
-CoverMorph Studio v0.5.4 validation
+Quality fix validation (supersedes historical report below)
+- pytest: 57 passed, 1 skipped.
+- compileall covermorph scripts: passed.
+- git diff --check: passed.
+- Real LaMa / SDXL / Japanese OCR inference: NOT RUN.
+- Interactive Windows GUI and installer execution: NOT RUN.
+- This is a source fix, not a visually validated restoration release.
+
+Historical upstream CoverMorph Studio v0.5.4 validation (not rerun in full)
 
 Environment checked on this workstation:
 - Existing .venv reports Python 3.12.10 during pytest.

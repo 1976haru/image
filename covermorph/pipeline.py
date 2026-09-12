@@ -286,7 +286,7 @@ def _detect_and_remove_text(
         )
         metadata["text_removal_engine"] = "Failed; original kept"
         metadata["inpaint_engine"] = "Failed; original kept"
-        return img.copy(), boxes, errors
+        raise RuntimeError("글자 제거 실패: 손상된 대체 결과를 저장하지 않습니다. " + str(exc)) from exc
 
 
 def _upscale_or_fallback(
@@ -391,28 +391,7 @@ def _outpaint_or_fallback(
         return local, engine, errors, person_engine
 
     if not options.use_sdxl or not ai.sdxl_available():
-        try:
-            local, engine = _local_format(img, preset, kind, size, options, mode="natural")
-            write_log(root, f"SDXL unavailable for {kind}; Natural extension fallback was used.")
-            errors.append(
-                _error(
-                    "sdxl_unavailable",
-                    f"SDXL unavailable for {kind}; Natural extension fallback was used.",
-                )
-            )
-            return local, f"Fallback natural extension ({engine})", errors, person_engine
-        except Exception as exc:
-            write_exception(root, f"Natural extension fallback failed {kind}", exc)
-            local, engine = _local_format(img, preset, kind, size, options, mode="blur")
-            errors.append(
-                _error(
-                    "natural_extension_failed",
-                    f"Natural extension failed for {kind}; Blur Canvas fallback was used.",
-                    str(exc),
-                )
-            )
-            return local, f"Fallback blur canvas ({engine})", errors, person_engine
-
+        raise RuntimeError("AI 자연 배경 확장을 사용할 수 없습니다. SDXL 설치/실행 상태를 확인하거나 스마트 크롭을 직접 선택하세요.")
     try:
         person_mask, person_engine, person_error = _person_mask_or_whole_foreground(
             root,
@@ -445,28 +424,7 @@ def _outpaint_or_fallback(
         return restore_protected_pixels(generated, protect), f"{engine} + {person_engine}", errors, person_engine
     except Exception as exc:
         write_exception(root, f"SDXL {kind} fallback", exc)
-        errors.append(
-            _error(
-                "sdxl_failed",
-                f"SDXL failed for {kind}; Natural extension fallback was used.",
-                str(exc),
-            )
-        )
-        try:
-            local, engine = _local_format(img, preset, kind, size, options, mode="natural")
-            return local, f"Fallback natural extension ({engine})", errors, person_engine
-        except Exception as natural_exc:
-            write_exception(root, f"Natural extension fallback failed {kind}", natural_exc)
-            local, engine = _local_format(img, preset, kind, size, options, mode="blur")
-            errors.append(
-                _error(
-                    "natural_extension_failed",
-                    f"Natural extension failed for {kind}; Blur Canvas fallback was used.",
-                    str(natural_exc),
-                )
-            )
-            return local, f"Fallback blur canvas ({engine})", errors, person_engine
-
+        raise RuntimeError("AI 배경 확장 실패: 늘린 배경으로 대체하지 않습니다. " + str(exc)) from exc
 
 def _save_output(
     root: Path,
@@ -597,14 +555,17 @@ def process_image_file(
             metadata,
         )
 
-    clean, _boxes, text_errors = _detect_and_remove_text(
-        app_root,
-        ai,
-        img,
-        options,
-        metadata,
-        progress_callback,
-    )
+    try:
+        clean, _boxes, text_errors = _detect_and_remove_text(
+            app_root, ai, img, options, metadata, progress_callback,
+        )
+    except RuntimeError as exc:
+        errors.append(_error("restoration_failed", "글자 복원 실패; 결과 저장 중단", str(exc)))
+        metadata.update(status="failed", errors=errors,
+                        processing_time_seconds=round(time.perf_counter() - start, 3))
+        _write_job_json(app_root, item_dir, metadata)
+        return FileResult(source, item_dir, "failed", 0,
+                          count_selected_outputs_for_options(options), 0, [source.name], errors, metadata)
     errors.extend(text_errors)
 
     if options.enhance:

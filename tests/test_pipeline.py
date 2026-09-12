@@ -34,6 +34,14 @@ class BaseFakeAI:
         raise RuntimeError("Real-ESRGAN executable unavailable")
 
 
+class SuccessfulLamaAI(BaseFakeAI):
+    def lama_available(self):
+        return True
+
+    def inpaint(self, img, mask):
+        return img.copy(), "Fake LaMa"
+
+
 class FailingSdxlAI(BaseFakeAI):
     def sdxl_available(self) -> bool:
         return True
@@ -112,14 +120,11 @@ def test_sdxl_error_falls_back_per_output(tmp_path: Path) -> None:
 
     result = process_image_file(source, options, FailingSdxlAI(), tmp_path)
 
-    assert result.status == "partial"
-    assert result.success_outputs == 2
-    assert result.metadata["sdxl_fallback"] is True
-    assert result.metadata["thumbnail_16x9_engine"] == "Fallback natural extension (Natural edge extension)"
-    assert result.metadata["shorts_9x16_engine"] == "Fallback natural extension (Natural edge extension)"
-    assert any(error["category"] == "sdxl_failed" for error in result.metadata["sdxl_failures"])
-    assert Path(result.metadata["output_files"]["thumbnail_16x9"]).is_file()
-    assert Path(result.metadata["output_files"]["shorts_9x16"]).is_file()
+    assert result.status == "failed"
+    assert result.success_outputs == 0
+    assert result.failed_outputs == 2
+    assert not result.metadata["output_files"]
+    assert any("model download failed" in error.get("detail", "") for error in result.errors)
 
 
 def test_sdxl_then_natural_extension_failure_falls_back_to_blur(tmp_path: Path, monkeypatch) -> None:
@@ -142,12 +147,9 @@ def test_sdxl_then_natural_extension_failure_falls_back_to_blur(tmp_path: Path, 
 
     result = process_image_file(source, options, FailingSdxlAI(), tmp_path)
 
-    assert result.success_outputs == 1
-    assert result.metadata["thumbnail_16x9_engine"] == "Fallback blur canvas (Blur Canvas)"
-    assert [error["category"] for error in result.metadata["extension_fallbacks"]] == [
-        "sdxl_failed",
-        "natural_extension_failed",
-    ]
+    assert result.status == "failed"
+    assert result.success_outputs == 0
+    assert not result.metadata["output_files"]
 
 
 def test_realesrgan_missing_falls_back_to_local_sharpen(tmp_path: Path) -> None:
@@ -369,7 +371,7 @@ def test_sdxl_success_restores_protected_pixels(tmp_path: Path) -> None:
 
 def test_single_image_job_selection_count(tmp_path: Path) -> None:
     source = make_input(tmp_path / "cover.jpg")
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=False)]
+    jobs = [ImageJob(source=source, extension_mode="smart_crop", out_square=False, out_thumb=True, out_shorts=False)]
 
     assert count_selected_outputs_for_jobs(jobs) == 1
     assert output_count_by_kind(jobs) == {"square_1x1": 0, "thumbnail_16x9": 1, "shorts_9x16": 0}
@@ -377,7 +379,7 @@ def test_single_image_job_selection_count(tmp_path: Path) -> None:
 
 def test_five_image_selection_counts(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"cover{i}.jpg") for i in range(5)]
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=True) for source in sources]
+    jobs = [ImageJob(source=source, extension_mode="smart_crop", out_square=False, out_thumb=True, out_shorts=True) for source in sources]
 
     assert len(jobs) == 5
     assert count_selected_outputs_for_jobs(jobs) == 10
@@ -386,7 +388,7 @@ def test_five_image_selection_counts(tmp_path: Path) -> None:
 
 def test_five_images_all_thumbnail(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"thumb{i}.jpg") for i in range(5)]
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=False) for source in sources]
+    jobs = [ImageJob(source=source, extension_mode="smart_crop", out_square=False, out_thumb=True, out_shorts=False) for source in sources]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
 
@@ -396,7 +398,7 @@ def test_five_images_all_thumbnail(tmp_path: Path) -> None:
 
 def test_five_images_all_shorts(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"shorts{i}.jpg") for i in range(5)]
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=False, out_shorts=True) for source in sources]
+    jobs = [ImageJob(source=source, extension_mode="smart_crop", out_square=False, out_thumb=False, out_shorts=True) for source in sources]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
 
@@ -406,7 +408,7 @@ def test_five_images_all_shorts(tmp_path: Path) -> None:
 
 def test_five_images_thumbnail_and_shorts(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"both{i}.jpg") for i in range(5)]
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=True) for source in sources]
+    jobs = [ImageJob(source=source, extension_mode="smart_crop", out_square=False, out_thumb=True, out_shorts=True) for source in sources]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
 
@@ -417,11 +419,11 @@ def test_five_images_thumbnail_and_shorts(tmp_path: Path) -> None:
 def test_per_image_different_output_formats(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"mix{i}.jpg") for i in range(5)]
     jobs = [
-        ImageJob(source=sources[0], out_square=False, out_thumb=True, out_shorts=True),
-        ImageJob(source=sources[1], out_square=False, out_thumb=False, out_shorts=True),
-        ImageJob(source=sources[2], out_square=False, out_thumb=True, out_shorts=False),
-        ImageJob(source=sources[3], out_square=True, out_thumb=False, out_shorts=False),
-        ImageJob(source=sources[4], out_square=True, out_thumb=True, out_shorts=True),
+        ImageJob(extension_mode="smart_crop", source=sources[0], out_square=False, out_thumb=True, out_shorts=True),
+        ImageJob(extension_mode="smart_crop", source=sources[1], out_square=False, out_thumb=False, out_shorts=True),
+        ImageJob(extension_mode="smart_crop", source=sources[2], out_square=False, out_thumb=True, out_shorts=False),
+        ImageJob(extension_mode="smart_crop", source=sources[3], out_square=True, out_thumb=False, out_shorts=False),
+        ImageJob(extension_mode="smart_crop", source=sources[4], out_square=True, out_thumb=True, out_shorts=True),
     ]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
@@ -449,7 +451,7 @@ def test_per_image_manual_masks_are_isolated(tmp_path: Path) -> None:
         ),
     ]
 
-    process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
+    process_image_jobs(jobs, local_options(tmp_path), tmp_path, SuccessfulLamaAI())
 
     data1 = json.loads((tmp_path / "out" / "mask1" / "covermorph_job.json").read_text(encoding="utf-8"))
     data2 = json.loads((tmp_path / "out" / "mask2" / "covermorph_job.json").read_text(encoding="utf-8"))
@@ -468,7 +470,7 @@ def test_per_image_ocr_and_manual_masks_are_combined(tmp_path: Path) -> None:
         ocr_boxes=((30, 30, 60, 60),),
     )
 
-    process_image_jobs([job], local_options(tmp_path), tmp_path, BaseFakeAI())
+    process_image_jobs([job], local_options(tmp_path), tmp_path, SuccessfulLamaAI())
 
     data = json.loads((tmp_path / "out" / "ocr" / "covermorph_job.json").read_text(encoding="utf-8"))
     assert data["text_boxes_total"] == 2
@@ -509,11 +511,11 @@ def test_one_image_failure_does_not_stop_remaining_images(tmp_path: Path) -> Non
 def test_planned_output_count_and_progress_ratio(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"plan{i}.jpg") for i in range(5)]
     jobs = [
-        ImageJob(source=sources[0], out_square=True, out_thumb=False, out_shorts=False),
-        ImageJob(source=sources[1], out_square=False, out_thumb=True, out_shorts=True),
-        ImageJob(source=sources[2], out_square=False, out_thumb=True, out_shorts=True),
-        ImageJob(source=sources[3], out_square=False, out_thumb=True, out_shorts=True),
-        ImageJob(source=sources[4], out_square=False, out_thumb=True, out_shorts=True),
+        ImageJob(extension_mode="smart_crop", source=sources[0], out_square=True, out_thumb=False, out_shorts=False),
+        ImageJob(extension_mode="smart_crop", source=sources[1], out_square=False, out_thumb=True, out_shorts=True),
+        ImageJob(extension_mode="smart_crop", source=sources[2], out_square=False, out_thumb=True, out_shorts=True),
+        ImageJob(extension_mode="smart_crop", source=sources[3], out_square=False, out_thumb=True, out_shorts=True),
+        ImageJob(extension_mode="smart_crop", source=sources[4], out_square=False, out_thumb=True, out_shorts=True),
     ]
 
     assert count_selected_outputs_for_jobs(jobs) == 9
@@ -548,8 +550,8 @@ def test_progress_counts_failed_outputs(tmp_path: Path) -> None:
 def test_multi_image_duplicate_file_names_get_new_numbers(tmp_path: Path) -> None:
     source = make_input(tmp_path / "same.jpg")
     jobs = [
-        ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=False),
-        ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=False),
+        ImageJob(source=source, extension_mode="smart_crop", out_square=False, out_thumb=True, out_shorts=False),
+        ImageJob(source=source, extension_mode="smart_crop", out_square=False, out_thumb=True, out_shorts=False),
     ]
 
     results = process_image_jobs(

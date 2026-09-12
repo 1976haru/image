@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from pathlib import Path
 
 import cv2
@@ -66,12 +68,13 @@ def test_japanese_ocr_candidate_and_removal_without_model_download(monkeypatch) 
     img = Image.new("RGB", (240, 100), (170, 170, 170))
     boxes = detect_text_boxes_multilang(img, ("ja", "en"))
     assert boxes
-    assert inpaint_text_opencv(img, boxes).size == img.size
+    with pytest.raises(ValueError, match="LaMa"):
+        inpaint_text_opencv(img, boxes)
 
 
 def test_opencv_text_removal_keeps_size() -> None:
     img = sample_image()
-    out = inpaint_text_opencv(img, [(105, 165, 320, 240)])
+    out = inpaint_text_opencv(img, [(105, 165, 108, 168)])
     assert out.size == img.size
     assert out.mode == "RGB"
 
