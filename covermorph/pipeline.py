@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from . import __version__
 from .ai_plugins import AIBackends
@@ -19,14 +19,11 @@ from .processor import (
     build_full_frame_outpaint_canvas,
     detect_text_boxes_easyocr,
     inpaint_text_opencv,
-    make_fit_original,
-    make_shorts,
-    make_smart_crop,
     make_square,
-    make_text_safe_landscape,
     mask_pil_from_boxes,
     mild_enhance,
-    natural_background_extend,
+    natural_background_extend,  # noqa: F401 - kept as a testable fallback seam
+    render_full_frame_format,
     restore_protected_pixels,
     save_jpg,
 )
@@ -134,7 +131,7 @@ def _dedupe_boxes(boxes: Sequence[Rect]) -> list[Rect]:
 
 def _load_image(path: Path) -> Image.Image:
     with Image.open(path) as opened:
-        return opened.convert("RGB")
+        return ImageOps.exif_transpose(opened).convert("RGB")
 
 
 def _write_job_json(root: Path, item_dir: Path, metadata: dict[str, Any]) -> None:
@@ -363,24 +360,17 @@ def _local_format(
             ),
             "Natural edge extension",
         )
-    if selected_mode == "smart_crop":
-        return (
-            make_smart_crop(
-                img,
-                size,
-                kind=kind,
-                anchor=anchor,
-                offset_x=options.subject_offset_x,
-                offset_y=options.subject_offset_y,
-                subject_scale=options.subject_scale,
-            ),
-            "Smart crop",
-        )
-    if selected_mode == "fit":
-        return make_fit_original(img, size), "Original fit"
-    if kind == "thumbnail":
-        return make_text_safe_landscape(img, preset, size), "Blur Canvas"
-    return make_shorts(img, preset), "Blur Canvas"
+    return render_full_frame_format(
+        img,
+        size,
+        preset,
+        kind,
+        mode=selected_mode,
+        anchor=anchor,
+        offset_x=options.subject_offset_x,
+        offset_y=options.subject_offset_y,
+        subject_scale=options.subject_scale,
+    )
 
 
 def _outpaint_or_fallback(

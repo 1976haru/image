@@ -358,6 +358,47 @@ def make_fit_original(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return bg
 
 
+def render_full_frame_format(
+    img: Image.Image,
+    size: tuple[int, int],
+    preset: Any,
+    kind: str,
+    mode: str = "ai_natural",
+    anchor: str = "center",
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    subject_scale: float = 1.0,
+) -> tuple[Image.Image, str]:
+    """Render one output format using the same geometry as the preview and fallback."""
+    normalized = img.convert("RGB")
+    if mode == "smart_crop":
+        return make_smart_crop(
+            normalized,
+            size,
+            kind=kind,
+            anchor=anchor,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            subject_scale=subject_scale,
+        ), "Smart crop"
+    if mode == "fit":
+        return make_fit_original(normalized, size), "Original fit"
+    if mode == "blur":
+        if kind == "thumbnail":
+            return make_text_safe_landscape(normalized, preset, size), "Blur Canvas"
+        return make_shorts(normalized, preset), "Blur Canvas"
+    return natural_background_extend(
+        normalized,
+        size,
+        preset,
+        kind,
+        anchor=anchor,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        subject_scale=subject_scale,
+    ), "Natural edge extension"
+
+
 def build_full_frame_outpaint_canvas(
     img: Image.Image,
     size: tuple[int, int],
@@ -580,6 +621,13 @@ def make_square(img: Image.Image) -> Image.Image:
     return ImageOps.fit(img, (1400, 1400), method=Image.Resampling.LANCZOS)
 
 
-def save_jpg(img: Image.Image, path: Path, quality: int = 96) -> None:
+def save_jpg(img: Image.Image, path: Path, quality: int = 98) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    img.convert("RGB").save(path, "JPEG", quality=quality, subsampling=0, optimize=True)
+    img.convert("RGB").save(
+        path,
+        "JPEG",
+        quality=max(98, quality),
+        subsampling=0,
+        progressive=True,
+        optimize=True,
+    )

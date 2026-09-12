@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import shutil
 import sys
 import threading
 import tkinter as tk
@@ -29,13 +30,9 @@ from .processor import (
     build_full_frame_outpaint_canvas,
     detect_text_boxes_easyocr,
     inpaint_text_opencv,
-    make_fit_original,
-    make_shorts,
-    make_smart_crop,
     make_square,
-    make_text_safe_landscape,
     mask_pil_from_boxes,
-    natural_background_extend,
+    render_full_frame_format,
 )
 from .settings import (
     DEFAULT_SETTINGS,
@@ -100,6 +97,7 @@ class ImageRowState:
     extension_var: ctk.StringVar | None = None
     status_label: ctk.CTkLabel | None = None
     row_widgets: list[Any] = field(default_factory=list)
+    result: Any | None = None
 
 
 def app_root() -> Path:
@@ -161,13 +159,15 @@ class CoverMorphApp(_CoverMorphWindow):
 
     def build_ui(self) -> None:
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        self.build_top_control_bar()
 
         left = ctk.CTkScrollableFrame(self, width=420)
-        left.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        left.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
         right = ctk.CTkFrame(self)
-        right.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=10)
+        right.grid(row=1, column=1, sticky="nsew", padx=(0, 10), pady=(0, 10))
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(1, weight=1)
 
@@ -217,6 +217,34 @@ class CoverMorphApp(_CoverMorphWindow):
         self.build_image_list_panel(right)
         self.build_preview_panel(right)
         self.bind_setting_traces()
+
+    def build_top_control_bar(self) -> None:
+        bar = ctk.CTkFrame(self, border_width=1, border_color="#2563eb")
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        bar.grid_columnconfigure(3, weight=1)
+        self.top_selection_label = ctk.CTkLabel(bar, text="선택 이미지: 0장", anchor="w")
+        self.top_selection_label.grid(row=0, column=0, padx=(12, 8), pady=(8, 0), sticky="w")
+        self.top_plan_label = ctk.CTkLabel(bar, text="예상 결과: 0개", anchor="w")
+        self.top_plan_label.grid(row=0, column=1, padx=8, pady=(8, 0), sticky="w")
+        self.top_current_label = ctk.CTkLabel(bar, text="현재 처리: 대기", anchor="w")
+        self.top_current_label.grid(row=0, column=2, padx=8, pady=(8, 0), sticky="w")
+        self.top_progress_label = ctk.CTkLabel(bar, text="0/0 결과 생성 완료", anchor="w")
+        self.top_progress_label.grid(row=0, column=3, padx=8, pady=(8, 0), sticky="w")
+        self.top_progress_bar = ctk.CTkProgressBar(bar)
+        self.top_progress_bar.grid(row=1, column=0, columnspan=4, padx=12, pady=(4, 8), sticky="ew")
+        self.top_progress_bar.set(0)
+        buttons = ctk.CTkFrame(bar, fg_color="transparent")
+        buttons.grid(row=0, column=4, rowspan=2, padx=(8, 12), pady=8)
+        self.top_run_button = ctk.CTkButton(buttons, text="원클릭 변환", command=self.run_pipeline, width=116)
+        self.top_run_button.pack(side="left", padx=3)
+        self.top_selected_button = ctk.CTkButton(
+            buttons, text="선택 항목 변환", command=self.run_selected_pipeline, width=116
+        )
+        self.top_selected_button.pack(side="left", padx=3)
+        self.top_cancel_button = ctk.CTkButton(
+            buttons, text="전체 취소", command=self.cancel_work, width=96, state="disabled", fg_color="#7f1d1d"
+        )
+        self.top_cancel_button.pack(side="left", padx=3)
 
     def build_input_group(self, parent: Any) -> None:
         frame = self.group(parent, "1. 입력 이미지")
@@ -476,6 +504,10 @@ class CoverMorphApp(_CoverMorphWindow):
         )
         self.cancel_button.pack(fill="x", padx=12, pady=(0, 12))
 
+        # The root-level control bar is the primary action area; keep the
+        # summary here but avoid duplicating the action buttons in the scroller.
+        self.run_button.pack_forget()
+        self.cancel_button.pack_forget()
         self.fixed_busy_widgets = [
             self.add_button,
             self.remove_button,
@@ -505,6 +537,8 @@ class CoverMorphApp(_CoverMorphWindow):
             self.ai_status_button,
             self.duplicate_policy_menu,
             self.run_button,
+            self.top_run_button,
+            self.top_selected_button,
         ]
 
     def build_image_list_panel(self, parent: Any) -> None:
@@ -904,7 +938,8 @@ class CoverMorphApp(_CoverMorphWindow):
             child.destroy()
 
         headers = ["번호", "미리보기", "원본 파일명", "1:1", "16:9", "9:16", "확장 방식", "상태"]
-        widths = [46, 76, 280, 54, 54, 54, 180, 100]
+        widths = [46, 76, 230, 54, 54, 54, 170, 86, 92, 92, 86]
+        headers.extend(["개별 변환", "결과 저장", "폴더 열기"])
         for col, (header, width) in enumerate(zip(headers, widths, strict=True)):
             label = ctk.CTkLabel(self.table_scroll, text=header, width=width, anchor="w", text_color="#cbd5e1")
             label.grid(row=0, column=col, sticky="ew", padx=3, pady=(2, 6))
@@ -957,8 +992,33 @@ class CoverMorphApp(_CoverMorphWindow):
                     command=lambda _value, item=state: self.on_row_extension_changed(item),
                 ),
             ]
+            widgets.extend(
+                [
+                    ctk.CTkButton(
+                        state.row_frame,
+                        text="개별 변환",
+                        width=widths[8],
+                        height=28,
+                        command=lambda item=state: self.run_single_image(item),
+                    ),
+                    ctk.CTkButton(
+                        state.row_frame,
+                        text="결과 저장",
+                        width=widths[9],
+                        height=28,
+                        command=lambda item=state: self.export_row_results(item),
+                    ),
+                    ctk.CTkButton(
+                        state.row_frame,
+                        text="폴더 열기",
+                        width=widths[10],
+                        height=28,
+                        command=lambda item=state: self.open_row_folder(item),
+                    ),
+                ]
+            )
             state.status_label = ctk.CTkLabel(state.row_frame, text=state.job.status, width=widths[7], anchor="w")
-            widgets.append(state.status_label)
+            widgets.insert(7, state.status_label)
 
             selectable_cols = {0, 1, 2, 7}
             for col, widget in enumerate(widgets):
@@ -1300,32 +1360,20 @@ class CoverMorphApp(_CoverMorphWindow):
         preset = PRESETS.get(state.job.preset_name, PRESETS["OldPopLounge"])
         anchor = preset.person_anchor_16x9 if kind == "thumbnail" else preset.person_anchor_9x16
         mode = state.job.extension_mode
-        if mode == "smart_crop":
-            out = make_smart_crop(
-                img,
-                size,
-                kind=kind,
-                anchor=anchor,
-                offset_x=state.job.subject_offset_x,
-                offset_y=state.job.subject_offset_y,
-                subject_scale=state.job.subject_scale,
-            )
-        elif mode == "fit":
-            out = make_fit_original(img, size)
-        elif mode == "blur":
-            out = make_text_safe_landscape(img, preset, size) if kind == "thumbnail" else make_shorts(img, preset)
-        else:
-            out = natural_background_extend(
-                img,
-                size,
-                preset,
-                kind,
-                anchor=anchor,
-                offset_x=state.job.subject_offset_x,
-                offset_y=state.job.subject_offset_y,
-                subject_scale=state.job.subject_scale,
-            )
-
+        out, _engine = render_full_frame_format(
+            img,
+            size,
+            preset,
+            kind,
+            mode=mode,
+            anchor=anchor,
+            offset_x=state.job.subject_offset_x,
+            offset_y=state.job.subject_offset_y,
+            subject_scale=state.job.subject_scale,
+        )
+        # Keep the mask overlays below while sharing the exact geometry with saving.
+        if mode not in {"ai_natural", "natural", "smart_crop", "fit", "blur"}:
+            out = img.copy()
         if self.show_protect_mask.get() or self.show_ai_mask.get():
             _canvas, ai_mask, protect = build_full_frame_outpaint_canvas(
                 img,
@@ -1368,6 +1416,7 @@ class CoverMorphApp(_CoverMorphWindow):
                 except (tk.TclError, AttributeError):
                     pass
         self.cancel_button.configure(state="normal" if busy else "disabled")
+        self.top_cancel_button.configure(state="normal" if busy else "disabled")
 
     def start_worker(self, task: str, worker: Any) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
@@ -1429,7 +1478,7 @@ class CoverMorphApp(_CoverMorphWindow):
         elif event_type == "pipeline_progress":
             self.handle_pipeline_progress(event["payload"])
         elif event_type == "pipeline_done":
-            self.handle_pipeline_done(event["results"], event["output_dir"])
+            self.handle_pipeline_done(event["results"], event["output_dir"], event.get("row_indices"))
         elif event_type == "worker_error":
             self.status.configure(text=f"오류: {event['error']}\n수동 마스크나 로그를 확인해주세요.")
             messagebox.showerror("CoverMorph 오류", event["error"])
@@ -1439,6 +1488,8 @@ class CoverMorphApp(_CoverMorphWindow):
 
     def handle_pipeline_progress(self, payload: dict[str, Any]) -> None:
         event_type = payload.get("type")
+        if payload.get("filename"):
+            self.top_current_label.configure(text=f"현재 처리: {payload['filename']}")
         if event_type == "status":
             self.status.configure(text=payload.get("message", "작업 중..."))
             return
@@ -1458,6 +1509,8 @@ class CoverMorphApp(_CoverMorphWindow):
             total_outputs = int(payload.get("total_outputs") or 0)
             completed_outputs = int(payload.get("completed_outputs") or 0)
             self.progress_bar.set(payload.get("ratio", 0.0))
+            self.top_progress_bar.set(payload.get("ratio", 0.0))
+            self.top_progress_label.configure(text=f"{completed_outputs}/{total_outputs} 결과 생성 완료")
             self.progress_label.configure(
                 text=f"{completed_outputs}/{total_outputs} 결과물 완료 | 성공 집계 중 | 실패 집계 중"
             )
@@ -1468,6 +1521,8 @@ class CoverMorphApp(_CoverMorphWindow):
             total_outputs = int(payload.get("total_outputs") or 0)
             completed_outputs = int(payload.get("completed_outputs") or 0)
             self.progress_bar.set(completed_outputs / max(1, total_outputs))
+            self.top_progress_bar.set(completed_outputs / max(1, total_outputs))
+            self.top_progress_label.configure(text=f"{completed_outputs}/{total_outputs} 결과 생성 완료")
             self.progress_label.configure(
                 text=(
                     f"{completed_outputs}/{total_outputs} 결과물 완료 | "
@@ -1494,7 +1549,14 @@ class CoverMorphApp(_CoverMorphWindow):
             return "건너뜀"
         return "실패"
 
-    def handle_pipeline_done(self, results: list[Any], output_dir: Path) -> None:
+    def handle_pipeline_done(
+        self, results: list[Any], output_dir: Path, row_indices: list[int] | None = None
+    ) -> None:
+        if row_indices is None:
+            row_indices = list(range(len(results)))
+        for row_index, result in zip(row_indices, results, strict=False):
+            if 0 <= row_index < len(self.image_states):
+                self.image_states[row_index].result = result
         success_sources = sum(1 for result in results if result.success_outputs > 0)
         failed_sources = sum(1 for result in results if result.success_outputs == 0 and result.status != "skipped")
         generated_count = sum(result.success_outputs for result in results)
@@ -1608,6 +1670,8 @@ class CoverMorphApp(_CoverMorphWindow):
             labels.append(f"1:1 클린 커버 {counts['square_1x1']}개")
         output_dir = self.output_path_var.get().strip() or "이미지 선택 후 자동 설정"
         planned = "\n ".join(labels) if labels else "선택한 출력 없음"
+        self.top_selection_label.configure(text=f"선택 이미지: {len(jobs)}장")
+        self.top_plan_label.configure(text=f"예상 결과: {total_outputs}개")
         self.summary_label.configure(
             text=(
                 f"출력 폴더:\n{output_dir}\n\n"
@@ -1661,6 +1725,76 @@ class CoverMorphApp(_CoverMorphWindow):
                 )
             )
         return jobs
+
+    def run_single_image(self, state: ImageRowState) -> None:
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            messagebox.showwarning("작업 중", "현재 작업이 끝난 뒤 개별 변환을 실행해주세요.")
+            return
+        if count_selected_outputs_for_jobs([state.job]) == 0:
+            messagebox.showinfo("안내", "이 행에서 생성할 출력 규격을 하나 이상 선택해주세요.")
+            return
+        output_dir = self.validate_output_directory_for_run()
+        if output_dir is None:
+            return
+        state.job.status = "처리 중"
+        state.job.error = ""
+        self.refresh_image_table()
+        options = self.pipeline_options(output_dir)
+        job = self.jobs_for_run()[self.image_states.index(state)]
+        total_outputs = count_selected_outputs_for_jobs([job])
+        self.progress_bar.set(0)
+        self.top_progress_bar.set(0)
+        self.top_progress_label.configure(text=f"0/{total_outputs} 결과 생성 완료")
+
+        def worker() -> None:
+            results = process_image_jobs(
+                [job],
+                options,
+                self.root_dir,
+                ai=self.ai,
+                progress_callback=lambda payload: self.worker_queue.put(
+                    {"type": "pipeline_progress", "payload": payload, "row_indices": [self.image_states.index(state)]}
+                ),
+                cancel_event=self.cancel_event,
+            )
+            self.worker_queue.put(
+                {"type": "pipeline_done", "results": results, "output_dir": options.output_dir,
+                 "row_indices": [self.image_states.index(state)]}
+            )
+
+        self.start_worker("Single image", worker)
+
+    def open_row_folder(self, state: ImageRowState) -> None:
+        path = state.result.item_dir if state.result is not None else self.output_dir_for_state(state)
+        self.safe_open_folder(path)
+
+    def output_dir_for_state(self, state: ImageRowState) -> Path:
+        root = self.output_path_var.get().strip()
+        return Path(root) / state.job.source.stem if root else default_output_dir_for_source(state.job.source)
+
+    def export_row_results(self, state: ImageRowState) -> None:
+        if state.result is None or not state.result.metadata.get("output_files"):
+            messagebox.showinfo("안내", "먼저 해당 이미지의 변환을 완료해주세요.")
+            return
+        directory = filedialog.askdirectory(title="결과를 내보낼 폴더")
+        if not directory:
+            return
+        try:
+            target = Path(directory)
+            target.mkdir(parents=True, exist_ok=True)
+            for source_name in state.result.metadata["output_files"].values():
+                source_path = Path(source_name)
+                shutil.copy2(source_path, target / source_path.name)
+            self.status.configure(text=f"결과 저장 완료:\n{target}")
+        except (OSError, shutil.Error) as exc:
+            write_exception(self.root_dir, "Row result export", exc)
+            messagebox.showerror("결과 저장 실패", str(exc))
+
+    def run_selected_pipeline(self) -> None:
+        if self.selected_index < 0 or self.selected_index >= len(self.image_states):
+            messagebox.showinfo("안내", "먼저 목록에서 이미지를 선택해주세요.")
+            return
+        self.run_single_image(self.image_states[self.selected_index])
 
     def run_pipeline(self) -> None:
         if not self.image_states:
