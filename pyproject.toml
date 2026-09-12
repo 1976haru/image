@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "logs",
+    "output",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pytest.ini_options]
+addopts = "--basetemp=.pytest_tmp"
+testpaths = ["tests"]
+markers = [
+    "optional_ai: tests that need optional AI models or external binaries",
+]

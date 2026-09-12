@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
 logs/
 output/
 build/

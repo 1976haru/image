@@ -1,16 +1,28 @@
-app.py: OK
-covermorph/logger.py: OK
-covermorph/gui.py: OK
-covermorph/ai_plugins.py: OK
-covermorph/__init__.py: OK
-covermorph/presets.py: OK
-covermorph/processor.py: OK
-CoverMorph Studio v0.5 validation
+CoverMorph Studio v0.5.1 validation
 
+Environment checked on this workstation:
+- Python launcher only reports Python 3.14.
+- Python 3.11 and 3.12 are not installed, so a clean supported-version venv could not be created here.
+- Existing .venv is Python 3.14.4 and was used for static and unit validation only.
+
+Completed:
 - Python compileall: PASS
-- Outpaint canvas 1920x1080: PASS
-- Protected pixel compositing: PASS
-- 1:1 output 1400x1400: PASS
-- 16:9 output 1920x1080: PASS
-- 9:16 output 1080x1920: PASS
-- SDXL/rembg are optional and use automatic local fallback when unavailable.
+- requirements install in existing .venv: PASS
+- OpenCV version after constraint: PASS, cv2 4.14.0
+- CascadeClassifier, cv2.inpaint, GaussianBlur smoke: PASS
+- pip check: PASS
+- ruff check .: PASS
+- pytest: PASS, 13 passed and 1 optional AI test skipped
+- Temporary sample image 1:1, 16:9, 9:16 generation: PASS
+- Generated JPG reopen and size check: PASS
+- Git large-file scan outside .git and .venv: PASS
+- .gitignore check for .venv/output/logs/build/dist: PASS
+- GUI import smoke: PASS
+- Windows .bat ASCII and CRLF check: PASS
+- INSTALL.bat unsupported Python message check: PASS
+- RUN_TESTS.bat unsupported .venv message check: PASS
+
+Not run on this workstation:
+- Clean Python 3.11 or 3.12 virtualenv install, because no supported Python runtime is installed.
+- Full GUI launch through RUN.bat, because the existing .venv uses unsupported Python 3.14.
+- Real SDXL, LaMa, and Real-ESRGAN model execution, because optional models/assets were not installed for validation.

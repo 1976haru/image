@@ -1,5 +1,8 @@
 Pillow>=10.4
 numpy>=1.26
-opencv-python>=4.10
+opencv-python>=4.10,<5
+opencv-python-headless>=4.10,<5
 customtkinter>=5.2
 easyocr>=1.7
+pytest>=8.0
+ruff>=0.8

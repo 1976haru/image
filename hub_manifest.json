@@ -1,7 +1,7 @@
 {
   "app_id": "covermorph-studio",
   "name": "CoverMorph Studio",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "category": "image",
   "entrypoint": "RUN.bat",
   "description": "AI-assisted cover to clean-cover/thumbnail/shorts batch pipeline",

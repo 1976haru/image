@@ -1,5 +1,5 @@
-from dataclasses import dataclass, asdict
-from typing import Dict
+from dataclasses import asdict, dataclass
+
 
 @dataclass
 class ChannelPreset:
@@ -12,7 +12,7 @@ class ChannelPreset:
     enhance_strength: float = 1.0
     description: str = ""
 
-PRESETS: Dict[str, ChannelPreset] = {
+PRESETS: dict[str, ChannelPreset] = {
     "OldPopLounge": ChannelPreset(
         name="OldPopLounge",
         text_safe_ratio_16x9=0.40,
