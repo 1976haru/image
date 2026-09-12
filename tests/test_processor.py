@@ -8,12 +8,16 @@ from PIL import Image, ImageDraw
 
 from covermorph.presets import PRESETS
 from covermorph.processor import (
+    build_full_frame_outpaint_canvas,
     build_outpaint_canvas,
     inpaint_text_opencv,
+    make_fit_original,
     make_shorts,
+    make_smart_crop,
     make_square,
     make_text_safe_landscape,
     mask_from_boxes,
+    natural_background_extend,
     restore_protected_pixels,
     save_jpg,
 )
@@ -59,6 +63,10 @@ def test_output_sizes() -> None:
     assert make_square(img).size == (1400, 1400)
     assert make_text_safe_landscape(img, preset).size == (1920, 1080)
     assert make_shorts(img, preset).size == (1080, 1920)
+    assert natural_background_extend(img, (1920, 1080), preset, "thumbnail", anchor="right").size == (1920, 1080)
+    assert natural_background_extend(img, (1080, 1920), preset, "shorts").size == (1080, 1920)
+    assert make_smart_crop(img, (1920, 1080)).size == (1920, 1080)
+    assert make_fit_original(img, (1920, 1080)).size == (1920, 1080)
 
 
 def test_jpg_save_and_reopen(tmp_path: Path) -> None:
@@ -85,3 +93,47 @@ def test_outpaint_canvas_masks_match_output_size() -> None:
     assert canvas.size == (1920, 1080)
     assert mask.size == (1920, 1080)
     assert protect.size == (1920, 1080)
+
+
+def test_full_frame_outpaint_canvas_masks_match_output_size() -> None:
+    img = sample_image()
+    preset = PRESETS["OldPopLounge"]
+    canvas, mask, protect = build_full_frame_outpaint_canvas(img, (1920, 1080), preset, "thumbnail", anchor="right")
+    assert canvas.size == (1920, 1080)
+    assert mask.size == (1920, 1080)
+    assert protect.size == (1920, 1080)
+
+
+def test_full_frame_local_extension_has_no_black_or_white_borders() -> None:
+    img = sample_image()
+    preset = PRESETS["OldPopLounge"]
+    for out in (
+        natural_background_extend(img, (1920, 1080), preset, "thumbnail", anchor="right"),
+        natural_background_extend(img, (1080, 1920), preset, "shorts"),
+    ):
+        arr = np.asarray(out.convert("RGB"))
+        edges = np.concatenate(
+            [
+                arr[:8].reshape(-1, 3),
+                arr[-8:].reshape(-1, 3),
+                arr[:, :8].reshape(-1, 3),
+                arr[:, -8:].reshape(-1, 3),
+            ]
+        )
+        assert not np.all(edges.mean(axis=0) < 5)
+        assert not np.all(edges.mean(axis=0) > 250)
+
+
+def test_full_frame_protected_pixels_are_restored() -> None:
+    img = Image.new("RGB", (120, 120), (20, 180, 70))
+    preset = PRESETS["OldPopLounge"]
+    _canvas, _mask, protect = build_full_frame_outpaint_canvas(
+        img,
+        (192, 108),
+        preset,
+        "thumbnail",
+        anchor="right",
+    )
+    generated = Image.new("RGB", (192, 108), (255, 0, 0))
+    restored = restore_protected_pixels(generated, protect)
+    assert restored.getpixel((150, 54)) != (255, 0, 0)

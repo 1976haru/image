@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-title CoverMorph Studio v0.5.2 - Base Install
+title CoverMorph Studio v0.5.3 - Base Install
 cd /d "%~dp0"
 
 echo [1/5] Locating Python 3.11 or 3.12...
@@ -34,7 +34,7 @@ echo [4/5] Installing base packages...
 if errorlevel 1 goto install_error
 
 echo [5/5] Verifying installation...
-".venv\Scripts\python.exe" -c "import PIL, numpy, cv2, customtkinter; print('Base packages OK')"
+".venv\Scripts\python.exe" -c "import PIL, numpy, cv2, customtkinter, tkinterdnd2; print('Base packages OK')"
 if errorlevel 1 goto install_error
 ".venv\Scripts\python.exe" -m pip check
 if errorlevel 1 goto install_error

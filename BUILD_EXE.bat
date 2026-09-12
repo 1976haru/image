@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-title CoverMorph Studio v0.5.2 - EXE Build
+title CoverMorph Studio v0.5.3 - EXE Build
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" goto no_venv
@@ -12,11 +12,11 @@ echo [1/3] Installing build packages...
 if errorlevel 1 goto build_error
 
 echo [2/3] Building EXE...
-".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --onedir --name "CoverMorphStudio_v0.5.2" --collect-all "customtkinter" --add-data "presets;presets" --add-data "hub_manifest.json;." --add-data "tools\README.txt;tools" "app.py"
+".venv\Scripts\pyinstaller.exe" --noconfirm --clean --windowed --onedir --name "CoverMorphStudio_v0.5.3" --collect-all "customtkinter" --collect-all "tkinterdnd2" --add-data "presets;presets" --add-data "hub_manifest.json;." --add-data "tools\README.txt;tools" "app.py"
 if errorlevel 1 goto build_error
 
 echo [3/3] Done.
-echo SUCCESS: Check "dist\CoverMorphStudio_v0.5.2"
+echo SUCCESS: Check "dist\CoverMorphStudio_v0.5.3"
 echo Optional AI models stay external. Put Real-ESRGAN files in the EXE folder's tools directory.
 pause
 exit /b 0

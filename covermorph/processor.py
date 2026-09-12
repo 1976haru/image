@@ -6,7 +6,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
 Rect = tuple[int, int, int, int]
 StatusCallback = Callable[[str], None]
@@ -135,6 +135,302 @@ def blurred_background(
     bg = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS)
     bg = bg.filter(ImageFilter.GaussianBlur(blur))
     return ImageEnhance.Brightness(bg).enhance(0.88)
+
+
+def _target_fill_scale(
+    img: Image.Image,
+    size: tuple[int, int],
+    kind: str,
+    subject_scale: float,
+) -> float:
+    target_width, target_height = size
+    safe_scale = max(0.75, min(1.45, subject_scale))
+    if kind == "thumbnail":
+        scale = target_height / img.height
+    elif kind == "shorts":
+        scale = target_width / img.width
+    else:
+        scale = max(target_width / img.width, target_height / img.height)
+    return scale * safe_scale
+
+
+def _foreground_position(
+    fg_size: tuple[int, int],
+    target_size: tuple[int, int],
+    kind: str,
+    anchor: str,
+    safe_ratio: float,
+    offset_x: float,
+    offset_y: float,
+) -> tuple[int, int]:
+    fg_width, fg_height = fg_size
+    target_width, target_height = target_size
+    if kind == "thumbnail":
+        if anchor == "right":
+            x = target_width - fg_width
+            safe_left = int(target_width * safe_ratio)
+            if fg_width < target_width - safe_left:
+                x = max(safe_left, x)
+        elif anchor == "left":
+            x = 0
+        else:
+            x = (target_width - fg_width) // 2
+        y = (target_height - fg_height) // 2
+    elif kind == "shorts":
+        x = (target_width - fg_width) // 2
+        y = (target_height - fg_height) // 2
+    else:
+        x = (target_width - fg_width) // 2
+        y = (target_height - fg_height) // 2
+
+    x += int(target_width * max(-0.35, min(0.35, offset_x)))
+    y += int(target_height * max(-0.35, min(0.35, offset_y)))
+    return x, y
+
+
+def _cover_background(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+    bg = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS)
+    return bg.filter(ImageFilter.GaussianBlur(max(6, int(min(size) * 0.01))))
+
+
+def _paste_axis_extensions(base: Image.Image, fg: Image.Image, x: int, y: int) -> None:
+    target_width, target_height = base.size
+    fg_width, fg_height = fg.size
+    crop_left = max(0, x)
+    crop_top = max(0, y)
+    crop_right = min(target_width, x + fg_width)
+    crop_bottom = min(target_height, y + fg_height)
+
+    visible_left = crop_left - x
+    visible_top = crop_top - y
+    visible_right = visible_left + max(0, crop_right - crop_left)
+    visible_bottom = visible_top + max(0, crop_bottom - crop_top)
+    if visible_right <= visible_left or visible_bottom <= visible_top:
+        return
+
+    visible = fg.crop((visible_left, visible_top, visible_right, visible_bottom))
+    strip = max(8, min(96, min(visible.size) // 5))
+
+    if crop_left > 0:
+        left_strip = visible.crop((0, 0, min(strip, visible.width), visible.height))
+        left_ext = ImageOps.mirror(left_strip).resize((crop_left, visible.height), Image.Resampling.BICUBIC)
+        base.paste(left_ext, (0, crop_top))
+    if crop_right < target_width:
+        right_strip = visible.crop((max(0, visible.width - strip), 0, visible.width, visible.height))
+        right_ext = ImageOps.mirror(right_strip).resize(
+            (target_width - crop_right, visible.height),
+            Image.Resampling.BICUBIC,
+        )
+        base.paste(right_ext, (crop_right, crop_top))
+    if crop_top > 0:
+        top_strip = visible.crop((0, 0, visible.width, min(strip, visible.height)))
+        top_ext = ImageOps.flip(top_strip).resize((visible.width, crop_top), Image.Resampling.BICUBIC)
+        base.paste(top_ext, (crop_left, 0))
+    if crop_bottom < target_height:
+        bottom_strip = visible.crop((0, max(0, visible.height - strip), visible.width, visible.height))
+        bottom_ext = ImageOps.flip(bottom_strip).resize(
+            (visible.width, target_height - crop_bottom),
+            Image.Resampling.BICUBIC,
+        )
+        base.paste(bottom_ext, (crop_left, crop_bottom))
+
+
+def _feather_mask(size: tuple[int, int], feather: int) -> Image.Image:
+    width, height = size
+    feather = max(1, min(feather, width // 4, height // 4))
+    mask = Image.new("L", size, 255)
+    edge = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(edge)
+    draw.rectangle((feather, feather, width - feather, height - feather), fill=255)
+    edge = edge.filter(ImageFilter.GaussianBlur(feather / 2))
+    return ImageChops.multiply(mask, edge)
+
+
+def core_protection_mask(size: tuple[int, int], kind: str, feather: int = 18) -> Image.Image:
+    width, height = size
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    if kind == "thumbnail":
+        rect = (
+            int(width * 0.14),
+            int(height * 0.08),
+            int(width * 0.92),
+            int(height * 0.92),
+        )
+    elif kind == "shorts":
+        rect = (
+            int(width * 0.08),
+            int(height * 0.18),
+            int(width * 0.92),
+            int(height * 0.82),
+        )
+    else:
+        rect = (
+            int(width * 0.08),
+            int(height * 0.08),
+            int(width * 0.92),
+            int(height * 0.92),
+        )
+    draw.rounded_rectangle(rect, radius=max(12, min(size) // 12), fill=255)
+    return mask.filter(ImageFilter.GaussianBlur(feather))
+
+
+def natural_background_extend(
+    img: Image.Image,
+    size: tuple[int, int],
+    preset: Any,
+    kind: str,
+    anchor: str = "center",
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    subject_scale: float = 1.0,
+) -> Image.Image:
+    target_width, target_height = size
+    scale = _target_fill_scale(img, size, kind, subject_scale)
+    fg_width = max(1, int(img.width * scale))
+    fg_height = max(1, int(img.height * scale))
+    fg = img.resize((fg_width, fg_height), Image.Resampling.LANCZOS)
+    x, y = _foreground_position(
+        fg.size,
+        size,
+        kind,
+        anchor,
+        getattr(preset, "text_safe_ratio_16x9", 0.38),
+        offset_x,
+        offset_y,
+    )
+
+    if fg_width >= target_width and fg_height >= target_height:
+        return make_smart_crop(
+            img,
+            size,
+            kind=kind,
+            anchor=anchor,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            subject_scale=subject_scale,
+        )
+
+    base = _cover_background(img, size)
+    _paste_axis_extensions(base, fg, x, y)
+
+    crop_left = max(0, -x)
+    crop_top = max(0, -y)
+    crop_right = min(fg_width, target_width - x)
+    crop_bottom = min(fg_height, target_height - y)
+    if crop_right > crop_left and crop_bottom > crop_top:
+        visible = fg.crop((crop_left, crop_top, crop_right, crop_bottom))
+        paste_x = max(0, x)
+        paste_y = max(0, y)
+        feather = max(10, int(min(size) * 0.018))
+        base.paste(visible, (paste_x, paste_y), _feather_mask(visible.size, feather))
+
+    return base.convert("RGB")
+
+
+def make_smart_crop(
+    img: Image.Image,
+    size: tuple[int, int],
+    kind: str = "thumbnail",
+    anchor: str = "center",
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    subject_scale: float = 1.0,
+) -> Image.Image:
+    center_x = 0.5 + max(-0.35, min(0.35, offset_x)) * 0.5
+    center_y = 0.5 + max(-0.35, min(0.35, offset_y)) * 0.5
+    if kind == "thumbnail" and anchor == "right":
+        center_x = min(0.76, center_x + 0.18)
+    scale = max(1.0, min(1.8, subject_scale))
+    work_size = (max(1, int(img.width / scale)), max(1, int(img.height / scale)))
+    left = max(0, min(img.width - work_size[0], int(img.width * center_x - work_size[0] / 2)))
+    top = max(0, min(img.height - work_size[1], int(img.height * center_y - work_size[1] / 2)))
+    crop = img.crop((left, top, left + work_size[0], top + work_size[1]))
+    return ImageOps.fit(crop, size, method=Image.Resampling.LANCZOS, centering=(center_x, center_y))
+
+
+def make_fit_original(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+    bg = Image.new("RGB", size, (18, 18, 18))
+    fg = ImageOps.contain(img, size, method=Image.Resampling.LANCZOS)
+    x = (size[0] - fg.width) // 2
+    y = (size[1] - fg.height) // 2
+    bg.paste(fg, (x, y))
+    return bg
+
+
+def build_full_frame_outpaint_canvas(
+    img: Image.Image,
+    size: tuple[int, int],
+    preset: Any,
+    kind: str,
+    person_mask: Image.Image | None = None,
+    anchor: str = "center",
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    subject_scale: float = 1.0,
+    protect_core: bool = True,
+) -> tuple[Image.Image, Image.Image, Image.Image]:
+    target_width, target_height = size
+    scale = _target_fill_scale(img, size, kind, subject_scale)
+    fg_width = max(1, int(img.width * scale))
+    fg_height = max(1, int(img.height * scale))
+    fg = img.resize((fg_width, fg_height), Image.Resampling.LANCZOS)
+    x, y = _foreground_position(
+        fg.size,
+        size,
+        kind,
+        anchor,
+        getattr(preset, "text_safe_ratio_16x9", 0.38),
+        offset_x,
+        offset_y,
+    )
+
+    base = natural_background_extend(
+        img,
+        size,
+        preset,
+        kind,
+        anchor=anchor,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        subject_scale=subject_scale,
+    )
+    gen_mask = Image.new("L", size, 255)
+    crop_left = max(0, -x)
+    crop_top = max(0, -y)
+    crop_right = min(fg_width, target_width - x)
+    crop_bottom = min(fg_height, target_height - y)
+    paste_x = max(0, x)
+    paste_y = max(0, y)
+    visible_width = max(0, crop_right - crop_left)
+    visible_height = max(0, crop_bottom - crop_top)
+
+    protect = Image.new("RGBA", size, (0, 0, 0, 0))
+    if visible_width and visible_height:
+        core_mask = (
+            core_protection_mask((visible_width, visible_height), kind)
+            if protect_core
+            else Image.new("L", (visible_width, visible_height), 0)
+        )
+        if person_mask is not None:
+            resized_person = person_mask.convert("L").resize((fg_width, fg_height), Image.Resampling.LANCZOS)
+            visible_person = resized_person.crop((crop_left, crop_top, crop_right, crop_bottom))
+            core_mask = ImageChops.lighter(core_mask, visible_person)
+
+        visible_fg = fg.crop((crop_left, crop_top, crop_right, crop_bottom)).convert("RGBA")
+        protect.paste(visible_fg, (paste_x, paste_y), core_mask)
+
+        safe = max(10, int(min(size) * 0.018))
+        protected_rect = (
+            paste_x + safe,
+            paste_y + safe,
+            paste_x + visible_width - safe,
+            paste_y + visible_height - safe,
+        )
+        if protected_rect[2] > protected_rect[0] and protected_rect[3] > protected_rect[1]:
+            gen_mask.paste(0, protected_rect)
+        gen_mask = gen_mask.filter(ImageFilter.GaussianBlur(max(5, safe // 2)))
+    return base, gen_mask, protect
 
 
 def build_outpaint_canvas(

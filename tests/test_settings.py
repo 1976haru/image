@@ -25,13 +25,20 @@ def test_no_output_format_selected_is_blocked() -> None:
 
 def test_output_folder_settings_save(tmp_path: Path) -> None:
     output_dir = tmp_path / "CoverMorph_Output"
-    data = DEFAULT_SETTINGS | {"output_directory": str(output_dir), "output_thumbnail": False}
+    data = DEFAULT_SETTINGS | {
+        "output_directory": str(output_dir),
+        "output_thumbnail": False,
+        "extension_mode": "natural",
+        "protect_core": False,
+    }
 
     save_settings(tmp_path, data)
     loaded = load_settings(tmp_path)
 
     assert loaded["output_directory"] == str(output_dir)
     assert loaded["output_thumbnail"] is False
+    assert loaded["extension_mode"] == "natural"
+    assert loaded["protect_core"] is False
 
 
 def test_output_folder_restored_after_restart(tmp_path: Path) -> None:
@@ -85,6 +92,8 @@ def test_corrupt_settings_json_recovers_defaults(tmp_path: Path) -> None:
 
     assert loaded["output_square"] is True
     assert repaired["thumbnail_resolution"] == "1920x1080"
+    assert repaired["extension_mode"] == "ai_natural"
+    assert repaired["protect_core"] is True
 
 
 def test_default_output_dir_uses_source_folder() -> None:

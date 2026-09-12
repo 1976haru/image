@@ -1,33 +1,55 @@
-CoverMorph Studio v0.5.2 validation
+CoverMorph Studio v0.5.3 validation
 
 Environment checked on this workstation:
 - Existing .venv reports Python 3.12.10 during pytest.
-- Optional SDXL, LaMa, and Real-ESRGAN assets were not installed for full model execution.
+- Optional SDXL, LaMa, and Real-ESRGAN model assets were not installed for full model execution.
+- tkinterdnd2 0.6.3 was installed for drag-and-drop support.
 
 Completed:
 - Python compileall: PASS
+- requirements.txt install in existing .venv: PASS after network-restricted retry with approval
 - pip check: PASS
 - ruff check .: PASS
-- pytest: PASS, 27 passed and 1 optional AI test skipped
+- pytest: PASS, 47 passed and 1 optional AI test skipped
+- OpenCV smoke: PASS
+  - CascadeClassifier loaded haarcascade_frontalface_default.xml
+  - cv2.inpaint returned expected image shape
+  - cv2.GaussianBlur returned expected image shape
+- Temporary sample generation: PASS
+  - 1:1 clean cover 1400x1400 generated and reopened
+  - 16:9 thumbnail 1920x1080 generated and reopened
+  - 9:16 shorts 1080x1920 generated and reopened
 - Output selection tests: PASS
   - thumbnail only
   - shorts only
   - thumbnail and shorts only
   - all three output formats
   - no output selected blocked by validation helper
+- Multi-image tests: PASS
+  - one image and five image job counts
+  - five images all 16:9
+  - five images all 9:16
+  - five images 16:9 plus 9:16
+  - per-image mixed output formats
+  - per-image manual mask isolation
+  - per-image preset isolation
+  - one image failure does not stop the next image
+  - planned output count and progress ratio
+  - failed output progress accounting
+  - duplicate filename new-number handling
+  - Korean and space filename handling
+  - 16:9 and 9:16 outputs have no black or white blank borders
+  - protected pixel restoration
+  - SDXL to natural extension to blur fallback order
 - Settings tests: PASS
-  - output folder save
-  - output folder restore after reload
+  - output folder save and restore
   - Korean and space path
   - missing output folder creation
-  - duplicate filename new-number policy
   - safe output folder open
   - corrupt settings.json recovery
-- Temporary sample generation: PASS
-  - selected thumbnail 1280x720 and shorts 1080x1920 only
-  - generated JPG files reopened successfully
-- Version check for v0.5.1 leftovers: PASS
+- GUI import and drag-and-drop package import smoke: PASS
+- Version check for v0.5.2 leftovers: PASS after this file update
 
 Not run on this workstation:
-- Full GUI interactive run, because automated GUI clicking was not requested and the core UI import/path logic was validated through tests.
-- Real SDXL, LaMa, and Real-ESRGAN model execution, because optional models/assets were not installed for validation.
+- Full interactive GUI clicking/dragging test.
+- Real SDXL, LaMa, and Real-ESRGAN model execution, because optional models/assets were not installed.

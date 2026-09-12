@@ -16,14 +16,17 @@ from .logger import write_exception, write_log
 from .presets import PRESETS, ChannelPreset, preset_to_dict
 from .processor import (
     Rect,
-    build_outpaint_canvas,
+    build_full_frame_outpaint_canvas,
     detect_text_boxes_easyocr,
     inpaint_text_opencv,
+    make_fit_original,
     make_shorts,
+    make_smart_crop,
     make_square,
     make_text_safe_landscape,
     mask_pil_from_boxes,
     mild_enhance,
+    natural_background_extend,
     restore_protected_pixels,
     save_jpg,
 )
@@ -59,9 +62,33 @@ class PipelineOptions:
     out_shorts: bool = True
     thumbnail_resolution: str = "1920x1080"
     duplicate_policy: str = "new_number"
-    use_sdxl: bool = False
+    extension_mode: str = "ai_natural"
+    protect_core: bool = True
+    subject_offset_x: float = 0.0
+    subject_offset_y: float = 0.0
+    subject_scale: float = 1.0
+    use_sdxl: bool = True
     protect_person: bool = True
     outpaint_prompt: str = DEFAULT_OUTPAINT_PROMPT
+
+
+@dataclass(slots=True)
+class ImageJob:
+    source: Path
+    out_square: bool = True
+    out_thumb: bool = True
+    out_shorts: bool = True
+    manual_boxes: tuple[Rect, ...] = ()
+    ocr_boxes: tuple[Rect, ...] = ()
+    preset_name: str = "OldPopLounge"
+    ocr_languages: tuple[str, ...] = ("en",)
+    extension_mode: str = "ai_natural"
+    subject_offset_x: float = 0.0
+    subject_offset_y: float = 0.0
+    subject_scale: float = 1.0
+    outpaint_prompt: str = DEFAULT_OUTPAINT_PROMPT
+    status: str = "대기"
+    error: str = ""
 
 
 @dataclass(slots=True)
@@ -98,7 +125,7 @@ def _dedupe_boxes(boxes: Sequence[Rect]) -> list[Rect]:
     seen: set[Rect] = set()
     unique: list[Rect] = []
     for box in boxes:
-        normalized = tuple(int(v) for v in box)
+        normalized = tuple(int(value) for value in box)
         if normalized not in seen:
             unique.append(normalized)
             seen.add(normalized)
@@ -119,6 +146,46 @@ def _write_job_json(root: Path, item_dir: Path, metadata: dict[str, Any]) -> Non
         )
     except (OSError, ValueError) as exc:
         write_exception(root, "Job JSON write failed", exc)
+
+
+def count_selected_outputs_for_options(options: PipelineOptions) -> int:
+    return int(options.out_square) + int(options.out_thumb) + int(options.out_shorts)
+
+
+def count_selected_outputs_for_jobs(jobs: Sequence[ImageJob]) -> int:
+    return sum(int(job.out_square) + int(job.out_thumb) + int(job.out_shorts) for job in jobs)
+
+
+def output_count_by_kind(jobs: Sequence[ImageJob]) -> dict[str, int]:
+    return {
+        "square_1x1": sum(1 for job in jobs if job.out_square),
+        "thumbnail_16x9": sum(1 for job in jobs if job.out_thumb),
+        "shorts_9x16": sum(1 for job in jobs if job.out_shorts),
+    }
+
+
+def progress_ratio(completed_outputs: int, total_outputs: int) -> float:
+    if total_outputs <= 0:
+        return 0.0
+    return max(0.0, min(1.0, completed_outputs / total_outputs))
+
+
+def options_for_job(base_options: PipelineOptions, job: ImageJob) -> PipelineOptions:
+    text_boxes = tuple(_dedupe_boxes([*job.ocr_boxes, *job.manual_boxes]))
+    return replace(
+        base_options,
+        preset_name=job.preset_name,
+        ocr_languages=job.ocr_languages,
+        manual_boxes=text_boxes,
+        out_square=job.out_square,
+        out_thumb=job.out_thumb,
+        out_shorts=job.out_shorts,
+        extension_mode=job.extension_mode,
+        subject_offset_x=job.subject_offset_x,
+        subject_offset_y=job.subject_offset_y,
+        subject_scale=job.subject_scale,
+        outpaint_prompt=job.outpaint_prompt,
+    )
 
 
 def _base_metadata(
@@ -142,6 +209,12 @@ def _base_metadata(
         "shorts_9x16_engine": "Skipped",
         "thumbnail_resolution": options.thumbnail_resolution,
         "duplicate_policy": options.duplicate_policy,
+        "extension_mode": options.extension_mode,
+        "extension_fallbacks": [],
+        "subject_offset_x": options.subject_offset_x,
+        "subject_offset_y": options.subject_offset_y,
+        "subject_scale": options.subject_scale,
+        "core_protection": options.protect_core,
         "selected_outputs": {
             "square_1x1": options.out_square,
             "thumbnail_16x9": options.out_thumb,
@@ -154,6 +227,7 @@ def _base_metadata(
         "outpaint_prompt": options.outpaint_prompt,
         "output_files": {},
         "outputs": {},
+        "skipped_outputs": 0,
         "processing_time_seconds": 0.0,
         "status": "pending",
         "errors": [],
@@ -172,15 +246,12 @@ def _detect_and_remove_text(
     errors: list[dict[str, str]] = []
 
     if options.auto_remove_text:
+        _emit(progress_callback, type="file_stage", status="OCR 처리 중")
         try:
             detected_boxes = detect_text_boxes_easyocr(
                 img,
                 options.ocr_languages,
-                status_callback=lambda message: _emit(
-                    progress_callback,
-                    type="status",
-                    message=message,
-                ),
+                status_callback=lambda message: _emit(progress_callback, type="status", message=message),
             )
         except Exception as exc:
             write_exception(root, "OCR fallback", exc)
@@ -195,6 +266,7 @@ def _detect_and_remove_text(
         metadata["inpaint_engine"] = "No text mask"
         return img.copy(), boxes, errors
 
+    _emit(progress_callback, type="file_stage", status="글자 제거 중")
     if options.prefer_lama and ai.lama_available():
         try:
             clean, engine = ai.inpaint(img, mask_pil_from_boxes(img.size, boxes))
@@ -250,7 +322,7 @@ def _person_mask_or_whole_foreground(
     if not protect_person:
         return None, "Disabled", None
     if not ai.rembg_available():
-        return None, "Whole foreground protect (rembg unavailable)", None
+        return None, "Core region protect (rembg unavailable)", None
     try:
         mask, engine = ai.person_mask(img)
         return mask, engine, None
@@ -258,10 +330,10 @@ def _person_mask_or_whole_foreground(
         write_exception(root, "Person segmentation fallback", exc)
         return (
             None,
-            "Whole foreground protect (person segmentation fallback)",
+            "Core region protect (person segmentation fallback)",
             _error(
                 "person_segmentation_failed",
-                "Person segmentation failed; the full foreground was protected instead.",
+                "Person segmentation failed; the central core was protected instead.",
                 str(exc),
             ),
         )
@@ -272,7 +344,40 @@ def _local_format(
     preset: ChannelPreset,
     kind: str,
     size: tuple[int, int],
+    options: PipelineOptions,
+    mode: str | None = None,
 ) -> tuple[Image.Image, str]:
+    selected_mode = mode or options.extension_mode
+    anchor = preset.person_anchor_16x9 if kind == "thumbnail" else preset.person_anchor_9x16
+    if selected_mode == "natural":
+        return (
+            natural_background_extend(
+                img,
+                size,
+                preset,
+                kind,
+                anchor=anchor,
+                offset_x=options.subject_offset_x,
+                offset_y=options.subject_offset_y,
+                subject_scale=options.subject_scale,
+            ),
+            "Natural edge extension",
+        )
+    if selected_mode == "smart_crop":
+        return (
+            make_smart_crop(
+                img,
+                size,
+                kind=kind,
+                anchor=anchor,
+                offset_x=options.subject_offset_x,
+                offset_y=options.subject_offset_y,
+                subject_scale=options.subject_scale,
+            ),
+            "Smart crop",
+        )
+    if selected_mode == "fit":
+        return make_fit_original(img, size), "Original fit"
     if kind == "thumbnail":
         return make_text_safe_landscape(img, preset, size), "Blur Canvas"
     return make_shorts(img, preset), "Blur Canvas"
@@ -291,19 +396,32 @@ def _outpaint_or_fallback(
     errors: list[dict[str, str]] = []
     person_engine = "Disabled" if not options.protect_person else "Pending"
 
-    if not options.use_sdxl:
-        local, engine = _local_format(img, preset, kind, size)
+    if options.extension_mode != "ai_natural":
+        local, engine = _local_format(img, preset, kind, size, options)
         return local, engine, errors, person_engine
 
-    if not ai.sdxl_available():
-        local, _engine = _local_format(img, preset, kind, size)
-        write_log(root, f"SDXL unavailable for {kind}; Blur Canvas fallback was used.")
-        error = _error(
-            "sdxl_unavailable",
-            f"SDXL unavailable for {kind}; Blur Canvas fallback was used.",
-        )
-        errors.append(error)
-        return local, "Fallback blur canvas", errors, person_engine
+    if not options.use_sdxl or not ai.sdxl_available():
+        try:
+            local, engine = _local_format(img, preset, kind, size, options, mode="natural")
+            write_log(root, f"SDXL unavailable for {kind}; Natural extension fallback was used.")
+            errors.append(
+                _error(
+                    "sdxl_unavailable",
+                    f"SDXL unavailable for {kind}; Natural extension fallback was used.",
+                )
+            )
+            return local, f"Fallback natural extension ({engine})", errors, person_engine
+        except Exception as exc:
+            write_exception(root, f"Natural extension fallback failed {kind}", exc)
+            local, engine = _local_format(img, preset, kind, size, options, mode="blur")
+            errors.append(
+                _error(
+                    "natural_extension_failed",
+                    f"Natural extension failed for {kind}; Blur Canvas fallback was used.",
+                    str(exc),
+                )
+            )
+            return local, f"Fallback blur canvas ({engine})", errors, person_engine
 
     try:
         person_mask, person_engine, person_error = _person_mask_or_whole_foreground(
@@ -314,7 +432,18 @@ def _outpaint_or_fallback(
         )
         if person_error is not None:
             errors.append(person_error)
-        canvas, mask, protect = build_outpaint_canvas(img, size, person_mask, anchor=anchor)
+        canvas, mask, protect = build_full_frame_outpaint_canvas(
+            img,
+            size,
+            preset,
+            kind,
+            person_mask,
+            anchor=anchor,
+            offset_x=options.subject_offset_x,
+            offset_y=options.subject_offset_y,
+            subject_scale=options.subject_scale,
+            protect_core=options.protect_core,
+        )
         if mask.size != size or protect.size != size:
             raise RuntimeError("Protection mask size does not match output canvas size.")
         generated, engine = ai.outpaint(
@@ -326,15 +455,27 @@ def _outpaint_or_fallback(
         return restore_protected_pixels(generated, protect), f"{engine} + {person_engine}", errors, person_engine
     except Exception as exc:
         write_exception(root, f"SDXL {kind} fallback", exc)
-        local, _engine = _local_format(img, preset, kind, size)
         errors.append(
             _error(
                 "sdxl_failed",
-                f"SDXL failed for {kind}; Blur Canvas fallback was used.",
+                f"SDXL failed for {kind}; Natural extension fallback was used.",
                 str(exc),
             )
         )
-        return local, "Fallback blur canvas", errors, person_engine
+        try:
+            local, engine = _local_format(img, preset, kind, size, options, mode="natural")
+            return local, f"Fallback natural extension ({engine})", errors, person_engine
+        except Exception as natural_exc:
+            write_exception(root, f"Natural extension fallback failed {kind}", natural_exc)
+            local, engine = _local_format(img, preset, kind, size, options, mode="blur")
+            errors.append(
+                _error(
+                    "natural_extension_failed",
+                    f"Natural extension failed for {kind}; Blur Canvas fallback was used.",
+                    str(natural_exc),
+                )
+            )
+            return local, f"Fallback blur canvas ({engine})", errors, person_engine
 
 
 def _save_output(
@@ -368,6 +509,10 @@ def _save_output(
         return 0, 1, 0, [_error("save_failed", f"Could not save {path.name}.", str(exc))]
 
 
+def _output_done(progress_callback: ProgressCallback | None, key: str, filename: str, status: str) -> None:
+    _emit(progress_callback, type="output_done", key=key, filename=filename, status=status)
+
+
 def process_image_file(
     source: Path,
     options: PipelineOptions,
@@ -389,6 +534,7 @@ def process_image_file(
     try:
         item_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
+        selected_count = max(1, count_selected_outputs_for_options(options))
         write_exception(app_root, f"Output folder failed {source.name}", exc)
         metadata["status"] = "failed"
         metadata["errors"].append(_error("output_folder_create_failed", "Output folder could not be created.", str(exc)))
@@ -398,7 +544,7 @@ def process_image_file(
             item_dir=item_dir,
             status="failed",
             success_outputs=0,
-            failed_outputs=1,
+            failed_outputs=selected_count,
             failed_file_names=[source.name],
             errors=metadata["errors"],
             metadata=metadata,
@@ -416,14 +562,15 @@ def process_image_file(
         metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
         _write_job_json(app_root, item_dir, metadata)
         return FileResult(
-            source=source,
-            item_dir=item_dir,
-            status="failed",
-            success_outputs=0,
-            failed_outputs=1,
-            failed_file_names=[source.name],
-            errors=errors,
-            metadata=metadata,
+            source,
+            item_dir,
+            "failed",
+            0,
+            max(1, count_selected_outputs_for_options(options)),
+            0,
+            [source.name],
+            errors,
+            metadata,
         )
     except UnidentifiedImageError as exc:
         errors.append(_error("corrupt_image", "Source image is damaged or unsupported.", str(exc)))
@@ -432,14 +579,15 @@ def process_image_file(
         metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
         _write_job_json(app_root, item_dir, metadata)
         return FileResult(
-            source=source,
-            item_dir=item_dir,
-            status="failed",
-            success_outputs=0,
-            failed_outputs=1,
-            failed_file_names=[source.name],
-            errors=errors,
-            metadata=metadata,
+            source,
+            item_dir,
+            "failed",
+            0,
+            max(1, count_selected_outputs_for_options(options)),
+            0,
+            [source.name],
+            errors,
+            metadata,
         )
     except OSError as exc:
         errors.append(_error("read_error", "Source image could not be read.", str(exc)))
@@ -448,14 +596,15 @@ def process_image_file(
         metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
         _write_job_json(app_root, item_dir, metadata)
         return FileResult(
-            source=source,
-            item_dir=item_dir,
-            status="failed",
-            success_outputs=0,
-            failed_outputs=1,
-            failed_file_names=[source.name],
-            errors=errors,
-            metadata=metadata,
+            source,
+            item_dir,
+            "failed",
+            0,
+            max(1, count_selected_outputs_for_options(options)),
+            0,
+            [source.name],
+            errors,
+            metadata,
         )
 
     clean, _boxes, text_errors = _detect_and_remove_text(
@@ -485,6 +634,7 @@ def process_image_file(
         path = item_dir / f"{source.stem}_clean_1x1_1400x1400.jpg"
         try:
             _check_cancel(cancel_event)
+            _emit(progress_callback, type="file_stage", status="1:1 생성 중")
             ok, fail, skipped, save_errors = _save_output(
                 app_root,
                 make_square(clean),
@@ -499,6 +649,12 @@ def process_image_file(
             errors.extend(save_errors)
             if fail:
                 failed_names.append(path.name)
+            _output_done(
+                progress_callback,
+                "square_1x1",
+                source.name,
+                "success" if ok else "failed" if fail else "skipped",
+            )
         except PipelineCancelled:
             raise
         except Exception as exc:
@@ -512,6 +668,7 @@ def process_image_file(
                 "engine": "Crop 1:1",
                 "error": str(exc),
             }
+            _output_done(progress_callback, "square_1x1", source.name, "failed")
 
     if options.out_thumb:
         thumb_size = thumbnail_size(options.thumbnail_resolution)
@@ -519,6 +676,7 @@ def process_image_file(
         path = item_dir / f"{source.stem}_thumbnail_16x9_{thumb_width}x{thumb_height}.jpg"
         try:
             _check_cancel(cancel_event)
+            _emit(progress_callback, type="file_stage", status="16:9 생성 중")
             thumb, engine, outpaint_errors, person_engine = _outpaint_or_fallback(
                 app_root,
                 ai,
@@ -539,6 +697,12 @@ def process_image_file(
             errors.extend(save_errors)
             if fail:
                 failed_names.append(path.name)
+            _output_done(
+                progress_callback,
+                "thumbnail_16x9",
+                source.name,
+                "success" if ok else "failed" if fail else "skipped",
+            )
         except PipelineCancelled:
             raise
         except Exception as exc:
@@ -553,11 +717,13 @@ def process_image_file(
                 "engine": "Failed",
                 "error": str(exc),
             }
+            _output_done(progress_callback, "thumbnail_16x9", source.name, "failed")
 
     if options.out_shorts:
         path = item_dir / f"{source.stem}_shorts_9x16_1080x1920.jpg"
         try:
             _check_cancel(cancel_event)
+            _emit(progress_callback, type="file_stage", status="9:16 생성 중")
             shorts, engine, outpaint_errors, person_engine = _outpaint_or_fallback(
                 app_root,
                 ai,
@@ -579,6 +745,12 @@ def process_image_file(
             errors.extend(save_errors)
             if fail:
                 failed_names.append(path.name)
+            _output_done(
+                progress_callback,
+                "shorts_9x16",
+                source.name,
+                "success" if ok else "failed" if fail else "skipped",
+            )
         except PipelineCancelled:
             raise
         except Exception as exc:
@@ -593,14 +765,16 @@ def process_image_file(
                 "engine": "Failed",
                 "error": str(exc),
             }
+            _output_done(progress_callback, "shorts_9x16", source.name, "failed")
 
     sdxl_errors = [error for error in errors if error["category"].startswith("sdxl")]
+    extension_errors = [error for error in errors if "extension" in error["category"] or error["category"].startswith("sdxl")]
     metadata["sdxl_fallback"] = bool(sdxl_errors)
     metadata["sdxl_failures"] = sdxl_errors
+    metadata["extension_fallbacks"] = extension_errors
     metadata["errors"] = errors
-    metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
-
     metadata["skipped_outputs"] = skipped_outputs
+    metadata["processing_time_seconds"] = round(time.perf_counter() - start, 3)
 
     if success_outputs == 0 and skipped_outputs > 0 and failed_outputs == 0:
         status = "skipped"
@@ -641,62 +815,152 @@ def process_files(
     progress_callback: ProgressCallback | None = None,
     cancel_event: Event | None = None,
 ) -> list[FileResult]:
+    jobs = [
+        ImageJob(
+            source=source,
+            out_square=options.out_square,
+            out_thumb=options.out_thumb,
+            out_shorts=options.out_shorts,
+            manual_boxes=options.manual_boxes if index == 0 else (),
+            preset_name=options.preset_name,
+            ocr_languages=options.ocr_languages,
+            extension_mode=options.extension_mode,
+            subject_offset_x=options.subject_offset_x,
+            subject_offset_y=options.subject_offset_y,
+            subject_scale=options.subject_scale,
+            outpaint_prompt=options.outpaint_prompt,
+        )
+        for index, source in enumerate(files)
+    ]
+    return process_image_jobs(jobs, options, app_root, ai, progress_callback, cancel_event)
+
+
+def process_image_jobs(
+    jobs: Sequence[ImageJob],
+    base_options: PipelineOptions,
+    app_root: Path,
+    ai: AIBackends | None = None,
+    progress_callback: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
+) -> list[FileResult]:
     backend = ai or AIBackends(app_root)
     results: list[FileResult] = []
-    total = len(files)
+    total_files = len(jobs)
+    total_outputs = count_selected_outputs_for_jobs(jobs)
+    completed_outputs = 0
     success_files = 0
     failed_files = 0
     success_outputs = 0
     failed_outputs = 0
     skipped_outputs = 0
 
-    for index, source in enumerate(files, 1):
+    for index, job in enumerate(jobs, 1):
         if cancel_event is not None and cancel_event.is_set():
             _emit(progress_callback, type="cancelled", message="작업이 취소되었습니다.")
             break
+        job.status = "대기"
+        completed_before_job = completed_outputs
         _emit(
             progress_callback,
             type="file_start",
             index=index,
-            total=total,
-            filename=source.name,
+            total=total_files,
+            total_outputs=total_outputs,
+            completed_outputs=completed_outputs,
+            filename=job.source.name,
             success_files=success_files,
             failed_files=failed_files,
         )
+
+        def job_progress(payload: dict[str, Any], *, job_index: int = index, job_source: Path = job.source) -> None:
+            nonlocal completed_outputs
+            if payload.get("type") == "file_stage":
+                job.status = str(payload.get("status", "처리 중"))
+                _emit(
+                    progress_callback,
+                    type="file_stage",
+                    index=job_index,
+                    filename=job_source.name,
+                    status=job.status,
+                    total_outputs=total_outputs,
+                    completed_outputs=completed_outputs,
+                )
+                return
+            if payload.get("type") == "output_done":
+                completed_outputs += 1
+                _emit(
+                    progress_callback,
+                    type="output_progress",
+                    index=job_index,
+                    filename=job_source.name,
+                    key=payload.get("key"),
+                    status=payload.get("status"),
+                    total_outputs=total_outputs,
+                    completed_outputs=completed_outputs,
+                    ratio=progress_ratio(completed_outputs, total_outputs),
+                )
+                return
+            _emit(progress_callback, **payload)
+
         try:
-            item_options = options
-            if index != 1 and options.manual_boxes:
-                item_options = replace(options, manual_boxes=())
             result = process_image_file(
-                source,
-                item_options,
+                job.source,
+                options_for_job(base_options, job),
                 backend,
                 app_root,
-                progress_callback=progress_callback,
+                progress_callback=job_progress,
                 cancel_event=cancel_event,
             )
         except PipelineCancelled:
+            job.status = "취소됨"
             _emit(progress_callback, type="cancelled", message="작업이 취소되었습니다.")
             break
         except Exception as exc:
-            write_exception(app_root, f"Unexpected file failure {source.name}", exc)
+            write_exception(app_root, f"Unexpected file failure {job.source.name}", exc)
+            job.status = "실패"
+            job.error = str(exc)
             result = FileResult(
-                source=source,
-                item_dir=options.output_dir / source.stem,
+                source=job.source,
+                item_dir=base_options.output_dir / job.source.stem,
                 status="failed",
                 success_outputs=0,
-                failed_outputs=1,
+                failed_outputs=max(1, count_selected_outputs_for_options(options_for_job(base_options, job))),
                 skipped_outputs=0,
-                failed_file_names=[source.name],
+                failed_file_names=[job.source.name],
                 errors=[_error("unexpected_error", "Unexpected processing error.", str(exc))],
                 metadata={},
+            )
+
+        result_done_outputs = result.success_outputs + result.failed_outputs + result.skipped_outputs
+        emitted_done_outputs = completed_outputs - completed_before_job
+        if result_done_outputs > emitted_done_outputs:
+            completed_outputs += result_done_outputs - emitted_done_outputs
+            _emit(
+                progress_callback,
+                type="output_progress",
+                index=index,
+                filename=job.source.name,
+                key="file_result",
+                status=result.status,
+                total_outputs=total_outputs,
+                completed_outputs=completed_outputs,
+                ratio=progress_ratio(completed_outputs, total_outputs),
             )
 
         results.append(result)
         if result.status == "success":
             success_files += 1
-        elif result.status != "skipped":
+            job.status = "저장 완료"
+        elif result.status == "skipped":
+            job.status = "건너뜀"
+        elif result.success_outputs > 0:
             failed_files += 1
+            job.status = "일부 완료"
+            job.error = "; ".join(error["message"] for error in result.errors)
+        else:
+            failed_files += 1
+            job.status = "실패"
+            job.error = "; ".join(error["message"] for error in result.errors)
         success_outputs += result.success_outputs
         failed_outputs += result.failed_outputs
         skipped_outputs += result.skipped_outputs
@@ -704,8 +968,10 @@ def process_files(
             progress_callback,
             type="file_done",
             index=index,
-            total=total,
-            filename=source.name,
+            total=total_files,
+            total_outputs=total_outputs,
+            completed_outputs=completed_outputs,
+            filename=job.source.name,
             status=result.status,
             success_files=success_files,
             failed_files=failed_files,
@@ -718,8 +984,10 @@ def process_files(
     _emit(
         progress_callback,
         type="batch_done",
-        total=total,
+        total=total_files,
         processed=len(results),
+        total_outputs=total_outputs,
+        completed_outputs=completed_outputs,
         success_files=success_files,
         failed_files=failed_files,
         success_outputs=success_outputs,

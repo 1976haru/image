@@ -13,6 +13,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "output_thumbnail": True,
     "output_shorts": True,
     "thumbnail_resolution": "1920x1080",
+    "extension_mode": "ai_natural",
+    "protect_core": True,
     "duplicate_policy": "new_number",
     "last_preset": "OldPopLounge",
     "last_ocr_language": "영어",
@@ -26,6 +28,13 @@ DUPLICATE_POLICIES = {
     "overwrite": "덮어쓰기",
     "new_number": "새 번호 붙이기",
     "skip": "건너뛰기",
+}
+EXTENSION_MODES = {
+    "ai_natural": "AI 자연 배경 확장",
+    "smart_crop": "스마트 크롭",
+    "natural": "자연 배경 확장",
+    "blur": "블러 배경",
+    "fit": "원본 전체 맞춤",
 }
 
 
@@ -43,9 +52,11 @@ def normalize_settings(data: dict[str, Any] | None) -> dict[str, Any]:
         settings.update({key: data[key] for key in settings if key in data})
     if settings["thumbnail_resolution"] not in THUMBNAIL_RESOLUTIONS:
         settings["thumbnail_resolution"] = DEFAULT_SETTINGS["thumbnail_resolution"]
+    if settings["extension_mode"] not in EXTENSION_MODES:
+        settings["extension_mode"] = DEFAULT_SETTINGS["extension_mode"]
     if settings["duplicate_policy"] not in DUPLICATE_POLICIES:
         settings["duplicate_policy"] = DEFAULT_SETTINGS["duplicate_policy"]
-    for key in ("output_square", "output_thumbnail", "output_shorts"):
+    for key in ("output_square", "output_thumbnail", "output_shorts", "protect_core"):
         settings[key] = bool(settings[key])
     settings["output_directory"] = str(settings.get("output_directory") or "")
     return settings
