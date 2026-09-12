@@ -15,3 +15,5 @@ dist/
 .vscode/
 Thumbs.db
 desktop.ini
+
+validation_results/

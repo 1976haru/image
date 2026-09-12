@@ -215,6 +215,11 @@ def _base_metadata(
         "thumbnail_resolution": options.thumbnail_resolution,
         "duplicate_policy": options.duplicate_policy,
         "extension_mode": options.extension_mode,
+        "requested_extension_mode": options.extension_mode,
+        "actual_extension_engines": {
+            "thumbnail_16x9": "Pending",
+            "shorts_9x16": "Pending",
+        },
         "extension_fallbacks": [],
         "subject_offset_x": options.subject_offset_x,
         "subject_offset_y": options.subject_offset_y,
@@ -235,6 +240,8 @@ def _base_metadata(
         "skipped_outputs": 0,
         "processing_time_seconds": 0.0,
         "status": "pending",
+        "generation_status": "pending",
+        "visual_quality_status": "unverified",
         "errors": [],
     }
 
@@ -658,6 +665,7 @@ def process_image_file(
                 preset.person_anchor_16x9,
             )
             metadata["thumbnail_16x9_engine"] = engine
+            metadata["actual_extension_engines"]["thumbnail_16x9"] = engine
             metadata["person_protection_engine"] = person_engine
             errors.extend(outpaint_errors)
             ok, fail, skipped, save_errors = _save_output(app_root, thumb, path, metadata, "thumbnail_16x9", engine)
@@ -686,6 +694,7 @@ def process_image_file(
             failed_outputs += 1
             failed_names.append(path.name)
             metadata["thumbnail_16x9_engine"] = failure_engine
+            metadata["actual_extension_engines"]["thumbnail_16x9"] = failure_engine
             metadata["outputs"]["thumbnail_16x9"] = {
                 "status": "failed",
                 "path": str(path),
@@ -710,6 +719,7 @@ def process_image_file(
                 preset.person_anchor_9x16,
             )
             metadata["shorts_9x16_engine"] = engine
+            metadata["actual_extension_engines"]["shorts_9x16"] = engine
             if metadata["person_protection_engine"] in {"Pending", "Disabled"}:
                 metadata["person_protection_engine"] = person_engine
             errors.extend(outpaint_errors)
@@ -739,6 +749,7 @@ def process_image_file(
             failed_outputs += 1
             failed_names.append(path.name)
             metadata["shorts_9x16_engine"] = failure_engine
+            metadata["actual_extension_engines"]["shorts_9x16"] = failure_engine
             metadata["outputs"]["shorts_9x16"] = {
                 "status": "failed",
                 "path": str(path),
@@ -767,6 +778,7 @@ def process_image_file(
     else:
         status = "success"
     metadata["status"] = status
+    metadata["generation_status"] = status
     _write_job_json(app_root, item_dir, metadata)
     write_log(
         app_root,
