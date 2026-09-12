@@ -1,6 +1,0 @@
-diffusers>=0.35
-transformers>=4.46
-accelerate>=1.1
-safetensors>=0.4
-rembg[cpu]>=2.0.67
-onnxruntime>=1.20
