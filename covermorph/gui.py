@@ -414,7 +414,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.extension_menu.pack(fill="x", padx=12, pady=(0, 8))
         self.extension_desc = ctk.CTkLabel(
             frame,
-            text="AI 자연 배경 확장이 기본값입니다. 실패하면 자연 배경 확장, 블러 배경 순서로 전환합니다.",
+            text="AI 자연 배경 확장이 기본값입니다. 실패하면 해당 출력은 저장하지 않으며, 자연 확장·스마트 크롭·블러를 직접 선택해 다시 처리하세요.",
             wraplength=350,
             justify="left",
             text_color="#cbd5e1",
@@ -1606,7 +1606,7 @@ class CoverMorphApp(_CoverMorphWindow):
             if len(failed_names) > 12:
                 message += f"\n...외 {len(failed_names) - 12}개"
         if fallback_lines:
-            message += "\n\n자동 전환:\n" + "\n".join(fallback_lines[:8])
+            message += "\n\n엔진 오류/처리 기록:\n" + "\n".join(fallback_lines[:8])
             if len(fallback_lines) > 8:
                 message += f"\n...외 {len(fallback_lines) - 8}건"
         self.status.configure(text=f"완료\n{output_dir}\n생성 {generated_count}개")

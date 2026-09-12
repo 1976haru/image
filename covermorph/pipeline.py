@@ -44,6 +44,14 @@ class PipelineCancelled(RuntimeError):
     pass
 
 
+class OutputEngineFailure(RuntimeError):
+    """A selected output engine failed; do not silently use another engine."""
+
+    def __init__(self, message: str, error: dict[str, str]):
+        super().__init__(message)
+        self.error = error
+
+
 @dataclass(slots=True)
 class PipelineOptions:
     output_dir: Path
@@ -391,27 +399,12 @@ def _outpaint_or_fallback(
         return local, engine, errors, person_engine
 
     if not options.use_sdxl or not ai.sdxl_available():
-        try:
-            local, engine = _local_format(img, preset, kind, size, options, mode="natural")
-            write_log(root, f"SDXL unavailable for {kind}; Natural extension fallback was used.")
-            errors.append(
-                _error(
-                    "sdxl_unavailable",
-                    f"SDXL unavailable for {kind}; Natural extension fallback was used.",
-                )
-            )
-            return local, f"Fallback natural extension ({engine})", errors, person_engine
-        except Exception as exc:
-            write_exception(root, f"Natural extension fallback failed {kind}", exc)
-            local, engine = _local_format(img, preset, kind, size, options, mode="blur")
-            errors.append(
-                _error(
-                    "natural_extension_failed",
-                    f"Natural extension failed for {kind}; Blur Canvas fallback was used.",
-                    str(exc),
-                )
-            )
-            return local, f"Fallback blur canvas ({engine})", errors, person_engine
+        error = _error(
+            "sdxl_unavailable",
+            f"SDXL unavailable for {kind}; choose a local extension mode explicitly.",
+        )
+        write_log(root, error["message"])
+        raise OutputEngineFailure(error["message"], error)
 
     try:
         person_mask, person_engine, person_error = _person_mask_or_whole_foreground(
@@ -443,29 +436,16 @@ def _outpaint_or_fallback(
             NEGATIVE_OUTPAINT_PROMPT,
         )
         return restore_protected_pixels(generated, protect), f"{engine} + {person_engine}", errors, person_engine
+    except OutputEngineFailure:
+        raise
     except Exception as exc:
-        write_exception(root, f"SDXL {kind} fallback", exc)
-        errors.append(
-            _error(
-                "sdxl_failed",
-                f"SDXL failed for {kind}; Natural extension fallback was used.",
-                str(exc),
-            )
+        write_exception(root, f"SDXL {kind} failed", exc)
+        error = _error(
+            "sdxl_failed",
+            f"SDXL failed for {kind}; output was not saved.",
+            str(exc),
         )
-        try:
-            local, engine = _local_format(img, preset, kind, size, options, mode="natural")
-            return local, f"Fallback natural extension ({engine})", errors, person_engine
-        except Exception as natural_exc:
-            write_exception(root, f"Natural extension fallback failed {kind}", natural_exc)
-            local, engine = _local_format(img, preset, kind, size, options, mode="blur")
-            errors.append(
-                _error(
-                    "natural_extension_failed",
-                    f"Natural extension failed for {kind}; Blur Canvas fallback was used.",
-                    str(natural_exc),
-                )
-            )
-            return local, f"Fallback blur canvas ({engine})", errors, person_engine
+        raise OutputEngineFailure(error["message"], error) from exc
 
 
 def _save_output(
@@ -697,14 +677,19 @@ def process_image_file(
             raise
         except Exception as exc:
             write_exception(app_root, f"Thumbnail output failed {source.name}", exc)
-            errors.append(_error("output_generation_failed", "16:9 output generation failed.", str(exc)))
+            if isinstance(exc, OutputEngineFailure):
+                errors.append(exc.error)
+                failure_engine = f"Failed ({exc.error['category']}; not saved)"
+            else:
+                errors.append(_error("output_generation_failed", "16:9 output generation failed.", str(exc)))
+                failure_engine = "Failed (not saved)"
             failed_outputs += 1
             failed_names.append(path.name)
-            metadata["thumbnail_16x9_engine"] = "Failed"
+            metadata["thumbnail_16x9_engine"] = failure_engine
             metadata["outputs"]["thumbnail_16x9"] = {
                 "status": "failed",
                 "path": str(path),
-                "engine": "Failed",
+                "engine": failure_engine,
                 "error": str(exc),
             }
             _output_done(progress_callback, "thumbnail_16x9", source.name, "failed")
@@ -745,21 +730,27 @@ def process_image_file(
             raise
         except Exception as exc:
             write_exception(app_root, f"Shorts output failed {source.name}", exc)
-            errors.append(_error("output_generation_failed", "9:16 output generation failed.", str(exc)))
+            if isinstance(exc, OutputEngineFailure):
+                errors.append(exc.error)
+                failure_engine = f"Failed ({exc.error['category']}; not saved)"
+            else:
+                errors.append(_error("output_generation_failed", "9:16 output generation failed.", str(exc)))
+                failure_engine = "Failed (not saved)"
             failed_outputs += 1
             failed_names.append(path.name)
-            metadata["shorts_9x16_engine"] = "Failed"
+            metadata["shorts_9x16_engine"] = failure_engine
             metadata["outputs"]["shorts_9x16"] = {
                 "status": "failed",
                 "path": str(path),
-                "engine": "Failed",
+                "engine": failure_engine,
                 "error": str(exc),
             }
             _output_done(progress_callback, "shorts_9x16", source.name, "failed")
 
     sdxl_errors = [error for error in errors if error["category"].startswith("sdxl")]
     extension_errors = [error for error in errors if "extension" in error["category"] or error["category"].startswith("sdxl")]
-    metadata["sdxl_fallback"] = bool(sdxl_errors)
+    metadata["sdxl_fallback"] = False
+    metadata["sdxl_fallback_policy"] = "explicit-local-mode-only"
     metadata["sdxl_failures"] = sdxl_errors
     metadata["extension_fallbacks"] = extension_errors
     metadata["errors"] = errors

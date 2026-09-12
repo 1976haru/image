@@ -481,6 +481,8 @@ def render_full_frame_format(
         if kind == "thumbnail":
             return make_text_safe_landscape(normalized, preset, size), "Blur Canvas"
         return make_shorts(normalized, preset), "Blur Canvas"
+    if mode == "ai_natural":
+        raise RuntimeError("AI 자연 배경 확장 결과가 없습니다. 먼저 변환을 실행하거나 로컬 방식을 선택하세요.")
     return natural_background_extend(
         normalized,
         size,

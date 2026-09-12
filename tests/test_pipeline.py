@@ -97,7 +97,7 @@ def assert_no_blank_frame(path: Path) -> None:
         assert not np.all(mean > 250)
 
 
-def test_sdxl_error_falls_back_per_output(tmp_path: Path) -> None:
+def test_sdxl_error_fails_per_output_without_saving_a_local_replacement(tmp_path: Path) -> None:
     source = make_input(tmp_path / "cover.jpg")
     options = PipelineOptions(
         output_dir=tmp_path / "out",
@@ -112,17 +112,17 @@ def test_sdxl_error_falls_back_per_output(tmp_path: Path) -> None:
 
     result = process_image_file(source, options, FailingSdxlAI(), tmp_path)
 
-    assert result.status == "partial"
-    assert result.success_outputs == 2
-    assert result.metadata["sdxl_fallback"] is True
-    assert result.metadata["thumbnail_16x9_engine"] == "Fallback natural extension (Natural edge extension)"
-    assert result.metadata["shorts_9x16_engine"] == "Fallback natural extension (Natural edge extension)"
-    assert any(error["category"] == "sdxl_failed" for error in result.metadata["sdxl_failures"])
-    assert Path(result.metadata["output_files"]["thumbnail_16x9"]).is_file()
-    assert Path(result.metadata["output_files"]["shorts_9x16"]).is_file()
+    assert result.status == "failed"
+    assert result.success_outputs == 0
+    assert result.failed_outputs == 2
+    assert result.metadata["sdxl_fallback"] is False
+    assert "not saved" in result.metadata["thumbnail_16x9_engine"]
+    assert "not saved" in result.metadata["shorts_9x16_engine"]
+    assert all(error["category"] == "sdxl_failed" for error in result.metadata["sdxl_failures"])
+    assert not result.metadata["output_files"]
 
 
-def test_sdxl_then_natural_extension_failure_falls_back_to_blur(tmp_path: Path, monkeypatch) -> None:
+def test_sdxl_failure_does_not_try_an_implicit_natural_or_blur_fallback(tmp_path: Path, monkeypatch) -> None:
     source = make_input(tmp_path / "cover.jpg")
     options = PipelineOptions(
         output_dir=tmp_path / "out",
@@ -136,18 +136,38 @@ def test_sdxl_then_natural_extension_failure_falls_back_to_blur(tmp_path: Path, 
     )
 
     def fail_natural(*args, **kwargs):
-        raise RuntimeError("natural extension failed")
+        raise AssertionError("implicit natural fallback must not run")
 
     monkeypatch.setattr("covermorph.pipeline.natural_background_extend", fail_natural)
 
     result = process_image_file(source, options, FailingSdxlAI(), tmp_path)
 
-    assert result.success_outputs == 1
-    assert result.metadata["thumbnail_16x9_engine"] == "Fallback blur canvas (Blur Canvas)"
-    assert [error["category"] for error in result.metadata["extension_fallbacks"]] == [
-        "sdxl_failed",
-        "natural_extension_failed",
-    ]
+    assert result.status == "failed"
+    assert result.success_outputs == 0
+    assert result.failed_outputs == 1
+    assert not result.metadata["output_files"]
+
+
+def test_sdxl_unavailable_marks_output_failed_and_does_not_save(tmp_path: Path) -> None:
+    source = make_input(tmp_path / "unavailable.jpg")
+    options = PipelineOptions(
+        output_dir=tmp_path / "out",
+        auto_remove_text=False,
+        prefer_esrgan=False,
+        out_square=False,
+        out_thumb=False,
+        out_shorts=True,
+        extension_mode="ai_natural",
+        use_sdxl=True,
+    )
+
+    result = process_image_file(source, options, BaseFakeAI(), tmp_path)
+
+    assert result.status == "failed"
+    assert result.success_outputs == 0
+    assert result.metadata["outputs"]["shorts_9x16"]["status"] == "failed"
+    assert result.metadata["shorts_9x16_engine"].endswith("not saved)")
+    assert result.metadata["sdxl_failures"][0]["category"] == "sdxl_unavailable"
 
 
 def test_realesrgan_missing_falls_back_to_local_sharpen(tmp_path: Path) -> None:
@@ -386,7 +406,7 @@ def test_five_image_selection_counts(tmp_path: Path) -> None:
 
 def test_five_images_all_thumbnail(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"thumb{i}.jpg") for i in range(5)]
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=False) for source in sources]
+    jobs = [ImageJob(source=source, extension_mode="natural", out_square=False, out_thumb=True, out_shorts=False) for source in sources]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
 
@@ -396,7 +416,7 @@ def test_five_images_all_thumbnail(tmp_path: Path) -> None:
 
 def test_five_images_all_shorts(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"shorts{i}.jpg") for i in range(5)]
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=False, out_shorts=True) for source in sources]
+    jobs = [ImageJob(source=source, extension_mode="natural", out_square=False, out_thumb=False, out_shorts=True) for source in sources]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
 
@@ -406,7 +426,7 @@ def test_five_images_all_shorts(tmp_path: Path) -> None:
 
 def test_five_images_thumbnail_and_shorts(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"both{i}.jpg") for i in range(5)]
-    jobs = [ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=True) for source in sources]
+    jobs = [ImageJob(source=source, extension_mode="natural", out_square=False, out_thumb=True, out_shorts=True) for source in sources]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
 
@@ -417,11 +437,11 @@ def test_five_images_thumbnail_and_shorts(tmp_path: Path) -> None:
 def test_per_image_different_output_formats(tmp_path: Path) -> None:
     sources = [make_input(tmp_path / f"mix{i}.jpg") for i in range(5)]
     jobs = [
-        ImageJob(source=sources[0], out_square=False, out_thumb=True, out_shorts=True),
-        ImageJob(source=sources[1], out_square=False, out_thumb=False, out_shorts=True),
-        ImageJob(source=sources[2], out_square=False, out_thumb=True, out_shorts=False),
-        ImageJob(source=sources[3], out_square=True, out_thumb=False, out_shorts=False),
-        ImageJob(source=sources[4], out_square=True, out_thumb=True, out_shorts=True),
+        ImageJob(source=sources[0], extension_mode="natural", out_square=False, out_thumb=True, out_shorts=True),
+        ImageJob(source=sources[1], extension_mode="natural", out_square=False, out_thumb=False, out_shorts=True),
+        ImageJob(source=sources[2], extension_mode="natural", out_square=False, out_thumb=True, out_shorts=False),
+        ImageJob(source=sources[3], extension_mode="natural", out_square=True, out_thumb=False, out_shorts=False),
+        ImageJob(source=sources[4], extension_mode="natural", out_square=True, out_thumb=True, out_shorts=True),
     ]
 
     results = process_image_jobs(jobs, local_options(tmp_path), tmp_path, BaseFakeAI())
@@ -548,8 +568,8 @@ def test_progress_counts_failed_outputs(tmp_path: Path) -> None:
 def test_multi_image_duplicate_file_names_get_new_numbers(tmp_path: Path) -> None:
     source = make_input(tmp_path / "same.jpg")
     jobs = [
-        ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=False),
-        ImageJob(source=source, out_square=False, out_thumb=True, out_shorts=False),
+        ImageJob(source=source, extension_mode="natural", out_square=False, out_thumb=True, out_shorts=False),
+        ImageJob(source=source, extension_mode="natural", out_square=False, out_thumb=True, out_shorts=False),
     ]
 
     results = process_image_jobs(

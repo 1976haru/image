@@ -40,7 +40,7 @@ Completed:
   - Korean and space filename handling
   - 16:9 and 9:16 outputs have no black or white blank borders
   - protected pixel restoration
-  - SDXL to natural extension to blur fallback order
+  - SDXL failure is recorded per output and does not save an implicit local replacement
 - Japanese OCR candidate test: PASS without model download using a deterministic Japanese detection fixture
 - OpenCV inpainting tests: PASS for NS/Telea comparison, adaptive padding, and feather blending
 - Shared preview/save renderer test: PASS for 16:9 and 9:16 output sizes
