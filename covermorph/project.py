@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -11,7 +12,7 @@ from typing import Any
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-PROJECT_SCHEMA_VERSION = 2
+PROJECT_SCHEMA_VERSION = 3
 PROJECT_FILENAME = "covermorph_project.json"
 
 INPUT_TYPE_TEXTLESS = "textless"
@@ -463,7 +464,7 @@ def create_project(project_dir: Path, name: str | None = None) -> CoverMorphProj
 
 
 def ensure_project_dirs(project: CoverMorphProject) -> None:
-    for relative in ("assets/originals", "assets/removal_previews", "assets/textless", "assets/references", "assets/inputs", "assets/generated"):
+    for relative in ("assets/originals", "assets/removal_previews", "assets/textless", "assets/references", "assets/references/processed", "assets/inputs", "assets/generated"):
         (project.project_dir / relative).mkdir(parents=True, exist_ok=True)
 
 
@@ -511,6 +512,33 @@ def add_person_reference(project: CoverMorphProject, person: PersonRecord, sourc
     reference = ReferenceImage(image_id, path_to_project_string(project, dest), role, use, note)
     person.reference_images.append(reference)
     return reference
+
+
+def prepare_reference_image(project: CoverMorphProject, reference: ReferenceImage, crop_box: tuple[int, int, int, int] | None = None) -> tuple[Path, dict[str, Any]]:
+    """Validate, orient, RGB-normalize, and optionally crop one reference without touching its source."""
+    source = resolve_project_path(project, reference.path)
+    if not source.is_file():
+        raise ProjectAssetError(f"Reference image is missing: {source}")
+    try:
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        with Image.open(source) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ProjectAssetError(f"Reference image is damaged or unreadable: {source}") from exc
+    processed = image
+    crop_key = "full"
+    if crop_box is not None:
+        left, top, right, bottom = (int(value) for value in crop_box)
+        if not (0 <= left < right <= image.width and 0 <= top < bottom <= image.height):
+            raise ProjectAssetError("Reference crop box is outside the image.")
+        processed = image.crop((left, top, right, bottom))
+        crop_key = f"{left}_{top}_{right}_{bottom}"
+    cache_key = hashlib.sha256(f"{source_hash}|{crop_key}|exif_transpose|rgb|ip-adapter-sdxl-v1".encode()).hexdigest()[:20]
+    destination = project.project_dir / "assets" / "references" / "processed" / f"{reference.image_id}_{cache_key}.png"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.is_file():
+        processed.save(destination, "PNG")
+    return destination, {"source_sha256": source_hash, "processed_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "crop_box": list(crop_box) if crop_box else None, "preprocess": "EXIF transpose, RGB, optional user crop", "cache_key": cache_key}
 
 
 def parse_input_file(path: Path) -> list[InputRecord]:

@@ -1,0 +1,5 @@
+# Optional 3-A/3-B1 local SDXL generation environment.
+diffusers>=0.37,<0.41
+transformers>=4.45,<5
+accelerate>=0.34,<2
+huggingface_hub>=0.26,<2

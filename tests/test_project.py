@@ -70,7 +70,7 @@ def test_project_save_load_restores_candidates_selection_and_settings(tmp_path: 
     loaded = load_project(project.project_file)
     restored = loaded.candidates[0]
 
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == 3
     assert loaded.project_id == project.project_id
     assert loaded.channel_name == "채널 A"
     assert loaded.series_name == "밤 산책"
@@ -184,7 +184,7 @@ def test_atomic_save_writes_valid_json(tmp_path: Path) -> None:
     save_project_atomic(project)
     data = json.loads(project.project_file.read_text(encoding="utf-8"))
 
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["candidates"][0]["working_source_approved"] is True
 
 
@@ -194,10 +194,10 @@ def test_schema_v1_project_migrates_without_candidate_loss(tmp_path: Path) -> No
     project_file = tmp_path / "project" / "covermorph_project.json"
     project_file.write_text(json.dumps({"schema_version": 1, "project_id": "old", "name": "old", "candidates": [{"candidate_id": "c1", "original_path": "assets/originals/old.png", "working_source_path": "assets/textless/old.png", "input_type": "textless"}]}), encoding="utf-8")
     loaded = load_project(project_file)
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == 3
     assert loaded.candidates[0].candidate_id == "c1"
     save_project_atomic(loaded)
-    assert json.loads(project_file.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert json.loads(project_file.read_text(encoding="utf-8"))["schema_version"] == 3
     assert source.exists() and working.exists()
 
 

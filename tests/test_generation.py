@@ -15,9 +15,13 @@ from covermorph.generation import (
     retry_failed_candidates,
 )
 from covermorph.project import (
+    ProjectAssetError,
     SceneCard,
+    add_person,
+    add_person_reference,
     create_project,
     load_project,
+    prepare_reference_image,
     save_project_atomic,
 )
 
@@ -27,9 +31,13 @@ class FakeEngine:
         self.seeds: list[int] = []
         self.failures = failures or set()
         self.cancel_after = cancel_after
+        self.ip_adapter_loaded = False
+        self.calls: list[tuple[str, float, bool]] = []
 
-    def generate_one(self, prompt, negative_prompt, config, seed, cancel_event, progress=None):
+    def generate_one(self, prompt, negative_prompt, config, seed, cancel_event, progress=None, reference_image=None):
         self.seeds.append(seed)
+        self.calls.append((config.reference_mode, config.reference_strength, reference_image is not None))
+        self.ip_adapter_loaded = config.reference_mode != "off" and reference_image is not None
         if seed in self.failures:
             raise GenerationError("fake failure")
         if self.cancel_after is not None and len(self.seeds) > self.cancel_after:
@@ -94,3 +102,48 @@ def test_cpu_environment_never_reports_generation_ready(tmp_path: Path) -> None:
     environment = detect_generation_environment(tmp_path)
     assert environment["cuda"] is False
     assert environment["status"] in {"gpu_unavailable", "package_missing"}
+
+
+def test_reference_off_and_on_pass_the_expected_condition(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "refs")
+    reference_source = tmp_path / "reference.png"
+    Image.new("RGBA", (32, 24), (10, 20, 30, 128)).save(reference_source)
+    person = add_person(project, "A")
+    reference = add_person_reference(project, person, reference_source, "person", "face")
+    scene = confirmed_scene()
+    off_engine = FakeEngine()
+    generate_scene_candidates(project, scene, off_engine, GenerationConfig(candidate_count=1, seed=1), Event())
+    assert off_engine.calls == [("off", 0.5, False)]
+    on_engine = FakeEngine()
+    config = GenerationConfig(candidate_count=1, seed=2, reference_mode="person", reference_image_id=reference.image_id, reference_strength=0.8)
+    result = generate_scene_candidates(project, scene, on_engine, config, Event())
+    assert result.completed == 1
+    assert on_engine.calls == [("person", 0.8, True)]
+    assert project.candidates[-1].generation_metadata["reference"]["reference_image_id"] == reference.image_id
+    assert project.candidates[-1].generation_metadata["references_applied"] is True
+
+
+def test_reference_modes_do_not_leak_and_crop_cache_changes(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "cache")
+    person = add_person(project, "A")
+    source = tmp_path / "ref.png"
+    Image.new("RGB", (40, 30), (1, 2, 3)).save(source)
+    reference = add_person_reference(project, person, source, "style")
+    first, first_meta = prepare_reference_image(project, reference)
+    second, second_meta = prepare_reference_image(project, reference, (0, 0, 20, 20))
+    assert first != second
+    assert first_meta["source_sha256"] == second_meta["source_sha256"]
+    style_scene = confirmed_scene()
+    style_engine = FakeEngine()
+    generate_scene_candidates(project, style_scene, style_engine, GenerationConfig(reference_mode="style", reference_image_id=reference.image_id, candidate_count=1), Event())
+    off_engine = FakeEngine()
+    generate_scene_candidates(project, style_scene, off_engine, GenerationConfig(reference_mode="off", candidate_count=1), Event())
+    assert style_engine.calls[0][0:3] == ("style", 0.5, True)
+    assert off_engine.calls[0][0:3] == ("off", 0.5, False)
+
+
+def test_missing_reference_blocks_without_registering_output(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "missing-ref")
+    with pytest.raises(ProjectAssetError, match="missing or ambiguous"):
+        generate_scene_candidates(project, confirmed_scene(), FakeEngine(), GenerationConfig(reference_mode="person", reference_image_id="gone"), Event())
+    assert project.candidates == []
