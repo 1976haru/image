@@ -11,12 +11,20 @@ from covermorph.project import (
     INPUT_TYPE_EXISTING_COVER,
     INPUT_TYPE_TEXTLESS,
     CandidateSettings,
+    ChannelGenerationPreset,
+    InputRecord,
     ProjectAssetError,
     ProjectLoadError,
+    SceneCard,
     add_candidate_from_file,
+    add_input_records,
+    add_person,
+    add_person_reference,
     adopt_removal_preview,
+    configure_scene_prompt,
     create_project,
     load_project,
+    parse_input_file,
     resolve_project_path,
     save_project_atomic,
     save_removal_preview,
@@ -62,7 +70,7 @@ def test_project_save_load_restores_candidates_selection_and_settings(tmp_path: 
     loaded = load_project(project.project_file)
     restored = loaded.candidates[0]
 
-    assert loaded.schema_version == 1
+    assert loaded.schema_version == 2
     assert loaded.project_id == project.project_id
     assert loaded.channel_name == "채널 A"
     assert loaded.series_name == "밤 산책"
@@ -176,5 +184,80 @@ def test_atomic_save_writes_valid_json(tmp_path: Path) -> None:
     save_project_atomic(project)
     data = json.loads(project.project_file.read_text(encoding="utf-8"))
 
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["candidates"][0]["working_source_approved"] is True
+
+
+def test_schema_v1_project_migrates_without_candidate_loss(tmp_path: Path) -> None:
+    source = make_image(tmp_path / "project" / "assets" / "originals" / "old.png", (4, 5, 6))
+    working = make_image(tmp_path / "project" / "assets" / "textless" / "old.png", (4, 5, 6))
+    project_file = tmp_path / "project" / "covermorph_project.json"
+    project_file.write_text(json.dumps({"schema_version": 1, "project_id": "old", "name": "old", "candidates": [{"candidate_id": "c1", "original_path": "assets/originals/old.png", "working_source_path": "assets/textless/old.png", "input_type": "textless"}]}), encoding="utf-8")
+    loaded = load_project(project_file)
+    assert loaded.schema_version == 2
+    assert loaded.candidates[0].candidate_id == "c1"
+    save_project_atomic(loaded)
+    assert json.loads(project_file.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert source.exists() and working.exists()
+
+
+def test_people_references_scenes_and_prompt_snapshot_round_trip(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "prompt")
+    person = add_person(project, "Shared Person")
+    reference = add_person_reference(project, person, make_image(tmp_path / "ref.png", (10, 20, 30)), "person", "face")
+    preset = ChannelGenerationPreset("p1", "Tokyo draft", version=3, master_prompt="cinematic", negative_prompt="blur")
+    project.channel_preset_id = preset.preset_id
+    project.channel_preset = preset.to_dict()
+    scene = SceneCard("s1", person_ids=[person.person_id], reference_image_ids=[reference.image_id], user_description="밤의 카페 東京 café")
+    configure_scene_prompt(project, scene, preset)
+    scene.prompt_confirmed = True
+    project.scenes.append(scene)
+    save_project_atomic(project)
+    moved = tmp_path / "moved"
+    shutil.move(str(project.project_dir), str(moved))
+    loaded = load_project(moved)
+    assert loaded.people[0].reference_images[0].path.startswith("assets/")
+    assert resolve_project_path(loaded, loaded.people[0].reference_images[0].path).is_file()
+    assert loaded.scenes[0].person_ids == [person.person_id]
+    assert "東京" in loaded.scenes[0].prompt_user
+    assert loaded.scenes[0].prompt_confirmed is True
+
+
+def test_input_records_are_copied_inside_project(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "inputs")
+    source = tmp_path / "외부" / "가사.json"
+    source.parent.mkdir()
+    source.write_text(json.dumps({"title": "東京", "lyrics": "café 프랑스"}, ensure_ascii=False), encoding="utf-8")
+    records = parse_input_file(source)
+    add_input_records(project, records)
+    save_project_atomic(project)
+    loaded = load_project(project.project_file)
+    assert not Path(loaded.inputs[0].source_path).is_absolute()
+    assert resolve_project_path(loaded, loaded.inputs[0].source_path).is_file()
+    assert source.read_text(encoding="utf-8").find("café") >= 0
+
+
+def test_scene_prompt_does_not_force_lyrics_or_cover_text_and_refresh_resets_confirmation(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "prompt")
+    project.inputs.append(InputRecord("i1", "lyrics", lyrics="가사 전체는 프롬프트에 자동 삽입하지 않음", theme_mood="French café"))
+    first = ChannelGenerationPreset("p1", "first", master_prompt="base", negative_prompt="bad")
+    second = ChannelGenerationPreset("p2", "second", version=2, master_prompt="changed")
+    scene = SceneCard("s1", user_description="사용자가 쓴 장면")
+    configure_scene_prompt(project, scene, first)
+    scene.prompt_confirmed = True
+    configure_scene_prompt(project, scene, second)
+    assert scene.prompt_source_preset_id == "p1"
+    configure_scene_prompt(project, scene, second, refresh=True)
+    assert scene.prompt_source_preset_id == "p2"
+    assert scene.prompt_confirmed is False
+    assert "가사 전체" not in scene.prompt_user
+
+
+def test_utf8_bom_input_and_unknown_json_are_reported(tmp_path: Path) -> None:
+    txt = tmp_path / "lyrics.txt"
+    txt.write_text("日本語 café 프랑스", encoding="utf-8-sig")
+    assert parse_input_file(txt)[0].lyrics == "日本語 café 프랑스"
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text(json.dumps({"mystery": 1}), encoding="utf-8")
+    with pytest.raises(ProjectLoadError, match="Unknown JSON"):
+        parse_input_file(unknown)

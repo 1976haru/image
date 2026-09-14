@@ -39,15 +39,24 @@ from .project import (
     INPUT_TYPE_TEXTLESS,
     CandidateRecord,
     CandidateSettings,
+    ChannelGenerationPreset,
     CoverMorphProject,
     ProjectAssetError,
     ProjectLoadError,
+    SceneCard,
     add_candidate_from_file,
+    add_input_records,
+    add_person,
+    add_person_reference,
     adopt_removal_preview,
+    configure_scene_prompt,
     create_project,
+    load_generation_presets,
     load_project,
+    parse_input_file,
     path_to_project_string,
     resolve_project_path,
+    save_generation_presets,
     save_project_atomic,
     save_removal_preview,
     validate_project_assets,
@@ -245,7 +254,18 @@ class CoverMorphApp(_CoverMorphWindow):
         self.lyric_mood_var = ctk.StringVar(value="")
         self.input_type_var = ctk.StringVar(value="글자 없는 이미지")
 
+        self.generation_presets = load_generation_presets(self.root_dir / "config" / "channel_generation_presets.json")
+        self.generation_preset_var = ctk.StringVar(value=self.generation_presets[0].name if self.generation_presets else "")
+        self.person_name_var = ctk.StringVar(value="")
+        self.scene_description_var = ctk.StringVar(value="")
+        self.reference_role_var = ctk.StringVar(value="person")
+        self.preset_master_prompt_var = ctk.StringVar(value="")
+        self.preset_negative_prompt_var = ctk.StringVar(value="")
+        self.current_scene_id: str | None = None
+        self.prompt_preview_text: ctk.CTkTextbox | None = None
+
         self.build_project_group(left)
+        self.build_generation_group(left)
         self.build_input_group(left)
         self.build_output_folder_group(left)
         self.build_preset_group(left)
@@ -394,6 +414,53 @@ class CoverMorphApp(_CoverMorphWindow):
         ctk.CTkLabel(frame, text="가사 분위기/주제", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12)
         self.lyric_mood_entry = ctk.CTkEntry(frame, textvariable=self.lyric_mood_var)
         self.lyric_mood_entry.pack(fill="x", padx=12, pady=(3, 12))
+
+    def build_generation_group(self, parent: Any) -> None:
+        frame = self.group(parent, "1. 채널 설정 / 기준 인물 / 장면")
+        names = [preset.name for preset in self.generation_presets] or ["새 생성 채널"]
+        self.generation_preset_menu = ctk.CTkOptionMenu(frame, variable=self.generation_preset_var, values=names, command=self.on_generation_preset_changed)
+        self.generation_preset_menu.pack(fill="x", padx=12, pady=(0, 4))
+        self.preset_draft_label = ctk.CTkLabel(frame, text="생성용 채널 프리셋 초안 | 기존 출력 배치 프리셋과 별도", text_color="#fbbf24", anchor="w")
+        self.preset_draft_label.pack(fill="x", padx=12, pady=3)
+        if self.generation_presets:
+            self.preset_master_prompt_var.set(self.generation_presets[0].master_prompt)
+            self.preset_negative_prompt_var.set(self.generation_presets[0].negative_prompt)
+        ctk.CTkLabel(frame, text="마스터 프롬프트 (글자 없는 이미지 기본)", anchor="w").pack(fill="x", padx=12, pady=(4, 2))
+        self.preset_master_prompt_entry = ctk.CTkEntry(frame, textvariable=self.preset_master_prompt_var)
+        self.preset_master_prompt_entry.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(frame, text="네거티브 프롬프트", anchor="w").pack(fill="x", padx=12, pady=(3, 2))
+        self.preset_negative_prompt_entry = ctk.CTkEntry(frame, textvariable=self.preset_negative_prompt_var)
+        self.preset_negative_prompt_entry.pack(fill="x", padx=12, pady=2)
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=3)
+        self.duplicate_generation_button = ctk.CTkButton(row, text="프리셋 복제", command=self.duplicate_generation_preset)
+        self.duplicate_generation_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.save_generation_button = ctk.CTkButton(row, text="프리셋 저장", command=self.save_generation_preset)
+        self.save_generation_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ctk.CTkLabel(frame, text="기준 인물 이름 (등록 후 여러 장면에서 같은 ID 사용)", anchor="w").pack(fill="x", padx=12, pady=(7, 2))
+        self.person_name_entry = ctk.CTkEntry(frame, textvariable=self.person_name_var)
+        self.person_name_entry.pack(fill="x", padx=12, pady=2)
+        self.add_person_button = ctk.CTkButton(frame, text="인물 등록", command=self.add_project_person)
+        self.add_person_button.pack(fill="x", padx=12, pady=3)
+        self.reference_role_menu = ctk.CTkOptionMenu(frame, variable=self.reference_role_var, values=["person", "style", "background_composition"])
+        self.reference_role_menu.pack(fill="x", padx=12, pady=3)
+        self.add_reference_button = ctk.CTkButton(frame, text="선택 인물에 참고 이미지 추가", command=self.add_project_reference)
+        self.add_reference_button.pack(fill="x", padx=12, pady=3)
+        self.input_file_button = ctk.CTkButton(frame, text="가사/프롬프트 TXT·JSON 불러오기", command=self.import_project_input)
+        self.input_file_button.pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(frame, text="장면 설명 (사용자 작성, 자동 가사 해석 아님)", anchor="w").pack(fill="x", padx=12, pady=(7, 2))
+        self.scene_description_entry = ctk.CTkEntry(frame, textvariable=self.scene_description_var)
+        self.scene_description_entry.pack(fill="x", padx=12, pady=2)
+        self.compose_scene_button = ctk.CTkButton(frame, text="장면 추가 / 최종 프롬프트 구성", command=self.add_project_scene)
+        self.compose_scene_button.pack(fill="x", padx=12, pady=3)
+        self.duplicate_scene_button = ctk.CTkButton(frame, text="현재 장면 복제", command=self.duplicate_current_scene)
+        self.duplicate_scene_button.pack(fill="x", padx=12, pady=3)
+        self.confirm_scene_button = ctk.CTkButton(frame, text="현재 장면 확인 완료", command=self.confirm_current_scene)
+        self.confirm_scene_button.pack(fill="x", padx=12, pady=3)
+        self.prompt_preview_text = ctk.CTkTextbox(frame, height=110)
+        self.prompt_preview_text.pack(fill="x", padx=12, pady=3)
+        self.copy_prompt_button = ctk.CTkButton(frame, text="최종 프롬프트 복사", command=self.copy_current_prompt)
+        self.copy_prompt_button.pack(fill="x", padx=12, pady=(3, 12))
 
     def build_ocr_group(self, parent: Any) -> None:
         frame = self.group(parent, "4. OCR 및 글자 제거")
@@ -605,6 +672,21 @@ class CoverMorphApp(_CoverMorphWindow):
             self.channel_name_entry,
             self.series_name_entry,
             self.lyric_mood_entry,
+            self.generation_preset_menu,
+            self.preset_master_prompt_entry,
+            self.preset_negative_prompt_entry,
+            self.duplicate_generation_button,
+            self.save_generation_button,
+            self.person_name_entry,
+            self.add_person_button,
+            self.reference_role_menu,
+            self.add_reference_button,
+            self.input_file_button,
+            self.scene_description_entry,
+            self.compose_scene_button,
+            self.duplicate_scene_button,
+            self.confirm_scene_button,
+            self.copy_prompt_button,
             self.input_type_menu,
             self.add_button,
             self.remove_button,
@@ -901,6 +983,139 @@ class CoverMorphApp(_CoverMorphWindow):
         if not path.exists() or not path.is_dir():
             self.status.configure(text="저장된 출력 폴더를 사용할 수 없습니다. 새 출력 폴더를 선택해주세요.")
 
+    def selected_generation_preset(self) -> ChannelGenerationPreset:
+        for preset in self.generation_presets:
+            if preset.name == self.generation_preset_var.get():
+                return preset
+        return self.generation_presets[0] if self.generation_presets else ChannelGenerationPreset("custom", "새 생성 채널")
+
+    def on_generation_preset_changed(self, _value: str = "") -> None:
+        preset = self.selected_generation_preset()
+        self.preset_master_prompt_var.set(preset.master_prompt)
+        self.preset_negative_prompt_var.set(preset.negative_prompt)
+        if self.project is None:
+            return
+        self.project.channel_preset_id = preset.preset_id
+        self.project.channel_preset = preset.to_dict()
+        self.mark_project_dirty()
+        self.preset_draft_label.configure(text="생성용 채널 프리셋 초안 | 기존 확정 장면은 유지됨")
+
+    def duplicate_generation_preset(self) -> None:
+        source = self.selected_generation_preset()
+        copied = ChannelGenerationPreset.from_dict({**source.to_dict(), "preset_id": "", "name": f"{source.name} 복제", "is_draft": True, "version": source.version + 1})
+        self.generation_presets.append(copied)
+        self.generation_preset_menu.configure(values=[item.name for item in self.generation_presets])
+        self.generation_preset_var.set(copied.name)
+        self.on_generation_preset_changed()
+
+    def save_generation_preset(self) -> None:
+        try:
+            preset = self.selected_generation_preset()
+            preset.master_prompt = self.preset_master_prompt_var.get().strip()
+            preset.negative_prompt = self.preset_negative_prompt_var.get().strip()
+            preset.version += 1
+            if self.project is not None:
+                self.project.channel_preset_id = preset.preset_id
+                self.project.channel_preset = preset.to_dict()
+                self.mark_project_dirty()
+            save_generation_presets(self.generation_presets, self.root_dir / "config" / "channel_generation_presets.json")
+            self.status.configure(text="생성용 채널 프리셋을 저장했습니다.")
+        except OSError as exc:
+            messagebox.showerror("프리셋 저장 실패", str(exc))
+
+    def add_project_person(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        person = add_person(self.project, self.person_name_var.get().strip() or "새 인물")  # type: ignore[arg-type]
+        self.person_name_var.set(f"{person.name} [{person.person_id}]")
+        self.mark_project_dirty()
+        self.status.configure(text=f"기준 인물을 등록했습니다: {person.name} ({person.person_id})")
+
+    def add_project_reference(self) -> None:
+        if self.project is None or not self.project.people:
+            messagebox.showinfo("기준 인물", "먼저 기준 인물을 등록해 주세요.")
+            return
+        filename = filedialog.askopenfilename(title="참고 이미지", filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
+        if not filename:
+            return
+        try:
+            reference = add_person_reference(self.project, self.project.people[-1], Path(filename), self.reference_role_var.get(), "other")
+        except ProjectAssetError as exc:
+            messagebox.showerror("참고 이미지 추가 실패", str(exc))
+            return
+        self.mark_project_dirty()
+        self.status.configure(text=f"참고 이미지를 복사했습니다. 모델 적용은 3단계에서 연결됩니다.\n{reference.path}")
+
+    def import_project_input(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        filename = filedialog.askopenfilename(title="가사 또는 프롬프트", filetypes=[("Text/JSON", "*.txt *.json"), ("All files", "*.*")])
+        if not filename:
+            return
+        try:
+            records = parse_input_file(Path(filename))
+        except ProjectLoadError as exc:
+            messagebox.showerror("입력 불러오기 실패", str(exc))
+            return
+        try:
+            add_input_records(self.project, records)  # type: ignore[arg-type]
+        except ProjectAssetError as exc:
+            messagebox.showerror("입력 복사 실패", str(exc))
+            return
+        self.mark_project_dirty()
+        self.status.configure(text=f"입력 자료 {len(records)}개를 추가했습니다. 가사 원문과 장면 설명은 별도로 보존됩니다.")
+
+    def add_project_scene(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        preset = self.selected_generation_preset()
+        scene = SceneCard(scene_id=f"scene_{len(self.project.scenes) + 1}", order=len(self.project.scenes) + 1, user_description=self.scene_description_var.get().strip())  # type: ignore[union-attr]
+        configure_scene_prompt(self.project, scene, preset)  # type: ignore[arg-type]
+        self.project.scenes.append(scene)  # type: ignore[union-attr]
+        self.current_scene_id = scene.scene_id
+        self.show_scene_prompt(scene)
+        self.mark_project_dirty()
+
+    def current_scene(self) -> SceneCard | None:
+        if self.project is None:
+            return None
+        return next((scene for scene in self.project.scenes if scene.scene_id == self.current_scene_id), self.project.scenes[-1] if self.project.scenes else None)
+
+    def show_scene_prompt(self, scene: SceneCard) -> None:
+        if self.prompt_preview_text is None:
+            return
+        self.prompt_preview_text.delete("1.0", "end")
+        self.prompt_preview_text.insert("1.0", f"[자동 구성]\n{scene.prompt_auto}\n\n[네거티브]\n{scene.negative_prompt_auto}\n\n확인 상태: {'완료' if scene.prompt_confirmed else '미확인'}")
+
+    def confirm_current_scene(self) -> None:
+        scene = self.current_scene()
+        if scene is None:
+            return
+        scene.prompt_confirmed = True
+        self.show_scene_prompt(scene)
+        self.mark_project_dirty()
+
+    def duplicate_current_scene(self) -> None:
+        scene = self.current_scene()
+        if scene is None or self.project is None:
+            return
+        from .project import duplicate_scene
+
+        copied = duplicate_scene(scene)
+        copied.order = len(self.project.scenes) + 1
+        self.project.scenes.append(copied)
+        self.current_scene_id = copied.scene_id
+        self.show_scene_prompt(copied)
+        self.mark_project_dirty()
+
+    def copy_current_prompt(self) -> None:
+        scene = self.current_scene()
+        if scene is None:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(scene.prompt_user or scene.prompt_auto)
+        self.status.configure(text="최종 프롬프트를 클립보드에 복사했습니다.")
+
     def project_input_type_key(self) -> str:
         return INPUT_TYPE_LABELS.get(self.input_type_var.get(), INPUT_TYPE_TEXTLESS)
 
@@ -937,6 +1152,9 @@ class CoverMorphApp(_CoverMorphWindow):
         self.project.channel_name = self.channel_name_var.get().strip()
         self.project.series_name = self.series_name_var.get().strip()
         self.project.lyric_mood_text = self.lyric_mood_var.get().strip()
+        preset = self.selected_generation_preset()
+        self.project.channel_preset_id = preset.preset_id
+        self.project.channel_preset = preset.to_dict()
         self.project.selected_candidate_ids = [
             state.candidate.candidate_id
             for state in self.image_states
@@ -952,6 +1170,16 @@ class CoverMorphApp(_CoverMorphWindow):
             self.channel_name_var.set(project.channel_name)
             self.series_name_var.set(project.series_name)
             self.lyric_mood_var.set(project.lyric_mood_text)
+            preset_id = project.channel_preset_id
+            preset = next((item for item in self.generation_presets if item.preset_id == preset_id), None)
+            if preset is None and project.channel_preset:
+                preset = ChannelGenerationPreset.from_dict(project.channel_preset)
+            if preset is not None:
+                if not any(item.preset_id == preset.preset_id for item in self.generation_presets):
+                    self.generation_presets.append(preset)
+                    self.generation_preset_menu.configure(values=[item.name for item in self.generation_presets])
+                self.generation_preset_var.set(preset.name)
+            self.current_scene_id = project.scenes[-1].scene_id if project.scenes else None
         finally:
             self._loading_project = False
         self.refresh_project_status()

@@ -11,7 +11,7 @@ from typing import Any
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2
 PROJECT_FILENAME = "covermorph_project.json"
 
 INPUT_TYPE_TEXTLESS = "textless"
@@ -29,6 +29,168 @@ class ProjectLoadError(ProjectError):
 
 class ProjectAssetError(ProjectError):
     pass
+
+
+REFERENCE_ROLES = {"person", "style", "background_composition"}
+REFERENCE_USES = {"face", "upper_body", "full_body", "other"}
+INPUT_RECORD_TYPES = {"lyrics", "image_prompt", "theme_series_mood"}
+
+
+@dataclass(slots=True)
+class ChannelGenerationPreset:
+    preset_id: str
+    name: str
+    version: int = 1
+    style: str = "사용자 지정"
+    mood: str = ""
+    color: str = ""
+    lighting: str = ""
+    era_region: str = ""
+    person_background_balance: str = ""
+    composition: str = ""
+    keep_features: str = ""
+    avoid_elements: str = ""
+    master_prompt: str = ""
+    negative_prompt: str = ""
+    textless_default: bool = True
+    is_draft: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ChannelGenerationPreset":
+        values = {field: data.get(field) for field in cls.__dataclass_fields__}
+        values["preset_id"] = str(values.get("preset_id") or new_id("preset"))
+        values["name"] = str(values.get("name") or "새 생성 채널")
+        values["version"] = int(values.get("version") or 1)
+        values["textless_default"] = bool(values.get("textless_default", True))
+        values["is_draft"] = bool(values.get("is_draft", True))
+        for field_name in (set(cls.__dataclass_fields__) - {"preset_id", "name", "version", "textless_default", "is_draft"}):
+            values[field_name] = str(values.get(field_name) or "")
+        return cls(**values)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {field: getattr(self, field) for field in self.__dataclass_fields__}
+
+
+def default_generation_presets() -> list[ChannelGenerationPreset]:
+    names = [
+        ("시니어", "OldPopLounge"),
+        ("Tokyo ChillRap Love Story", "남녀 이야기"),
+        ("Tokyo ChillRap", "남자 시점"),
+        ("Tokyo ChillRap", "여자 시점"),
+        ("Tokyo ChillRap", "카페"),
+    ]
+    return [
+        ChannelGenerationPreset(
+            preset_id=f"builtin_{index + 1}",
+            name=f"{channel} / {variant}",
+            style="사용자 지정",
+            mood=f"{variant} 분위기 초안",
+            era_region="사용자 입력 전까지 미정",
+            master_prompt="글자 없는 이미지. 사용자 장면 설명을 중심으로 구성.",
+            negative_prompt="text, typography, logo, watermark",
+        )
+        for index, (channel, variant) in enumerate(names)
+    ]
+
+
+@dataclass(slots=True)
+class ReferenceImage:
+    image_id: str
+    path: str
+    role: str = "person"
+    use: str = "other"
+    note: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReferenceImage":
+        role = str(data.get("role") or "person")
+        use = str(data.get("use") or "other")
+        return cls(str(data.get("image_id") or new_id("ref")), str(data.get("path") or ""), role if role in REFERENCE_ROLES else "person", use if use in REFERENCE_USES else "other", str(data.get("note") or ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"image_id": self.image_id, "path": self.path, "role": self.role, "use": self.use, "note": self.note}
+
+
+@dataclass(slots=True)
+class PersonRecord:
+    person_id: str
+    name: str
+    appearance: str = ""
+    hair: str = ""
+    base_outfit: str = ""
+    reference_images: list[ReferenceImage] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PersonRecord":
+        refs = data.get("reference_images") or []
+        return cls(str(data.get("person_id") or new_id("person")), str(data.get("name") or "새 인물"), str(data.get("appearance") or ""), str(data.get("hair") or ""), str(data.get("base_outfit") or ""), [ReferenceImage.from_dict(item) for item in refs if isinstance(item, dict)])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"person_id": self.person_id, "name": self.name, "appearance": self.appearance, "hair": self.hair, "base_outfit": self.base_outfit, "reference_images": [item.to_dict() for item in self.reference_images]}
+
+
+@dataclass(slots=True)
+class InputRecord:
+    input_id: str
+    input_type: str
+    title: str = ""
+    lyrics: str = ""
+    image_prompt: str = ""
+    theme_mood: str = ""
+    source_path: str = ""
+    selected: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "InputRecord":
+        return cls(str(data.get("input_id") or new_id("input")), str(data.get("input_type") or "theme_series_mood"), str(data.get("title") or ""), str(data.get("lyrics") or ""), str(data.get("image_prompt") or ""), str(data.get("theme_mood") or ""), str(data.get("source_path") or ""), bool(data.get("selected", True)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {field: getattr(self, field) for field in self.__dataclass_fields__}
+
+
+@dataclass(slots=True)
+class SceneCard:
+    scene_id: str
+    order: int = 1
+    input_id: str = ""
+    location: str = ""
+    time_of_day: str = ""
+    weather: str = ""
+    action: str = ""
+    emotion: str = ""
+    composition: str = ""
+    person_ids: list[str] = field(default_factory=list)
+    reference_image_ids: list[str] = field(default_factory=list)
+    outfit: str = ""
+    output_ratio: str = "1:1"
+    candidate_count: int = 1
+    user_description: str = ""
+    prompt_auto: str = ""
+    negative_prompt_auto: str = ""
+    prompt_user: str = ""
+    negative_prompt_user: str = ""
+    prompt_confirmed: bool = False
+    prompt_source_preset_id: str = ""
+    prompt_source_preset_version: int = 0
+    structured_request: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SceneCard":
+        values = {field: data.get(field) for field in cls.__dataclass_fields__}
+        values["scene_id"] = str(values.get("scene_id") or new_id("scene"))
+        values["order"] = int(values.get("order") or 1)
+        values["candidate_count"] = max(1, int(values.get("candidate_count") or 1))
+        values["person_ids"] = [str(x) for x in (values.get("person_ids") or [])]
+        values["reference_image_ids"] = [str(x) for x in (values.get("reference_image_ids") or [])]
+        values["structured_request"] = dict(values.get("structured_request") or {})
+        for field_name in (set(cls.__dataclass_fields__) - {"scene_id", "order", "candidate_count", "person_ids", "reference_image_ids", "structured_request", "prompt_confirmed", "prompt_source_preset_version"}):
+            values[field_name] = str(values.get(field_name) or "")
+        values["prompt_confirmed"] = bool(values.get("prompt_confirmed", False))
+        values["prompt_source_preset_version"] = int(values.get("prompt_source_preset_version") or 0)
+        return cls(**values)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {field: getattr(self, field) for field in self.__dataclass_fields__}
 
 
 @dataclass(slots=True)
@@ -177,6 +339,11 @@ class CoverMorphProject:
     series_name: str = ""
     lyric_mood_text: str = ""
     song_count: int = 0
+    channel_preset_id: str = ""
+    channel_preset: dict[str, Any] = field(default_factory=dict)
+    people: list[PersonRecord] = field(default_factory=list)
+    inputs: list[InputRecord] = field(default_factory=list)
+    scenes: list[SceneCard] = field(default_factory=list)
     selected_candidate_ids: list[str] = field(default_factory=list)
     candidates: list[CandidateRecord] = field(default_factory=list)
     created_at: str = ""
@@ -208,6 +375,11 @@ class CoverMorphProject:
             series_name=str(data.get("series_name") or ""),
             lyric_mood_text=str(data.get("lyric_mood_text") or ""),
             song_count=int(data.get("song_count") or 0),
+            channel_preset_id=str(data.get("channel_preset_id") or ""),
+            channel_preset=dict(data.get("channel_preset") or {}),
+            people=[PersonRecord.from_dict(item) for item in (data.get("people") or []) if isinstance(item, dict)],
+            inputs=[InputRecord.from_dict(item) for item in (data.get("inputs") or []) if isinstance(item, dict)],
+            scenes=[SceneCard.from_dict(item) for item in (data.get("scenes") or []) if isinstance(item, dict)],
             selected_candidate_ids=[str(item) for item in selected_ids],
             candidates=[CandidateRecord.from_dict(item) for item in candidates_data if isinstance(item, dict)],
             created_at=str(data.get("created_at") or ""),
@@ -223,6 +395,11 @@ class CoverMorphProject:
             "series_name": self.series_name,
             "lyric_mood_text": self.lyric_mood_text,
             "song_count": self.song_count,
+            "channel_preset_id": self.channel_preset_id,
+            "channel_preset": dict(self.channel_preset),
+            "people": [person.to_dict() for person in self.people],
+            "inputs": [item.to_dict() for item in self.inputs],
+            "scenes": [scene.to_dict() for scene in self.scenes],
             "selected_candidate_ids": list(self.selected_candidate_ids),
             "candidates": [candidate.to_dict() for candidate in self.candidates],
             "created_at": self.created_at,
@@ -271,8 +448,130 @@ def create_project(project_dir: Path, name: str | None = None) -> CoverMorphProj
 
 
 def ensure_project_dirs(project: CoverMorphProject) -> None:
-    for relative in ("assets/originals", "assets/removal_previews", "assets/textless"):
+    for relative in ("assets/originals", "assets/removal_previews", "assets/textless", "assets/references", "assets/inputs"):
         (project.project_dir / relative).mkdir(parents=True, exist_ok=True)
+
+
+def load_generation_presets(path: Path | None = None) -> list[ChannelGenerationPreset]:
+    """Load user-owned generation presets; built-ins are only used when absent."""
+    preset_file = path or Path("config/channel_generation_presets.json")
+    try:
+        data = json.loads(preset_file.read_text(encoding="utf-8-sig"))
+        if isinstance(data, list):
+            return [ChannelGenerationPreset.from_dict(item) for item in data if isinstance(item, dict)]
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        pass
+    return default_generation_presets()
+
+
+def save_generation_presets(presets: list[ChannelGenerationPreset], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps([item.to_dict() for item in presets], ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def add_person(project: CoverMorphProject, name: str = "새 인물") -> PersonRecord:
+    person = PersonRecord(person_id=new_id("person"), name=name)
+    project.people.append(person)
+    return person
+
+
+def add_person_reference(project: CoverMorphProject, person: PersonRecord, source_path: Path, role: str, use: str = "other", note: str = "") -> ReferenceImage:
+    if role not in REFERENCE_ROLES or use not in REFERENCE_USES:
+        raise ProjectAssetError(f"Unsupported reference role/use: {role}/{use}")
+    if not source_path.is_file():
+        raise ProjectAssetError(f"Reference image not found: {source_path}")
+    ensure_project_dirs(project)
+    image_id = new_id("ref")
+    dest = project.project_dir / "assets" / "references" / f"{image_id}{_safe_suffix(source_path)}"
+    shutil.copy2(source_path, dest)
+    _load_rgb_image(dest).close()
+    reference = ReferenceImage(image_id, path_to_project_string(project, dest), role, use, note)
+    person.reference_images.append(reference)
+    return reference
+
+
+def parse_input_file(path: Path) -> list[InputRecord]:
+    """Parse common TXT/JSON shapes without pretending to understand unknown schemas."""
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ProjectLoadError(f"Input file could not be read as UTF-8: {path}") from exc
+    if path.suffix.lower() == ".txt":
+        return [InputRecord(new_id("input"), "lyrics", path.stem, lyrics=raw, source_path=str(path))]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProjectLoadError(f"Input JSON is damaged: {path}") from exc
+    items = data if isinstance(data, list) else data.get("songs") or data.get("tracks") or data.get("items") if isinstance(data, dict) else None
+    if isinstance(items, list):
+        records = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            records.append(InputRecord(new_id("input"), "lyrics", str(item.get("title") or item.get("name") or ""), str(item.get("lyrics") or item.get("lyric") or ""), str(item.get("prompt") or item.get("image_prompt") or ""), str(item.get("theme") or item.get("mood") or ""), str(path)))
+        if records:
+            return records
+    if isinstance(data, dict):
+        known = {"title", "name", "lyrics", "lyric", "prompt", "image_prompt", "theme", "mood"}
+        if known.intersection(data):
+            return [InputRecord(new_id("input"), "lyrics", str(data.get("title") or data.get("name") or path.stem), str(data.get("lyrics") or data.get("lyric") or ""), str(data.get("prompt") or data.get("image_prompt") or ""), str(data.get("theme") or data.get("mood") or ""), str(path))]
+    raise ProjectLoadError(f"Unknown JSON input structure; choose title/lyrics/prompt fields: {path}")
+
+
+def add_input_records(project: CoverMorphProject, records: list[InputRecord]) -> None:
+    ensure_project_dirs(project)
+    for record in records:
+        source = Path(record.source_path)
+        if not source.is_file():
+            raise ProjectAssetError(f"Input source is missing: {source}")
+        destination = project.project_dir / "assets" / "inputs" / f"{record.input_id}{source.suffix.lower() or '.txt'}"
+        shutil.copy2(source, destination)
+        record.source_path = path_to_project_string(project, destination)
+        project.inputs.append(record)
+    project.song_count = len(project.inputs)
+
+
+def compose_scene_prompt(project: CoverMorphProject, scene: SceneCard, preset: ChannelGenerationPreset) -> tuple[str, str, dict[str, Any]]:
+    people = {person.person_id: person for person in project.people}
+    person_text = []
+    refs = []
+    for person_id in scene.person_ids:
+        person = people.get(person_id)
+        if person:
+            person_text.append(f"{person.name}: {person.appearance}; hair: {person.hair}; outfit: {person.base_outfit}")
+            refs.extend(ref.image_id for ref in person.reference_images if ref.image_id in scene.reference_image_ids)
+    parts = [preset.master_prompt, scene.user_description, scene.location, scene.time_of_day, scene.weather, scene.action, scene.emotion, scene.composition, scene.outfit, " ".join(person_text)]
+    prompt = ", ".join(part.strip() for part in parts if part and part.strip())
+    negative = ", ".join(part.strip() for part in (preset.negative_prompt, preset.avoid_elements, "text, typography, logo, watermark") if part and part.strip())
+    request = {"preset_id": preset.preset_id, "preset_version": preset.version, "scene_id": scene.scene_id, "person_ids": list(scene.person_ids), "reference_image_ids": refs, "output_ratio": scene.output_ratio, "candidate_count": scene.candidate_count, "textless": preset.textless_default}
+    return prompt, negative, request
+
+
+def configure_scene_prompt(project: CoverMorphProject, scene: SceneCard, preset: ChannelGenerationPreset, *, refresh: bool = False) -> None:
+    if scene.prompt_confirmed and not refresh:
+        return
+    scene.prompt_auto, scene.negative_prompt_auto, scene.structured_request = compose_scene_prompt(project, scene, preset)
+    scene.prompt_user = scene.prompt_auto
+    scene.negative_prompt_user = scene.negative_prompt_auto
+    scene.prompt_source_preset_id = preset.preset_id
+    scene.prompt_source_preset_version = preset.version
+    scene.prompt_confirmed = False
+
+
+def duplicate_scene(scene: SceneCard) -> SceneCard:
+    copied = SceneCard.from_dict(scene.to_dict())
+    copied.scene_id = new_id("scene")
+    copied.order = scene.order + 1
+    copied.prompt_confirmed = False
+    return copied
 
 
 def path_to_project_string(project: CoverMorphProject, path: Path) -> str:
@@ -464,4 +763,12 @@ def validate_project_assets(project: CoverMorphProject) -> list[ProjectIssue]:
             resolved = resolve_project_path(project, stored_path)
             if not resolved.is_file():
                 issues.append(ProjectIssue(candidate.candidate_id, kind, stored_path, message))
+    for person in project.people:
+        for reference in person.reference_images:
+            resolved = resolve_project_path(project, reference.path)
+            if not resolved.is_file():
+                issues.append(ProjectIssue(person.person_id, "reference", reference.path, "Person reference image is missing."))
+    for record in project.inputs:
+        if record.source_path and not resolve_project_path(project, record.source_path).is_file():
+            issues.append(ProjectIssue(record.input_id, "input", record.source_path, "Input source is missing."))
     return issues
