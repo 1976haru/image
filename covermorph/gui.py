@@ -34,6 +34,24 @@ from .processor import (
     mask_pil_from_boxes,
     render_full_frame_format,
 )
+from .project import (
+    INPUT_TYPE_EXISTING_COVER,
+    INPUT_TYPE_TEXTLESS,
+    CandidateRecord,
+    CandidateSettings,
+    CoverMorphProject,
+    ProjectAssetError,
+    ProjectLoadError,
+    add_candidate_from_file,
+    adopt_removal_preview,
+    create_project,
+    load_project,
+    path_to_project_string,
+    resolve_project_path,
+    save_project_atomic,
+    save_removal_preview,
+    validate_project_assets,
+)
 from .settings import (
     DEFAULT_SETTINGS,
     DUPLICATE_POLICIES,
@@ -69,8 +87,17 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-MAX_IMAGES = 5
+MAX_IMAGES = 50
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+PROJECT_FILETYPES = [("CoverMorph Project", "covermorph_project.json"), ("JSON", "*.json")]
+INPUT_TYPE_LABELS = {
+    "글자 없는 이미지": INPUT_TYPE_TEXTLESS,
+    "글자가 포함된 기존 커버": INPUT_TYPE_EXISTING_COVER,
+}
+INPUT_TYPE_STATUS = {
+    INPUT_TYPE_TEXTLESS: "작업 원본 채택됨",
+    INPUT_TYPE_EXISTING_COVER: "제거 결과 필요",
+}
 OCR_LANGUAGE_LABELS = {
     "영어": ("en",),
     "한국어+영어": ("ko", "en"),
@@ -91,6 +118,8 @@ class ImageRowState:
     job: ImageJob
     original: Image.Image
     thumbnail_photo: ImageTk.PhotoImage
+    candidate: CandidateRecord | None = None
+    selected_var: ctk.BooleanVar | None = None
     clean_preview: Image.Image | None = None
     row_frame: ctk.CTkFrame | None = None
     square_var: ctk.BooleanVar | None = None
@@ -122,6 +151,9 @@ class CoverMorphApp(_CoverMorphWindow):
         self.image_states: list[ImageRowState] = []
         self.selected_index: int | None = None
         self.output_dir: Path | None = None
+        self.project: CoverMorphProject | None = None
+        self.project_dirty = False
+        self._loading_project = False
 
         self.preview_tk: ImageTk.PhotoImage | None = None
         self.preview_scale = 1.0
@@ -141,6 +173,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.apply_saved_output_directory_notice()
         self.update_summary()
         self.refresh_ai_status()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         write_log(self.root_dir, f"CoverMorph Studio v{__version__} started")
 
     def group(self, parent: Any, title: str, *, highlight: bool = False) -> ctk.CTkFrame:
@@ -206,7 +239,13 @@ class CoverMorphApp(_CoverMorphWindow):
         self.subject_x = ctk.DoubleVar(value=0.0)
         self.subject_y = ctk.DoubleVar(value=0.0)
         self.subject_zoom = ctk.DoubleVar(value=1.0)
+        self.project_name_var = ctk.StringVar(value="프로젝트 없음")
+        self.channel_name_var = ctk.StringVar(value="")
+        self.series_name_var = ctk.StringVar(value="")
+        self.lyric_mood_var = ctk.StringVar(value="")
+        self.input_type_var = ctk.StringVar(value="글자 없는 이미지")
 
+        self.build_project_group(left)
         self.build_input_group(left)
         self.build_output_folder_group(left)
         self.build_preset_group(left)
@@ -250,9 +289,16 @@ class CoverMorphApp(_CoverMorphWindow):
 
     def build_input_group(self, parent: Any) -> None:
         frame = self.group(parent, "1. 입력 이미지")
+        ctk.CTkLabel(frame, text="입력 유형", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12)
+        self.input_type_menu = ctk.CTkOptionMenu(
+            frame,
+            variable=self.input_type_var,
+            values=list(INPUT_TYPE_LABELS),
+        )
+        self.input_type_menu.pack(fill="x", padx=12, pady=(3, 8))
         row = ctk.CTkFrame(frame, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=(0, 8))
-        self.add_button = ctk.CTkButton(row, text="이미지 추가", command=self.open_files, height=36)
+        self.add_button = ctk.CTkButton(row, text="후보 추가", command=self.open_files, height=36)
         self.add_button.pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.remove_button = ctk.CTkButton(
             row,
@@ -272,7 +318,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.clear_images_button.pack(side="left", fill="x", expand=True, padx=(5, 0))
         self.input_status = ctk.CTkLabel(
             frame,
-            text="1~5장의 이미지를 선택하거나 창 위로 드래그앤드롭하세요.",
+            text="프로젝트를 만든 뒤 후보 이미지를 추가하세요.",
             wraplength=360,
             justify="left",
             text_color="#cbd5e1",
@@ -316,6 +362,39 @@ class CoverMorphApp(_CoverMorphWindow):
         )
         self.preset_desc.pack(fill="x", padx=12, pady=(6, 12))
 
+    def build_project_group(self, parent: Any) -> None:
+        frame = self.group(parent, "0. 프로젝트", highlight=True)
+        self.project_status = ctk.CTkLabel(
+            frame,
+            text="새 프로젝트를 만들거나 기존 프로젝트를 열어주세요.",
+            wraplength=360,
+            justify="left",
+            text_color="#bae6fd",
+        )
+        self.project_status.pack(fill="x", padx=12, pady=(0, 8))
+
+        button_row = ctk.CTkFrame(frame, fg_color="transparent")
+        button_row.pack(fill="x", padx=12, pady=(0, 8))
+        self.new_project_button = ctk.CTkButton(button_row, text="새 프로젝트", command=self.new_project)
+        self.new_project_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.open_project_button = ctk.CTkButton(button_row, text="프로젝트 열기", command=self.open_project)
+        self.open_project_button.pack(side="left", fill="x", expand=True, padx=4)
+        self.save_project_button = ctk.CTkButton(button_row, text="저장", command=self.save_project)
+        self.save_project_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        ctk.CTkLabel(frame, text="프로젝트명", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12)
+        self.project_name_entry = ctk.CTkEntry(frame, textvariable=self.project_name_var)
+        self.project_name_entry.pack(fill="x", padx=12, pady=(3, 8))
+        ctk.CTkLabel(frame, text="채널명", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12)
+        self.channel_name_entry = ctk.CTkEntry(frame, textvariable=self.channel_name_var)
+        self.channel_name_entry.pack(fill="x", padx=12, pady=(3, 8))
+        ctk.CTkLabel(frame, text="시리즈명", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12)
+        self.series_name_entry = ctk.CTkEntry(frame, textvariable=self.series_name_var)
+        self.series_name_entry.pack(fill="x", padx=12, pady=(3, 8))
+        ctk.CTkLabel(frame, text="가사 분위기/주제", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12)
+        self.lyric_mood_entry = ctk.CTkEntry(frame, textvariable=self.lyric_mood_var)
+        self.lyric_mood_entry.pack(fill="x", padx=12, pady=(3, 12))
+
     def build_ocr_group(self, parent: Any) -> None:
         frame = self.group(parent, "4. OCR 및 글자 제거")
         self.ocr_menu = ctk.CTkOptionMenu(
@@ -345,6 +424,14 @@ class CoverMorphApp(_CoverMorphWindow):
             fg_color="#4b5563",
         )
         self.preview_button.pack(fill="x", padx=12, pady=4)
+        self.adopt_preview_button = ctk.CTkButton(
+            frame,
+            text="제거 결과를 작업 원본으로 사용",
+            command=self.adopt_clean_preview,
+            height=32,
+            fg_color="#0f766e",
+        )
+        self.adopt_preview_button.pack(fill="x", padx=12, pady=4)
         self.clear_button = ctk.CTkButton(
             frame,
             text="선택 이미지 마스크 초기화",
@@ -365,14 +452,14 @@ class CoverMorphApp(_CoverMorphWindow):
         ).pack(fill="x", padx=12, pady=(0, 8))
         self.square_check = ctk.CTkCheckBox(
             frame,
-            text="1:1 클린 커버\n  - 1400x1400 JPG\n  - 글자를 제거한 정사각형 이미지",
+            text="1:1 글자 없는 커버 베이스\n  - 1400x1400 JPG\n  - 문구 합성 전 정사각형 이미지",
             variable=self.output_square_var,
             command=self.on_output_defaults_changed,
         )
         self.square_check.pack(anchor="w", padx=12, pady=(0, 9))
         self.thumb_check = ctk.CTkCheckBox(
             frame,
-            text="16:9 유튜브 썸네일\n  - 기본 1920x1080 JPG\n  - 설정에서 1280x720 선택 가능",
+            text="16:9 Canva/CapCut 이미지\n  - 기본 1920x1080 JPG\n  - 설정에서 1280x720 선택 가능",
             variable=self.output_thumb_var,
             command=self.on_output_defaults_changed,
         )
@@ -511,6 +598,14 @@ class CoverMorphApp(_CoverMorphWindow):
         self.run_button.pack_forget()
         self.cancel_button.pack_forget()
         self.fixed_busy_widgets = [
+            self.new_project_button,
+            self.open_project_button,
+            self.save_project_button,
+            self.project_name_entry,
+            self.channel_name_entry,
+            self.series_name_entry,
+            self.lyric_mood_entry,
+            self.input_type_menu,
             self.add_button,
             self.remove_button,
             self.clear_images_button,
@@ -524,6 +619,7 @@ class CoverMorphApp(_CoverMorphWindow):
             self.prefer_lama_check,
             self.detect_button,
             self.preview_button,
+            self.adopt_preview_button,
             self.clear_button,
             self.square_check,
             self.thumb_check,
@@ -673,18 +769,25 @@ class CoverMorphApp(_CoverMorphWindow):
         ):
             var.trace_add("write", lambda *_args: self.on_persistent_setting_changed())
         self.output_path_var.trace_add("write", lambda *_args: self.update_summary())
+        for var in (
+            self.project_name_var,
+            self.channel_name_var,
+            self.series_name_var,
+            self.lyric_mood_var,
+        ):
+            var.trace_add("write", lambda *_args: self.on_project_field_changed())
 
     def setup_drag_drop(self) -> None:
         if DND_FILES is None or not getattr(self, "_covermorph_dnd_ready", False):
-            self.input_status.configure(text="1~5장의 이미지를 선택하세요. 드래그앤드롭은 tkinterdnd2 설치 시 활성화됩니다.")
+            self.input_status.configure(text="후보 이미지를 선택하세요. 드래그앤드롭은 tkinterdnd2 설치 시 활성화됩니다.")
             return
         try:
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", self.on_drop_files)
-            self.input_status.configure(text="1~5장의 이미지를 선택하거나 창 위로 드래그앤드롭하세요.")
+            self.input_status.configure(text="후보 이미지를 선택하거나 창 위로 드래그앤드롭하세요.")
         except tk.TclError as exc:
             write_exception(self.root_dir, "Drag and drop setup", exc)
-            self.input_status.configure(text="1~5장의 이미지를 선택하세요. 드래그앤드롭 초기화에 실패했습니다.")
+            self.input_status.configure(text="후보 이미지를 선택하세요. 드래그앤드롭 초기화에 실패했습니다.")
 
     def on_drop_files(self, event: Any) -> None:
         paths = [Path(value) for value in self.tk.splitlist(event.data)]
@@ -755,6 +858,8 @@ class CoverMorphApp(_CoverMorphWindow):
             state.job.ocr_languages = self.lang_codes()
             state.job.extension_mode = self.extension_key()
             state.job.outpaint_prompt = self.outpaint_prompt.get("1.0", "end").strip()
+            self.update_candidate_from_state(state)
+            self.mark_project_dirty()
             self.refresh_image_table()
         self.save_current_settings(include_output=False)
         self.update_summary()
@@ -768,6 +873,8 @@ class CoverMorphApp(_CoverMorphWindow):
             state.job.out_square = self.output_square_var.get()
             state.job.out_thumb = self.output_thumb_var.get()
             state.job.out_shorts = self.output_shorts_var.get()
+            self.update_candidate_from_state(state)
+            self.mark_project_dirty()
             self.refresh_image_table()
         self.save_current_settings(include_output=False)
         self.update_summary()
@@ -781,6 +888,8 @@ class CoverMorphApp(_CoverMorphWindow):
         state.job.subject_offset_x = float(self.subject_x.get())
         state.job.subject_offset_y = float(self.subject_y.get())
         state.job.subject_scale = float(self.subject_zoom.get())
+        self.update_candidate_from_state(state)
+        self.mark_project_dirty()
         self.draw_preview()
 
     def apply_saved_output_directory_notice(self) -> None:
@@ -791,6 +900,261 @@ class CoverMorphApp(_CoverMorphWindow):
         self.output_dir = path
         if not path.exists() or not path.is_dir():
             self.status.configure(text="저장된 출력 폴더를 사용할 수 없습니다. 새 출력 폴더를 선택해주세요.")
+
+    def project_input_type_key(self) -> str:
+        return INPUT_TYPE_LABELS.get(self.input_type_var.get(), INPUT_TYPE_TEXTLESS)
+
+    def refresh_project_status(self) -> None:
+        marker = " *" if self.project_dirty else ""
+        if self.project is None:
+            self.project_status.configure(text="프로젝트 없음")
+            self.title(f"CoverMorph Studio v{__version__}")
+            return
+        self.project_status.configure(
+            text=(
+                f"{self.project.name}{marker}\n"
+                f"{self.project.project_file}\n"
+                f"후보 {len(self.project.candidates)}장 | 곡 수 {self.project.song_count}곡"
+            )
+        )
+        self.title(f"CoverMorph Studio v{__version__} - {self.project.name}{marker}")
+
+    def mark_project_dirty(self) -> None:
+        if self._loading_project or self.project is None:
+            return
+        self.project_dirty = True
+        self.refresh_project_status()
+
+    def on_project_field_changed(self) -> None:
+        if self.project is None or self._loading_project:
+            return
+        self.mark_project_dirty()
+
+    def sync_project_from_ui(self) -> None:
+        if self.project is None:
+            return
+        self.project.name = self.project_name_var.get().strip() or self.project.project_file.parent.name
+        self.project.channel_name = self.channel_name_var.get().strip()
+        self.project.series_name = self.series_name_var.get().strip()
+        self.project.lyric_mood_text = self.lyric_mood_var.get().strip()
+        self.project.selected_candidate_ids = [
+            state.candidate.candidate_id
+            for state in self.image_states
+            if state.candidate is not None and state.candidate.selected
+        ]
+        for state in self.image_states:
+            self.update_candidate_from_state(state)
+
+    def apply_project_to_ui(self, project: CoverMorphProject) -> None:
+        self._loading_project = True
+        try:
+            self.project_name_var.set(project.name)
+            self.channel_name_var.set(project.channel_name)
+            self.series_name_var.set(project.series_name)
+            self.lyric_mood_var.set(project.lyric_mood_text)
+        finally:
+            self._loading_project = False
+        self.refresh_project_status()
+
+    def confirm_discard_project_changes(self) -> bool:
+        if not self.project_dirty:
+            return True
+        result = messagebox.askyesnocancel(
+            "저장되지 않은 변경",
+            "현재 프로젝트에 저장되지 않은 변경이 있습니다.\n저장할까요?",
+        )
+        if result is None:
+            return False
+        if result:
+            return self.save_project()
+        return True
+
+    def ensure_project_for_assets(self) -> bool:
+        if self.project is not None:
+            return True
+        messagebox.showinfo("프로젝트 필요", "이미지를 프로젝트 내부에 보존하려면 먼저 프로젝트 폴더를 만들어주세요.")
+        return self.new_project()
+
+    def new_project(self) -> bool:
+        if not self.confirm_discard_project_changes():
+            return False
+        directory = filedialog.askdirectory(title="새 CoverMorph 프로젝트 폴더")
+        if not directory:
+            return False
+        project_dir = Path(directory)
+        project = create_project(project_dir, project_dir.name)
+        self.project = project
+        self.project_dirty = False
+        self.image_states.clear()
+        self.selected_index = None
+        self.apply_project_to_ui(project)
+        self.refresh_image_table()
+        self.update_summary()
+        self.draw_preview()
+        try:
+            save_project_atomic(project)
+        except OSError as exc:
+            write_exception(self.root_dir, "Project create save", exc)
+            messagebox.showerror("프로젝트 저장 실패", str(exc))
+            self.project_dirty = True
+            self.refresh_project_status()
+            return False
+        self.status.configure(text=f"새 프로젝트를 만들었습니다.\n{project.project_file}")
+        return True
+
+    def open_project(self) -> bool:
+        if not self.confirm_discard_project_changes():
+            return False
+        filename = filedialog.askopenfilename(
+            title="CoverMorph 프로젝트 열기",
+            filetypes=PROJECT_FILETYPES,
+        )
+        if not filename:
+            return False
+        try:
+            project = load_project(Path(filename))
+        except ProjectLoadError as exc:
+            messagebox.showerror("프로젝트 열기 실패", str(exc))
+            return False
+        self.project = project
+        self.project_dirty = False
+        self.apply_project_to_ui(project)
+        self.load_project_rows(project)
+        issues = validate_project_assets(project)
+        if issues:
+            lines = [f"{issue.candidate_id}: {issue.message} ({issue.path or '경로 없음'})" for issue in issues]
+            messagebox.showwarning("프로젝트 이미지 누락", "\n".join(lines[:8]))
+        self.status.configure(text=f"프로젝트를 열었습니다.\n{project.project_file}")
+        return True
+
+    def save_project(self) -> bool:
+        if self.project is None:
+            directory = filedialog.askdirectory(title="CoverMorph 프로젝트 폴더")
+            if not directory:
+                return False
+            self.project = create_project(Path(directory), Path(directory).name)
+        self.sync_project_from_ui()
+        try:
+            save_project_atomic(self.project)
+        except (OSError, ValueError) as exc:
+            write_exception(self.root_dir, "Project save", exc)
+            messagebox.showerror("프로젝트 저장 실패", str(exc))
+            return False
+        self.project_dirty = False
+        self.refresh_project_status()
+        self.status.configure(text=f"프로젝트 저장 완료\n{self.project.project_file}")
+        return True
+
+    def on_close(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            if not messagebox.askyesno("작업 중", "현재 작업이 실행 중입니다. 종료할까요?"):
+                return
+            self.cancel_event.set()
+        if not self.confirm_discard_project_changes():
+            return
+        self.destroy()
+
+    def candidate_working_path(self, candidate: CandidateRecord | None) -> Path | None:
+        if self.project is None or candidate is None or not candidate.working_source_path:
+            return None
+        return resolve_project_path(self.project, candidate.working_source_path)
+
+    def candidate_original_path(self, candidate: CandidateRecord | None) -> Path | None:
+        if self.project is None or candidate is None or not candidate.original_path:
+            return None
+        return resolve_project_path(self.project, candidate.original_path)
+
+    def candidate_working_status(self, candidate: CandidateRecord | None) -> str:
+        if candidate is None:
+            return "외부 파일"
+        if candidate.working_source_approved and candidate.working_source_path:
+            return "채택됨"
+        if candidate.removal_preview_path:
+            return "채택 대기"
+        return INPUT_TYPE_STATUS.get(candidate.input_type, "확인 필요")
+
+    def make_thumbnail_photo(self, img: Image.Image) -> ImageTk.PhotoImage:
+        thumb = ImageOps.contain(img.copy(), (58, 58), Image.Resampling.LANCZOS)
+        thumb_bg = Image.new("RGB", (58, 58), (15, 23, 42))
+        thumb_bg.paste(thumb, ((58 - thumb.width) // 2, (58 - thumb.height) // 2))
+        return ImageTk.PhotoImage(thumb_bg)
+
+    def load_project_rows(self, project: CoverMorphProject) -> None:
+        self.image_states.clear()
+        self.selected_index = None
+        errors: list[str] = []
+        for candidate in project.candidates:
+            original_path = resolve_project_path(project, candidate.original_path)
+            try:
+                with Image.open(original_path) as opened:
+                    original = ImageOps.exif_transpose(opened).convert("RGB")
+            except (OSError, UnidentifiedImageError) as exc:
+                errors.append(f"{candidate.display_name}: {exc}")
+                continue
+
+            work_path = resolve_project_path(project, candidate.working_source_path) if candidate.working_source_path else original_path
+            settings = candidate.settings
+            job = ImageJob(
+                source=work_path,
+                out_square=settings.out_square,
+                out_thumb=settings.out_thumb,
+                out_shorts=settings.out_shorts,
+                auto_remove_text=False if candidate.working_source_path else None,
+                manual_boxes=tuple(settings.manual_boxes),
+                ocr_boxes=tuple(settings.ocr_boxes),
+                preset_name=settings.preset_name,
+                ocr_languages=tuple(settings.ocr_languages),
+                extension_mode=settings.extension_mode,
+                subject_offset_x=settings.subject_offset_x,
+                subject_offset_y=settings.subject_offset_y,
+                subject_scale=settings.subject_scale,
+                outpaint_prompt=settings.outpaint_prompt or DEFAULT_OUTPAINT_PROMPT,
+            )
+            clean_preview = None
+            preview_source = candidate.working_source_path or candidate.removal_preview_path
+            if preview_source:
+                try:
+                    with Image.open(resolve_project_path(project, preview_source)) as opened:
+                        clean_preview = ImageOps.exif_transpose(opened).convert("RGB")
+                except (OSError, UnidentifiedImageError):
+                    clean_preview = None
+            state = ImageRowState(
+                job=job,
+                original=original,
+                thumbnail_photo=self.make_thumbnail_photo(clean_preview or original),
+                candidate=candidate,
+                clean_preview=clean_preview,
+            )
+            self.image_states.append(state)
+
+        if self.image_states:
+            self.selected_index = 0
+        self.sync_controls_from_selected()
+        self.refresh_image_table()
+        self.update_summary()
+        self.draw_preview()
+        if errors:
+            messagebox.showwarning("이미지 로드 오류", "\n".join(errors[:8]))
+
+    def update_candidate_from_state(self, state: ImageRowState) -> None:
+        candidate = state.candidate
+        if candidate is None:
+            return
+        candidate.selected = bool(state.selected_var.get()) if state.selected_var is not None else candidate.selected
+        candidate.settings = CandidateSettings(
+            out_square=state.job.out_square,
+            out_thumb=state.job.out_thumb,
+            out_shorts=state.job.out_shorts,
+            manual_boxes=tuple(state.job.manual_boxes),
+            ocr_boxes=tuple(state.job.ocr_boxes),
+            preset_name=state.job.preset_name,
+            ocr_languages=tuple(state.job.ocr_languages),
+            extension_mode=state.job.extension_mode,
+            subject_offset_x=state.job.subject_offset_x,
+            subject_offset_y=state.job.subject_offset_y,
+            subject_scale=state.job.subject_scale,
+            outpaint_prompt=state.job.outpaint_prompt,
+        )
 
     def lang_codes(self) -> tuple[str, ...]:
         return OCR_LANGUAGE_LABELS.get(self.ocr_lang.get(), ("en",))
@@ -803,7 +1167,12 @@ class CoverMorphApp(_CoverMorphWindow):
         return self.image_states[self.selected_index]
 
     def jobs(self) -> list[ImageJob]:
-        return [state.job for state in self.image_states]
+        return [state.job for state in self.image_states if self.state_is_selected_for_run(state)]
+
+    def state_is_selected_for_run(self, state: ImageRowState) -> bool:
+        if state.candidate is None:
+            return True
+        return bool(state.candidate.selected)
 
     def open_files(self) -> None:
         paths = filedialog.askopenfilenames(filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff")])
@@ -811,14 +1180,24 @@ class CoverMorphApp(_CoverMorphWindow):
             self.add_image_paths([Path(path) for path in paths])
 
     def add_image_paths(self, paths: list[Path]) -> None:
+        if not self.ensure_project_for_assets():
+            return
         candidates = [path for path in paths if path.suffix.lower() in IMAGE_EXTENSIONS]
         if not candidates:
             messagebox.showinfo("안내", "지원하는 이미지 파일을 선택해주세요.")
             return
 
-        existing = {state.job.source.resolve() for state in self.image_states if state.job.source.exists()}
+        existing: set[Path] = set()
+        if self.project is not None:
+            for candidate in self.project.candidates:
+                if candidate.external_source_path:
+                    try:
+                        existing.add(Path(candidate.external_source_path).resolve())
+                    except OSError:
+                        pass
         added = 0
         errors: list[str] = []
+        input_type = self.project_input_type_key()
         for path in candidates:
             if len(self.image_states) >= MAX_IMAGES:
                 break
@@ -829,35 +1208,61 @@ class CoverMorphApp(_CoverMorphWindow):
             if resolved in existing:
                 continue
             try:
-                with Image.open(path) as opened:
-                    original = opened.convert("RGB")
-            except (OSError, UnidentifiedImageError) as exc:
+                settings = CandidateSettings(
+                    out_square=self.output_square_var.get(),
+                    out_thumb=self.output_thumb_var.get(),
+                    out_shorts=self.output_shorts_var.get(),
+                    manual_boxes=(),
+                    ocr_boxes=(),
+                    preset_name=self.preset_name.get(),
+                    ocr_languages=self.lang_codes(),
+                    extension_mode=self.extension_key(),
+                    outpaint_prompt=self.outpaint_prompt.get("1.0", "end").strip(),
+                )
+                candidate = add_candidate_from_file(self.project, path, input_type, settings)  # type: ignore[arg-type]
+                original_path = self.candidate_original_path(candidate)
+                if original_path is None:
+                    raise ProjectAssetError("프로젝트 내부 원본 경로를 만들 수 없습니다.")
+                with Image.open(original_path) as opened:
+                    original = ImageOps.exif_transpose(opened).convert("RGB")
+                work_path = self.candidate_working_path(candidate) or original_path
+                clean_preview = None
+                if candidate.working_source_path:
+                    with Image.open(work_path) as opened:
+                        clean_preview = ImageOps.exif_transpose(opened).convert("RGB")
+            except (OSError, UnidentifiedImageError, ProjectAssetError) as exc:
                 write_exception(self.root_dir, f"Open image {path.name}", exc)
                 errors.append(f"{path.name}: {exc}")
                 continue
 
-            thumb = ImageOps.contain(original.copy(), (58, 58), Image.Resampling.LANCZOS)
-            thumb_bg = Image.new("RGB", (58, 58), (15, 23, 42))
-            thumb_bg.paste(thumb, ((58 - thumb.width) // 2, (58 - thumb.height) // 2))
-            photo = ImageTk.PhotoImage(thumb_bg)
+            photo = self.make_thumbnail_photo(clean_preview or original)
             job = ImageJob(
-                source=path,
+                source=work_path,
                 out_square=self.output_square_var.get(),
                 out_thumb=self.output_thumb_var.get(),
                 out_shorts=self.output_shorts_var.get(),
+                auto_remove_text=False if candidate.working_source_path else None,
                 preset_name=self.preset_name.get(),
                 ocr_languages=self.lang_codes(),
                 extension_mode=self.extension_key(),
                 outpaint_prompt=self.outpaint_prompt.get("1.0", "end").strip(),
             )
-            self.image_states.append(ImageRowState(job=job, original=original, thumbnail_photo=photo))
+            self.image_states.append(
+                ImageRowState(
+                    job=job,
+                    original=original,
+                    thumbnail_photo=photo,
+                    candidate=candidate,
+                    clean_preview=clean_preview,
+                )
+            )
             existing.add(resolved)
             added += 1
 
         if len(self.image_states) >= MAX_IMAGES:
-            self.input_status.configure(text="이미지는 최대 5장까지 선택할 수 있습니다.")
+            self.input_status.configure(text=f"후보는 최대 {MAX_IMAGES}장까지 선택할 수 있습니다.")
         else:
-            self.input_status.configure(text=f"{len(self.image_states)}장 선택됨")
+            self.input_status.configure(text=f"후보 {len(self.image_states)}장")
 
         if errors:
             messagebox.showwarning("이미지 오류", "일부 이미지를 열 수 없습니다.\n" + "\n".join(errors[:5]))
@@ -865,7 +1270,7 @@ class CoverMorphApp(_CoverMorphWindow):
         if added and self.selected_index is None:
             self.selected_index = 0
         if added and not self.output_path_var.get().strip():
-            default_dir = default_output_dir_for_source(self.image_states[0].job.source)
+            default_dir = self.default_output_for_current_files() or default_output_dir_for_source(self.image_states[0].job.source)
             self.output_path_var.set(str(default_dir))
             self.output_dir = default_dir
 
@@ -873,26 +1278,40 @@ class CoverMorphApp(_CoverMorphWindow):
         self.refresh_image_table()
         self.update_summary()
         self.save_current_settings(include_output=False)
+        if added:
+            self.mark_project_dirty()
         self.draw_preview()
 
     def remove_selected_image(self) -> None:
         if self.selected_index is None:
             return
+        state = self.image_states[self.selected_index]
+        if self.project is not None and state.candidate is not None:
+            self.project.candidates = [
+                candidate
+                for candidate in self.project.candidates
+                if candidate.candidate_id != state.candidate.candidate_id
+            ]
+            self.mark_project_dirty()
         del self.image_states[self.selected_index]
         if not self.image_states:
             self.selected_index = None
         else:
             self.selected_index = min(self.selected_index, len(self.image_states) - 1)
-        self.input_status.configure(text=f"{len(self.image_states)}장 선택됨")
+        self.input_status.configure(text=f"후보 {len(self.image_states)}장")
         self.sync_controls_from_selected()
         self.refresh_image_table()
         self.update_summary()
         self.draw_preview()
 
     def clear_images(self) -> None:
+        if self.project is not None and self.image_states:
+            self.project.candidates.clear()
+            self.project.selected_candidate_ids.clear()
+            self.mark_project_dirty()
         self.image_states.clear()
         self.selected_index = None
-        self.input_status.configure(text="1~5장의 이미지를 선택하거나 창 위로 드래그앤드롭하세요.")
+        self.input_status.configure(text="후보 이미지를 선택하거나 창 위로 드래그앤드롭하세요.")
         self.refresh_image_table()
         self.update_summary()
         self.draw_preview()
@@ -939,8 +1358,8 @@ class CoverMorphApp(_CoverMorphWindow):
         for child in self.table_scroll.winfo_children():
             child.destroy()
 
-        headers = ["번호", "미리보기", "원본 파일명", "1:1", "16:9", "9:16", "확장 방식", "상태"]
-        widths = [46, 76, 230, 54, 54, 54, 170, 86, 92, 92, 86]
+        headers = ["번호", "선택", "미리보기", "원본 파일명", "작업 원본", "1:1", "16:9", "9:16", "확장 방식", "상태"]
+        widths = [46, 54, 76, 220, 112, 54, 54, 54, 170, 86, 92, 92, 86]
         headers.extend(["개별 변환", "결과 저장", "폴더 열기"])
         for col, (header, width) in enumerate(zip(headers, widths, strict=True)):
             label = ctk.CTkLabel(self.table_scroll, text=header, width=width, anchor="w", text_color="#cbd5e1")
@@ -956,6 +1375,10 @@ class CoverMorphApp(_CoverMorphWindow):
             state.square_var = ctk.BooleanVar(value=state.job.out_square)
             state.thumb_var = ctk.BooleanVar(value=state.job.out_thumb)
             state.shorts_var = ctk.BooleanVar(value=state.job.out_shorts)
+            if state.candidate is not None:
+                state.selected_var = ctk.BooleanVar(value=state.candidate.selected)
+            else:
+                state.selected_var = ctk.BooleanVar(value=True)
             state.extension_var = ctk.StringVar(
                 value=EXTENSION_MODES.get(state.job.extension_mode, EXTENSION_MODES["ai_natural"])
             )
@@ -963,26 +1386,44 @@ class CoverMorphApp(_CoverMorphWindow):
 
             widgets: list[Any] = [
                 ctk.CTkLabel(state.row_frame, text=str(row_index), width=widths[0]),
-                ctk.CTkLabel(state.row_frame, image=state.thumbnail_photo, text="", width=widths[1]),
-                ctk.CTkLabel(state.row_frame, text=state.job.source.name, width=widths[2], anchor="w"),
                 ctk.CTkCheckBox(
                     state.row_frame,
                     text="",
+                    width=widths[1],
+                    variable=state.selected_var,
+                    command=lambda item=state: self.on_candidate_selected_changed(item),
+                ),
+                ctk.CTkLabel(state.row_frame, image=state.thumbnail_photo, text="", width=widths[2]),
+                ctk.CTkLabel(
+                    state.row_frame,
+                    text=state.candidate.display_name if state.candidate is not None else state.job.source.name,
                     width=widths[3],
+                    anchor="w",
+                ),
+                ctk.CTkLabel(
+                    state.row_frame,
+                    text=self.candidate_working_status(state.candidate),
+                    width=widths[4],
+                    anchor="w",
+                ),
+                ctk.CTkCheckBox(
+                    state.row_frame,
+                    text="",
+                    width=widths[5],
                     variable=state.square_var,
                     command=lambda item=state: self.on_row_output_changed(item),
                 ),
                 ctk.CTkCheckBox(
                     state.row_frame,
                     text="",
-                    width=widths[4],
+                    width=widths[6],
                     variable=state.thumb_var,
                     command=lambda item=state: self.on_row_output_changed(item),
                 ),
                 ctk.CTkCheckBox(
                     state.row_frame,
                     text="",
-                    width=widths[5],
+                    width=widths[7],
                     variable=state.shorts_var,
                     command=lambda item=state: self.on_row_output_changed(item),
                 ),
@@ -990,7 +1431,7 @@ class CoverMorphApp(_CoverMorphWindow):
                     state.row_frame,
                     variable=state.extension_var,
                     values=list(EXTENSION_MODES.values()),
-                    width=widths[6],
+                    width=widths[8],
                     command=lambda _value, item=state: self.on_row_extension_changed(item),
                 ),
             ]
@@ -999,30 +1440,30 @@ class CoverMorphApp(_CoverMorphWindow):
                     ctk.CTkButton(
                         state.row_frame,
                         text="개별 변환",
-                        width=widths[8],
+                        width=widths[10],
                         height=28,
                         command=lambda item=state: self.run_single_image(item),
                     ),
                     ctk.CTkButton(
                         state.row_frame,
                         text="결과 저장",
-                        width=widths[9],
+                        width=widths[11],
                         height=28,
                         command=lambda item=state: self.export_row_results(item),
                     ),
                     ctk.CTkButton(
                         state.row_frame,
                         text="폴더 열기",
-                        width=widths[10],
+                        width=widths[12],
                         height=28,
                         command=lambda item=state: self.open_row_folder(item),
                     ),
                 ]
             )
-            state.status_label = ctk.CTkLabel(state.row_frame, text=state.job.status, width=widths[7], anchor="w")
-            widgets.insert(7, state.status_label)
+            state.status_label = ctk.CTkLabel(state.row_frame, text=state.job.status, width=widths[9], anchor="w")
+            widgets.insert(9, state.status_label)
 
-            selectable_cols = {0, 1, 2, 7}
+            selectable_cols = {0, 2, 3, 4, 9}
             for col, widget in enumerate(widgets):
                 widget.grid(row=0, column=col, sticky="ew", padx=3, pady=6)
                 if col in selectable_cols:
@@ -1036,10 +1477,18 @@ class CoverMorphApp(_CoverMorphWindow):
                     except (tk.TclError, AttributeError):
                         pass
 
+    def on_candidate_selected_changed(self, state: ImageRowState) -> None:
+        if state.candidate is not None and state.selected_var is not None:
+            state.candidate.selected = bool(state.selected_var.get())
+            self.mark_project_dirty()
+        self.update_summary()
+
     def on_row_output_changed(self, state: ImageRowState) -> None:
         state.job.out_square = bool(state.square_var and state.square_var.get())
         state.job.out_thumb = bool(state.thumb_var and state.thumb_var.get())
         state.job.out_shorts = bool(state.shorts_var and state.shorts_var.get())
+        self.update_candidate_from_state(state)
+        self.mark_project_dirty()
         if self.current_state() is state:
             self._loading_selection = True
             try:
@@ -1056,6 +1505,8 @@ class CoverMorphApp(_CoverMorphWindow):
             return
         reverse = {label: key for key, label in EXTENSION_MODES.items()}
         state.job.extension_mode = reverse.get(state.extension_var.get(), "ai_natural")
+        self.update_candidate_from_state(state)
+        self.mark_project_dirty()
         if self.current_state() is state:
             self._loading_selection = True
             try:
@@ -1087,6 +1538,8 @@ class CoverMorphApp(_CoverMorphWindow):
                 state.job.out_thumb = thumb
             if shorts is not None:
                 state.job.out_shorts = shorts
+            self.update_candidate_from_state(state)
+        self.mark_project_dirty()
         self.sync_controls_from_selected()
         self.refresh_image_table()
         self.update_summary()
@@ -1113,6 +1566,8 @@ class CoverMorphApp(_CoverMorphWindow):
         self.save_current_settings()
 
     def default_output_for_current_files(self) -> Path | None:
+        if self.project is not None:
+            return self.project.project_dir / "outputs"
         if not self.image_states:
             return None
         return default_output_dir_for_source(self.image_states[0].job.source)
@@ -1193,6 +1648,9 @@ class CoverMorphApp(_CoverMorphWindow):
         state = self.current_state()
         if state is None:
             return
+        if state.candidate is not None and state.candidate.input_type == INPUT_TYPE_TEXTLESS:
+            self.status.configure(text="글자 없는 이미지로 입력된 후보는 OCR을 실행하지 않습니다.")
+            return
         img = state.original.copy()
         langs = self.lang_codes()
         job_index = self.selected_index
@@ -1224,6 +1682,9 @@ class CoverMorphApp(_CoverMorphWindow):
         state = self.current_state()
         if state is None:
             return
+        if state.candidate is not None and state.candidate.input_type == INPUT_TYPE_TEXTLESS:
+            self.status.configure(text="글자 없는 이미지로 입력된 후보는 글자 제거가 필요 없습니다.")
+            return
         boxes = list(state.job.ocr_boxes) + list(state.job.manual_boxes)
         if not boxes:
             self.status.configure(text="OCR 탐지 결과나 수동 마스크가 없습니다.")
@@ -1241,6 +1702,34 @@ class CoverMorphApp(_CoverMorphWindow):
 
         self.start_worker("PreviewRemove", worker)
 
+    def adopt_clean_preview(self) -> None:
+        state = self.current_state()
+        if state is None or self.project is None or state.candidate is None:
+            messagebox.showinfo("안내", "먼저 프로젝트 후보를 선택해주세요.")
+            return
+        if state.candidate.input_type == INPUT_TYPE_TEXTLESS:
+            messagebox.showinfo("안내", "글자 없는 이미지 입력은 이미 작업 원본으로 채택되어 있습니다.")
+            return
+        if state.clean_preview is None or not state.candidate.removal_preview_path:
+            messagebox.showinfo("안내", "먼저 글자 제거 미리보기를 생성하고 확인해주세요.")
+            return
+        try:
+            working_path = adopt_removal_preview(self.project, state.candidate)
+        except ProjectAssetError as exc:
+            messagebox.showerror("작업 원본 채택 실패", str(exc))
+            return
+        state.job.source = working_path
+        state.job.auto_remove_text = False
+        state.job.manual_boxes = ()
+        state.job.ocr_boxes = ()
+        state.thumbnail_photo = self.make_thumbnail_photo(state.clean_preview)
+        state.job.status = "대기"
+        self.update_candidate_from_state(state)
+        self.mark_project_dirty()
+        self.refresh_image_table()
+        self.draw_preview()
+        self.status.configure(text=f"작업 원본으로 채택했습니다.\n{working_path}")
+
     def clear_boxes(self) -> None:
         state = self.current_state()
         if state is None:
@@ -1249,6 +1738,8 @@ class CoverMorphApp(_CoverMorphWindow):
         state.job.ocr_boxes = ()
         state.clean_preview = None
         state.job.status = "대기"
+        self.update_candidate_from_state(state)
+        self.mark_project_dirty()
         self.refresh_image_table()
         self.draw_preview()
 
@@ -1279,6 +1770,8 @@ class CoverMorphApp(_CoverMorphWindow):
         if img_x2 - img_x1 > 5 and img_y2 - img_y1 > 5:
             state.job.manual_boxes = (*state.job.manual_boxes, (img_x1, img_y1, img_x2, img_y2))
             state.clean_preview = None
+            self.update_candidate_from_state(state)
+            self.mark_project_dirty()
         self.drag_start = None
         self.draw_preview()
 
@@ -1482,6 +1975,8 @@ class CoverMorphApp(_CoverMorphWindow):
                 state = self.image_states[index]
                 state.job.ocr_boxes = tuple(event["boxes"])
                 state.job.status = "대기"
+                self.update_candidate_from_state(state)
+                self.mark_project_dirty()
                 self.status.configure(text=f"{state.job.source.name}\n글자 영역 {len(state.job.ocr_boxes)}개 탐지")
                 self.refresh_image_table()
                 self.draw_preview()
@@ -1491,12 +1986,29 @@ class CoverMorphApp(_CoverMorphWindow):
                 state = self.image_states[index]
                 state.clean_preview = event["image"]
                 state.job.status = "대기"
+                quality = "미기록"
+                if self.project is not None and state.candidate is not None:
+                    try:
+                        quality = save_removal_preview(
+                            self.project,
+                            state.candidate,
+                            state.clean_preview,
+                            str(event["engine"]),
+                            expected_size=state.original.size,
+                        )
+                        self.mark_project_dirty()
+                    except ProjectAssetError as exc:
+                        quality = f"저장 실패: {exc}"
+                        write_exception(self.root_dir, "Removal preview save", exc)
+                    state.thumbnail_photo = self.make_thumbnail_photo(state.clean_preview)
                 self.preview_mode.set("글자 제거 결과")
-                self.status.configure(text=f"미리보기 제거 완료: {event['engine']}")
+                self.status.configure(
+                    text=f"미리보기 제거 완료: {event['engine']}\n자동 품질 상태: {quality}\n확인 후 작업 원본으로 사용을 눌러주세요."
+                )
                 self.refresh_image_table()
                 self.draw_preview()
         elif event_type == "pipeline_progress":
-            self.handle_pipeline_progress(event["payload"])
+            self.handle_pipeline_progress(event["payload"], event.get("row_indices"))
         elif event_type == "pipeline_done":
             self.handle_pipeline_done(event["results"], event["output_dir"], event.get("row_indices"))
         elif event_type == "worker_error":
@@ -1506,7 +2018,7 @@ class CoverMorphApp(_CoverMorphWindow):
             self.worker_thread = None
             self.set_busy(False)
 
-    def handle_pipeline_progress(self, payload: dict[str, Any]) -> None:
+    def handle_pipeline_progress(self, payload: dict[str, Any], row_indices: list[int] | None = None) -> None:
         event_type = payload.get("type")
         if payload.get("filename"):
             self.top_current_label.configure(text=f"현재 처리: {payload['filename']}")
@@ -1514,7 +2026,13 @@ class CoverMorphApp(_CoverMorphWindow):
             self.status.configure(text=payload.get("message", "작업 중..."))
             return
         index = payload.get("index")
-        state = self.image_states[index - 1] if isinstance(index, int) and 1 <= index <= len(self.image_states) else None
+        state = None
+        if isinstance(index, int) and 1 <= index <= len(self.image_states):
+            state_index = index - 1
+            if row_indices is not None and 0 <= state_index < len(row_indices):
+                state_index = row_indices[state_index]
+            if 0 <= state_index < len(self.image_states):
+                state = self.image_states[state_index]
         if event_type == "file_start":
             if state is not None:
                 state.job.status = "대기"
@@ -1577,6 +2095,14 @@ class CoverMorphApp(_CoverMorphWindow):
         for row_index, result in zip(row_indices, results, strict=False):
             if 0 <= row_index < len(self.image_states):
                 self.image_states[row_index].result = result
+                candidate = self.image_states[row_index].candidate
+                if self.project is not None and candidate is not None:
+                    candidate.generated_paths = {
+                        key: path_to_project_string(self.project, Path(value))
+                        for key, value in result.metadata.get("output_files", {}).items()
+                    }
+                    self.update_candidate_from_state(self.image_states[row_index])
+                    self.mark_project_dirty()
         success_sources = sum(1 for result in results if result.success_outputs > 0)
         failed_sources = sum(1 for result in results if result.success_outputs == 0 and result.status != "skipped")
         generated_count = sum(result.success_outputs for result in results)
@@ -1723,18 +2249,36 @@ class CoverMorphApp(_CoverMorphWindow):
             outpaint_prompt=self.outpaint_prompt.get("1.0", "end").strip(),
         )
 
-    def jobs_for_run(self) -> list[ImageJob]:
+    def selected_row_indices(self) -> list[int]:
+        return [index for index, state in enumerate(self.image_states) if self.state_is_selected_for_run(state)]
+
+    def jobs_for_run(self, row_indices: list[int] | None = None) -> list[ImageJob]:
+        if row_indices is None:
+            row_indices = list(range(len(self.image_states)))
         jobs: list[ImageJob] = []
-        for state in self.image_states:
+        for row_index in row_indices:
+            state = self.image_states[row_index]
             job = state.job
+            source = job.source
+            auto_remove_text = job.auto_remove_text
+            manual_boxes = tuple(job.manual_boxes)
+            ocr_boxes = tuple(job.ocr_boxes)
+            if self.project is not None and state.candidate is not None:
+                working = self.candidate_working_path(state.candidate)
+                if working is not None:
+                    source = working
+                auto_remove_text = False
+                manual_boxes = ()
+                ocr_boxes = ()
             jobs.append(
                 ImageJob(
-                    source=job.source,
+                    source=source,
                     out_square=job.out_square,
                     out_thumb=job.out_thumb,
                     out_shorts=job.out_shorts,
-                    manual_boxes=tuple(job.manual_boxes),
-                    ocr_boxes=tuple(job.ocr_boxes),
+                    auto_remove_text=auto_remove_text,
+                    manual_boxes=manual_boxes,
+                    ocr_boxes=ocr_boxes,
                     preset_name=job.preset_name,
                     ocr_languages=tuple(job.ocr_languages),
                     extension_mode=job.extension_mode,
@@ -1746,12 +2290,41 @@ class CoverMorphApp(_CoverMorphWindow):
             )
         return jobs
 
+    def validate_states_ready_for_run(self, row_indices: list[int]) -> bool:
+        missing: list[str] = []
+        unapproved: list[str] = []
+        for row_index in row_indices:
+            state = self.image_states[row_index]
+            candidate = state.candidate
+            if candidate is None:
+                continue
+            if not candidate.working_source_path or not candidate.working_source_approved:
+                unapproved.append(candidate.display_name)
+                continue
+            working = self.candidate_working_path(candidate)
+            if working is None or not working.is_file():
+                missing.append(f"{candidate.display_name}: {candidate.working_source_path}")
+        if unapproved:
+            messagebox.showwarning(
+                "작업 원본 필요",
+                "기존 커버는 글자 제거 결과를 미리보기로 확인한 뒤 작업 원본으로 채택해야 합니다.\n"
+                + "\n".join(unapproved[:8]),
+            )
+            return False
+        if missing:
+            messagebox.showwarning("프로젝트 이미지 누락", "\n".join(missing[:8]))
+            return False
+        return True
+
     def run_single_image(self, state: ImageRowState) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
             messagebox.showwarning("작업 중", "현재 작업이 끝난 뒤 개별 변환을 실행해주세요.")
             return
         if count_selected_outputs_for_jobs([state.job]) == 0:
             messagebox.showinfo("안내", "이 행에서 생성할 출력 규격을 하나 이상 선택해주세요.")
+            return
+        row_index = self.image_states.index(state)
+        if not self.validate_states_ready_for_run([row_index]):
             return
         output_dir = self.validate_output_directory_for_run()
         if output_dir is None:
@@ -1760,7 +2333,7 @@ class CoverMorphApp(_CoverMorphWindow):
         state.job.error = ""
         self.refresh_image_table()
         options = self.pipeline_options(output_dir)
-        job = self.jobs_for_run()[self.image_states.index(state)]
+        job = self.jobs_for_run([row_index])[0]
         total_outputs = count_selected_outputs_for_jobs([job])
         self.progress_bar.set(0)
         self.top_progress_bar.set(0)
@@ -1773,13 +2346,13 @@ class CoverMorphApp(_CoverMorphWindow):
                 self.root_dir,
                 ai=self.ai,
                 progress_callback=lambda payload: self.worker_queue.put(
-                    {"type": "pipeline_progress", "payload": payload, "row_indices": [self.image_states.index(state)]}
+                    {"type": "pipeline_progress", "payload": payload, "row_indices": [row_index]}
                 ),
                 cancel_event=self.cancel_event,
             )
             self.worker_queue.put(
                 {"type": "pipeline_done", "results": results, "output_dir": options.output_dir,
-                 "row_indices": [self.image_states.index(state)]}
+                 "row_indices": [row_index]}
             )
 
         self.start_worker("Single image", worker)
@@ -1790,6 +2363,8 @@ class CoverMorphApp(_CoverMorphWindow):
 
     def output_dir_for_state(self, state: ImageRowState) -> Path:
         root = self.output_path_var.get().strip()
+        if self.project is not None:
+            return Path(root) / state.job.source.stem if root else self.project.project_dir / "outputs" / state.job.source.stem
         return Path(root) / state.job.source.stem if root else default_output_dir_for_source(state.job.source)
 
     def export_row_results(self, state: ImageRowState) -> None:
@@ -1811,7 +2386,7 @@ class CoverMorphApp(_CoverMorphWindow):
             messagebox.showerror("결과 저장 실패", str(exc))
 
     def run_selected_pipeline(self) -> None:
-        if self.selected_index < 0 or self.selected_index >= len(self.image_states):
+        if self.selected_index is None or self.selected_index < 0 or self.selected_index >= len(self.image_states):
             messagebox.showinfo("안내", "먼저 목록에서 이미지를 선택해주세요.")
             return
         self.run_single_image(self.image_states[self.selected_index])
@@ -1820,7 +2395,13 @@ class CoverMorphApp(_CoverMorphWindow):
         if not self.image_states:
             messagebox.showinfo("안내", "먼저 커버 이미지를 추가해주세요.")
             return
-        jobs = self.jobs_for_run()
+        row_indices = self.selected_row_indices()
+        if not row_indices:
+            messagebox.showinfo("안내", "변환할 후보를 하나 이상 선택해주세요.")
+            return
+        if not self.validate_states_ready_for_run(row_indices):
+            return
+        jobs = self.jobs_for_run(row_indices)
         if count_selected_outputs_for_jobs(jobs) == 0:
             messagebox.showinfo("안내", "생성할 출력 이미지 규격을 하나 이상 선택해주세요.")
             return
@@ -1846,7 +2427,7 @@ class CoverMorphApp(_CoverMorphWindow):
                 self.root_dir,
                 ai=self.ai,
                 progress_callback=lambda payload: self.worker_queue.put(
-                    {"type": "pipeline_progress", "payload": payload}
+                    {"type": "pipeline_progress", "payload": payload, "row_indices": row_indices}
                 ),
                 cancel_event=self.cancel_event,
             )
@@ -1855,6 +2436,7 @@ class CoverMorphApp(_CoverMorphWindow):
                     "type": "pipeline_done",
                     "results": results,
                     "output_dir": options.output_dir,
+                    "row_indices": row_indices,
                 }
             )
 

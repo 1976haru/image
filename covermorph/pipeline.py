@@ -83,6 +83,7 @@ class ImageJob:
     out_square: bool = True
     out_thumb: bool = True
     out_shorts: bool = True
+    auto_remove_text: bool | None = None
     manual_boxes: tuple[Rect, ...] = ()
     ocr_boxes: tuple[Rect, ...] = ()
     preset_name: str = "OldPopLounge"
@@ -179,6 +180,7 @@ def options_for_job(base_options: PipelineOptions, job: ImageJob) -> PipelineOpt
     text_boxes = tuple(_dedupe_boxes([*job.ocr_boxes, *job.manual_boxes]))
     return replace(
         base_options,
+        auto_remove_text=base_options.auto_remove_text if job.auto_remove_text is None else job.auto_remove_text,
         preset_name=job.preset_name,
         ocr_languages=job.ocr_languages,
         manual_boxes=text_boxes,

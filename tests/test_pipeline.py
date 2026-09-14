@@ -494,6 +494,28 @@ def test_per_image_ocr_and_manual_masks_are_combined(tmp_path: Path) -> None:
     assert data["text_boxes_total"] == 2
 
 
+def test_job_can_disable_auto_ocr_for_textless_working_source(tmp_path: Path, monkeypatch) -> None:
+    source = make_input(tmp_path / "textless.jpg")
+    job = ImageJob(
+        source=source,
+        out_square=True,
+        out_thumb=False,
+        out_shorts=False,
+        auto_remove_text=False,
+    )
+    options = local_options(tmp_path, auto_remove_text=True, out_square=True, out_thumb=False, out_shorts=False)
+
+    def fail_ocr(*args, **kwargs):
+        raise AssertionError("OCR must not run for adopted textless working originals")
+
+    monkeypatch.setattr("covermorph.pipeline.detect_text_boxes_multilang", fail_ocr)
+
+    result = process_image_jobs([job], options, tmp_path, BaseFakeAI())[0]
+
+    assert result.status == "success"
+    assert result.metadata["text_removal_engine"] == "No text mask"
+
+
 def test_per_image_presets_are_isolated(tmp_path: Path) -> None:
     source1 = make_input(tmp_path / "preset1.jpg")
     source2 = make_input(tmp_path / "preset2.jpg")

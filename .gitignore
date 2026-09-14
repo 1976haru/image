@@ -17,3 +17,31 @@ Thumbs.db
 desktop.ini
 
 validation_results/
+
+# Local user media, projects, and generated artifacts
+*.zip
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.lrc
+lyrics/
+projects/
+CoverMorph_Output/
+outputs/
+**/covermorph_project.json
+**/assets/originals/
+**/assets/removal_previews/
+**/assets/textless/
+
+# Local model/runtime assets
+models/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.onnx
+tools/realesrgan-ncnn-vulkan/
