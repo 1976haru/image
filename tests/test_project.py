@@ -210,6 +210,12 @@ def test_people_references_scenes_and_prompt_snapshot_round_trip(tmp_path: Path)
     project.channel_preset = preset.to_dict()
     scene = SceneCard("s1", person_ids=[person.person_id], reference_image_ids=[reference.image_id], user_description="밤의 카페 東京 café")
     configure_scene_prompt(project, scene, preset)
+    scene.structured_request = {
+        "reference_mode": "person",
+        "reference_image_id": reference.image_id,
+        "reference_strength": 0.8,
+        "reference_crop_box": [1, 2, 8, 9],
+    }
     scene.prompt_confirmed = True
     project.scenes.append(scene)
     save_project_atomic(project)
@@ -221,6 +227,10 @@ def test_people_references_scenes_and_prompt_snapshot_round_trip(tmp_path: Path)
     assert loaded.scenes[0].person_ids == [person.person_id]
     assert "東京" in loaded.scenes[0].prompt_user
     assert loaded.scenes[0].prompt_confirmed is True
+    assert loaded.scenes[0].structured_request["reference_mode"] == "person"
+    assert loaded.scenes[0].structured_request["reference_image_id"] == reference.image_id
+    assert loaded.scenes[0].structured_request["reference_strength"] == 0.8
+    assert loaded.scenes[0].structured_request["reference_crop_box"] == [1, 2, 8, 9]
 
 
 def test_input_records_are_copied_inside_project(tmp_path: Path) -> None:

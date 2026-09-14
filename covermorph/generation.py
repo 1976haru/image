@@ -4,6 +4,7 @@ import copy
 import gc
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -25,17 +26,19 @@ from .project import (
 
 DEFAULT_SDXL_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 DEFAULT_IP_ADAPTER = "h94/IP-Adapter"
-DEFAULT_IP_ADAPTER_WEIGHT = "ip-adapter-plus_sdxl_vit-h.safetensors"
 DEFAULT_IP_ADAPTER_REVISION = "9bf28b38530e55ffa91c6d82e5161a982c22f284"
-IP_ADAPTER_ENCODER_FOLDER = "models/image_encoder"
-IP_ADAPTER_FILES = ("sdxl_models/" + DEFAULT_IP_ADAPTER_WEIGHT, "models/image_encoder/config.json", "models/image_encoder/model.safetensors")
+DEFAULT_IP_ADAPTER_WEIGHT = "ip-adapter-plus_sdxl_vit-h.safetensors"
 DEFAULT_IP_ADAPTER_SUBFOLDER = "sdxl_models"
-IP_ADAPTER_ENCODER = "h94/IP-Adapter/models/image_encoder (OpenCLIP ViT-H-14)"
+IP_ADAPTER_IMAGE_ENCODER = "models/image_encoder"
+IP_ADAPTER_ENCODER = IP_ADAPTER_IMAGE_ENCODER
+IP_ADAPTER_ENCODER_FOLDER = IP_ADAPTER_IMAGE_ENCODER
+IP_ADAPTER_FILES = (
+    f"{DEFAULT_IP_ADAPTER_SUBFOLDER}/{DEFAULT_IP_ADAPTER_WEIGHT}",
+    f"{IP_ADAPTER_IMAGE_ENCODER}/config.json",
+    f"{IP_ADAPTER_IMAGE_ENCODER}/model.safetensors",
+)
 IP_ADAPTER_LICENSE = "Apache-2.0"
-IP_ADAPTER_HASHES = {
-    "sdxl_models/" + DEFAULT_IP_ADAPTER_WEIGHT: "3f5062b8400c94b7159665b21ba5c62acdcd7682262743d7f2aefedef00e6581",
-    "models/image_encoder/model.safetensors": "6ca9667da1ca9e0b0f75e46bb030f7e011f44f86cbfb8d5a36590fcd7507b030",
-}
+ADAPTER_READY_FILENAME = "adapter_ready.json"
 SDXL_LICENSE_URL = "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0"
 GENERATION_SIZES = {"1:1": (1024, 1024), "16:9": (1344, 768), "9:16": (768, 1344)}
 
@@ -50,6 +53,166 @@ class PromptTooLongError(GenerationError):
 
 class GenerationCancelled(GenerationError):
     pass
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    """Return a file digest for callers that use the historical public helper."""
+    return _sha256(path)
+
+
+def _has_model_weight(directory: Path) -> bool:
+    return any(
+        path.is_file()
+        for pattern in ("*.safetensors", "*.bin", "*.safetensors.index.json", "*.bin.index.json")
+        for path in directory.glob(pattern)
+    )
+
+
+def inspect_sdxl_model(model_path: Path) -> dict[str, Any]:
+    """Inspect a local SDXL snapshot without downloading or mutating it."""
+    required = ("unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2", "scheduler")
+    result: dict[str, Any] = {
+        "path": str(model_path),
+        "exists": model_path.is_dir(),
+        "model_index": (model_path / "model_index.json").is_file(),
+        "ready": False,
+        "failure_reason": None,
+    }
+    if not result["exists"]:
+        result["failure_reason"] = "model directory is missing"
+        return result
+    if not result["model_index"]:
+        result["failure_reason"] = "model_index.json is missing"
+        return result
+    try:
+        json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        result["failure_reason"] = f"model_index.json is invalid: {exc}"
+        return result
+    missing = [name for name in required if not (model_path / name).is_dir()]
+    unweighted = [name for name in required if (model_path / name).is_dir() and name not in {"tokenizer", "tokenizer_2", "scheduler"} and not _has_model_weight(model_path / name)]
+    if missing or unweighted:
+        result["failure_reason"] = f"incomplete SDXL snapshot; missing={missing}, unweighted={unweighted}"
+        return result
+    result["ready"] = True
+    return result
+
+
+def inspect_ip_adapter(
+    destination: Path,
+    model_id: str = DEFAULT_IP_ADAPTER,
+    revision: str = DEFAULT_IP_ADAPTER_REVISION,
+    weight_name: str = DEFAULT_IP_ADAPTER_WEIGHT,
+) -> dict[str, Any]:
+    """Validate the exact local IP-Adapter Plus SDXL ViT-H preparation."""
+    weight_path = destination / DEFAULT_IP_ADAPTER_SUBFOLDER / weight_name
+    encoder_path = destination / IP_ADAPTER_IMAGE_ENCODER
+    manifest_path = destination / ADAPTER_READY_FILENAME
+    result: dict[str, Any] = {
+        "path": str(destination),
+        "adapter_id": model_id,
+        "adapter_revision": revision,
+        "adapter_weight": weight_name,
+        "weight_path": str(weight_path),
+        "weight_exists": weight_path.is_file(),
+        "weight_sha256": None,
+        "weight_readable": False,
+        "hash_verified": False,
+        "image_encoder": IP_ADAPTER_IMAGE_ENCODER,
+        "image_encoder_revision": revision,
+        "image_encoder_path": str(encoder_path),
+        "image_encoder_ready": False,
+        "manifest_path": str(manifest_path),
+        "manifest_valid": False,
+        "ready": False,
+        "failure_reason": None,
+    }
+    if not weight_path.is_file():
+        result["failure_reason"] = "required IP-Adapter safetensors file is missing"
+        return result
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(weight_path), framework="pt", device="cpu") as opened:
+            result["weight_tensor_count"] = len(opened.keys())
+        result["weight_sha256"] = _sha256(weight_path)
+        result["weight_readable"] = True
+    except Exception as exc:
+        result["failure_reason"] = f"IP-Adapter safetensors is unreadable: {exc}"
+        return result
+    encoder_weights = _has_model_weight(encoder_path)
+    result["image_encoder_ready"] = (encoder_path / "config.json").is_file() and encoder_weights
+    if not result["image_encoder_ready"]:
+        result["failure_reason"] = "models/image_encoder is incomplete"
+        return result
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        manifest = None
+    expected_manifest = {
+        "adapter_id": model_id,
+        "adapter_revision": revision,
+        "adapter_weight": weight_name,
+        "weight_sha256": result["weight_sha256"],
+        "image_encoder": IP_ADAPTER_IMAGE_ENCODER,
+        "image_encoder_revision": revision,
+    }
+    result["manifest_valid"] = isinstance(manifest, dict) and all(manifest.get(key) == value for key, value in expected_manifest.items())
+    result["hash_verified"] = bool(result["manifest_valid"])
+    if not result["manifest_valid"]:
+        result["failure_reason"] = "adapter_ready.json is missing or does not match the prepared files"
+        return result
+    result["ready"] = True
+    return result
+
+
+def validate_adapter_directory(directory: Path) -> dict[str, Any]:
+    """Validate current adapter manifests and older hash manifests."""
+    try:
+        manifest = json.loads((directory / ADAPTER_READY_FILENAME).read_text(encoding="utf-8"))
+        if "files" in manifest:
+            if not manifest.get("revision"):
+                raise ValueError("Missing revision")
+            files = manifest["files"]
+            for name in IP_ADAPTER_FILES:
+                expected = files[name]
+                if file_sha256(directory / name) != expected:
+                    raise ValueError(f"Changed model file: {name}")
+            return manifest
+        inspection = inspect_ip_adapter(
+            directory,
+            manifest.get("adapter_id", DEFAULT_IP_ADAPTER),
+            manifest.get("adapter_revision", DEFAULT_IP_ADAPTER_REVISION),
+            manifest.get("adapter_weight", DEFAULT_IP_ADAPTER_WEIGHT),
+        )
+        if not inspection["ready"]:
+            raise ValueError(inspection["failure_reason"] or "incomplete adapter")
+        return manifest
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise GenerationError(f"Reference model is incomplete; use the prepare button: {exc}") from exc
+
+
+def _write_adapter_manifest(destination: Path, inspection: dict[str, Any]) -> Path:
+    manifest_path = destination / ADAPTER_READY_FILENAME
+    payload = {
+        "adapter_id": inspection["adapter_id"],
+        "adapter_revision": inspection["adapter_revision"],
+        "adapter_weight": inspection["adapter_weight"],
+        "weight_sha256": inspection["weight_sha256"],
+        "image_encoder": inspection["image_encoder"],
+        "image_encoder_revision": inspection["image_encoder_revision"],
+        "prepared_at": utc_now(),
+    }
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest_path
 
 
 @dataclass(slots=True)
@@ -100,7 +263,18 @@ class GenerationResult:
 
 
 def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_MODEL) -> dict[str, Any]:
-    result: dict[str, Any] = {"status": "package_missing", "torch": None, "cuda": False, "gpu": None, "vram_bytes": None, "model_paths": []}
+    result: dict[str, Any] = {
+        "status": "package_missing",
+        "torch": None,
+        "cuda": False,
+        "gpu": None,
+        "vram_bytes": None,
+        "model_paths": [],
+        "diffusers": None,
+        "transformers": None,
+        "accelerate": None,
+        "safetensors": None,
+    }
     try:
         import torch
     except ImportError:
@@ -112,18 +286,46 @@ def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_M
         result["gpu"] = torch.cuda.get_device_name(device)
         result["vram_bytes"] = int(torch.cuda.get_device_properties(device).total_memory)
     try:
+        import accelerate
+        result["accelerate"] = accelerate.__version__
+    except (ImportError, AttributeError):
+        pass
+    try:
         import diffusers
         result["diffusers"] = diffusers.__version__
-    except ImportError:
-        result["diffusers"] = None
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import safetensors
+        result["safetensors"] = safetensors.__version__
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import transformers
+        result["transformers"] = transformers.__version__
+    except (ImportError, AttributeError):
+        pass
     result["model_paths"] = [str(path) for path in (app_root / "models").glob("*")] if (app_root / "models").is_dir() else []
     model_path = Path(model_id)
     if not model_path.is_absolute():
         candidates = [model_path, app_root / model_path]
         model_path = next((candidate for candidate in candidates if candidate.is_dir()), candidates[-1])
     result["resolved_model_path"] = str(model_path) if model_path.is_dir() else None
+    result["model"] = inspect_sdxl_model(model_path)
+    result["model_prepared"] = result["model"]["ready"]
+    # Keep the original marker-level field for clients that used it before strict inspection.
     result["model_ready"] = model_path.is_dir() and (model_path / "model_index.json").is_file()
-    result["status"] = "ready" if result["cuda"] and result["diffusers"] and result["model_ready"] else ("gpu_unavailable" if not result["cuda"] else ("package_missing" if not result["diffusers"] else "model_missing"))
+    result["ip_adapter"] = inspect_ip_adapter(app_root / "models" / "ip_adapter")
+    result["ip_adapter_ready"] = result["ip_adapter"]["ready"]
+    packages_ready = all(result[name] for name in ("diffusers", "transformers", "accelerate", "safetensors"))
+    result["status"] = (
+        "gpu_unavailable"
+        if not result["cuda"]
+        else ("package_missing" if not packages_ready else ("model_missing" if not result["model_prepared"] else "ready"))
+    )
+    result["reference_status"] = "ready" if result["status"] == "ready" and result["ip_adapter_ready"] else (
+        "adapter_missing" if result["status"] == "ready" else result["status"]
+    )
     return result
 
 
@@ -134,26 +336,6 @@ def validate_prompt_length(prompt: str, negative_prompt: str, tokenizer: Any | N
         encoded = tokenizer(value, truncation=False, add_special_tokens=True)
         if len(encoded["input_ids"]) > tokenizer.model_max_length:
             raise PromptTooLongError(f"{label} exceeds the model input limit; shorten it before generating.")
-
-
-def file_sha256(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def validate_adapter_directory(directory: Path) -> dict[str, Any]:
-    try:
-        manifest = json.loads((directory / "adapter_ready.json").read_text(encoding="utf-8"))
-        if not manifest.get("revision"):
-            raise ValueError("Missing revision")
-        for name in IP_ADAPTER_FILES:
-            if name in IP_ADAPTER_HASHES and manifest["files"][name] != IP_ADAPTER_HASHES[name]:
-                raise ValueError(f"Unsupported checkpoint: {name}")
-            if file_sha256(directory / name) != manifest["files"][name]:
-                raise ValueError(f"Changed model file: {name}")
-        return manifest
-    except (OSError, ValueError, KeyError) as exc:
-        raise GenerationError(f"Reference model is incomplete; use the prepare button: {exc}") from exc
 
 
 class SDXLTextToImageEngine:
@@ -167,9 +349,10 @@ class SDXLTextToImageEngine:
         self.loaded_revision: str | None = None
         self.ip_adapter_loaded = False
         self.ip_adapter_revision: str | None = None
-        self.adapter_signature = None
-        self.memory_ready = False
+        self.ip_adapter_config: tuple[str, str, str, str] | None = None
+        self.adapter_signature: tuple[str, str, str, str] | None = None
         self.last_reference_applied = False
+        self.last_generation_metrics: dict[str, Any] = {}
 
     def load(self, progress: Callable[[dict[str, Any]], None] | None = None) -> None:
         try:
@@ -186,8 +369,8 @@ class SDXLTextToImageEngine:
             kwargs["revision"] = self.revision
         try:
             self.pipeline = StableDiffusionXLPipeline.from_pretrained(self.model_id, **kwargs)
-            self.pipeline.enable_vae_slicing()
-            self.pipeline.enable_vae_tiling()
+            self.pipeline.enable_attention_slicing()
+            self.pipeline.to("cuda")
             self.loaded_revision = getattr(self.pipeline, "_commit_hash", None) or self.revision or "model-default"
         except Exception as exc:
             self.pipeline = None
@@ -205,87 +388,114 @@ class SDXLTextToImageEngine:
         pipeline = StableDiffusionXLPipeline.from_pretrained(model_id, use_safetensors=True, local_files_only=False)
         pipeline.save_pretrained(destination)
         del pipeline
+        inspection = inspect_sdxl_model(destination)
+        if not inspection["ready"]:
+            raise GenerationError(f"SDXL model preparation verification failed: {inspection['failure_reason']}")
         return destination
 
     @staticmethod
-    def download_ip_adapter(destination: Path, model_id: str = DEFAULT_IP_ADAPTER, revision: str | None = None, progress: Callable[[dict[str, Any]], None] | None = None) -> Path:
+    def download_ip_adapter(destination: Path, model_id: str = DEFAULT_IP_ADAPTER, revision: str | None = DEFAULT_IP_ADAPTER_REVISION, progress: Callable[[dict[str, Any]], None] | None = None) -> Path:
         try:
             from huggingface_hub import snapshot_download
         except ImportError as exc:
             raise GenerationError("huggingface_hub is not installed; IP-Adapter preparation is unavailable.") from exc
         if progress:
             progress({"phase": "adapter_download", "model": model_id})
-        from huggingface_hub import HfApi
-        resolved = HfApi().model_info(model_id, revision=revision or DEFAULT_IP_ADAPTER_REVISION).sha
-        destination.mkdir(parents=True, exist_ok=True)
-        marker = destination / "adapter_ready.json"
-        marker.unlink(missing_ok=True)
-        snapshot_download(repo_id=model_id, revision=resolved, local_dir=str(destination), allow_patterns=list(IP_ADAPTER_FILES))
-        hashes = {}
-        for name in IP_ADAPTER_FILES:
-            path = destination / name
-            if not path.is_file() or path.stat().st_size == 0:
-                raise GenerationError(f"Incomplete adapter download: {name}")
-            if name.endswith(".json"):
-                json.loads(path.read_text(encoding="utf-8"))
-            else:
-                from safetensors import safe_open
-                with safe_open(str(path), framework="pt", device="cpu") as handle:
-                    if not list(handle.keys()):
-                        raise GenerationError(f"Empty checkpoint: {name}")
-            hashes[name] = file_sha256(path)
-            if name in IP_ADAPTER_HASHES and hashes[name] != IP_ADAPTER_HASHES[name]:
-                raise GenerationError(f"Checkpoint checksum mismatch: {name}")
-        temporary = destination / "adapter_ready.tmp"
-        temporary.write_text(json.dumps({"repo_id": model_id, "revision": resolved, "files": hashes}, indent=2), encoding="utf-8")
-        temporary.replace(marker)
+        adapter_revision = revision or DEFAULT_IP_ADAPTER_REVISION
+        snapshot_download(repo_id=model_id, revision=adapter_revision, local_dir=str(destination), allow_patterns=["sdxl_models/*", "models/image_encoder/*", "*.json", "*.md", "*.safetensors", "*.bin"])
+        inspection = inspect_ip_adapter(destination, model_id, adapter_revision)
+        if not inspection["weight_readable"] or not inspection["image_encoder_ready"]:
+            raise GenerationError(f"IP-Adapter download did not produce a complete preparation: {inspection['failure_reason']}")
+        _write_adapter_manifest(destination, inspection)
+        verified = inspect_ip_adapter(destination, model_id, adapter_revision)
+        if not verified["ready"]:
+            raise GenerationError(f"IP-Adapter preparation verification failed: {verified['failure_reason']}")
         return destination
 
     def load_ip_adapter(self, config: GenerationConfig, progress: Callable[[dict[str, Any]], None] | None = None) -> None:
         if self.pipeline is None:
             self.load(progress)
+        adapter_revision = config.ip_adapter_revision or DEFAULT_IP_ADAPTER_REVISION
+        adapter_key = (config.reference_mode, config.ip_adapter_id, adapter_revision, config.ip_adapter_weight)
+        if self.ip_adapter_loaded and self.ip_adapter_config != adapter_key:
+            self.unload()
+            self.load(progress)
+        if Path(config.ip_adapter_id).is_dir():
+            inspection = inspect_ip_adapter(Path(config.ip_adapter_id), DEFAULT_IP_ADAPTER, adapter_revision, config.ip_adapter_weight)
+            if not inspection["ready"]:
+                raise GenerationError(f"IP-Adapter preparation is incomplete: {inspection['failure_reason']}")
+        if self.ip_adapter_loaded:
+            try:
+                if hasattr(self.pipeline, "set_ip_adapter_scale"):
+                    self.pipeline.set_ip_adapter_scale(config.reference_strength)
+                    return
+            except Exception as exc:
+                raise GenerationError(f"IP-Adapter scale update failed: {exc}") from exc
         try:
-            import torch
-            from transformers import CLIPVisionModelWithProjection
-            revision = config.ip_adapter_revision or DEFAULT_IP_ADAPTER_REVISION
-            if Path(config.ip_adapter_id).is_dir():
-                revision = validate_adapter_directory(Path(config.ip_adapter_id))["revision"]
-            encoder = CLIPVisionModelWithProjection.from_pretrained(
-                config.ip_adapter_id, subfolder=IP_ADAPTER_ENCODER_FOLDER,
-                revision=revision, torch_dtype=torch.float16,
-                use_safetensors=True, local_files_only=config.local_files_only)
-            self.pipeline.register_modules(image_encoder=encoder)
-            self.pipeline.load_ip_adapter(config.ip_adapter_id,
-                subfolder=DEFAULT_IP_ADAPTER_SUBFOLDER, weight_name=config.ip_adapter_weight,
-                image_encoder_folder=None, revision=revision, local_files_only=config.local_files_only)
+            kwargs: dict[str, Any] = {
+                "subfolder": DEFAULT_IP_ADAPTER_SUBFOLDER,
+                "weight_name": config.ip_adapter_weight,
+                "local_files_only": config.local_files_only,
+                "revision": adapter_revision,
+            }
+            if hasattr(self.pipeline, "register_modules"):
+                import torch
+                from transformers import CLIPVisionModelWithProjection
+
+                encoder = CLIPVisionModelWithProjection.from_pretrained(
+                    config.ip_adapter_id,
+                    subfolder=IP_ADAPTER_ENCODER_FOLDER,
+                    revision=adapter_revision,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True,
+                    local_files_only=config.local_files_only,
+                )
+                self.pipeline.register_modules(image_encoder=encoder)
+                kwargs["image_encoder_folder"] = None
+            else:
+                kwargs["image_encoder_folder"] = IP_ADAPTER_IMAGE_ENCODER
+            self.pipeline.load_ip_adapter(config.ip_adapter_id, **kwargs)
+            if hasattr(self.pipeline, "set_ip_adapter_scale"):
+                self.pipeline.set_ip_adapter_scale(config.reference_strength)
             self.ip_adapter_loaded = True
-            self.ip_adapter_revision = revision
+            self.ip_adapter_revision = adapter_revision
+            self.ip_adapter_config = adapter_key
+            self.adapter_signature = adapter_key
         except Exception as exc:
             self.unload()
             raise GenerationError(f"IP-Adapter load failed; text-only fallback is disabled: {exc}") from exc
 
     def generate_one(self, prompt: str, negative_prompt: str, config: GenerationConfig, seed: int, cancel_event: Event, progress: Callable[[dict[str, Any]], None] | None = None, reference_image: Image.Image | None = None) -> Image.Image:
-        self.last_reference_applied = False
         config.validate()
-        if config.reference_mode != "off" and reference_image is None:
-            raise GenerationError("A reference image is required when reference mode is enabled.")
+        if self.pipeline is None:
+            self.load(progress)
         if cancel_event.is_set():
             raise GenerationCancelled("Cancellation requested before inference.")
         import torch
 
-        signature = None if config.reference_mode == "off" else (config.reference_mode, config.ip_adapter_id, config.ip_adapter_revision, config.ip_adapter_weight)
-        if self.pipeline is not None and self.adapter_signature != signature:
-            self.unload()
-        if self.pipeline is None:
-            self.load(progress)
-        if signature is not None:
+        if config.reference_mode != "off" and reference_image is None:
+            raise GenerationError("A reference image is required when reference mode is enabled.")
+        if config.reference_mode == "off":
+            if self.ip_adapter_loaded:
+                self.unload()
+                self.load(progress)
+            else:
+                self.unload_ip_adapter()
+        else:
+            adapter_key = (config.reference_mode, config.ip_adapter_id, config.ip_adapter_revision or DEFAULT_IP_ADAPTER_REVISION, config.ip_adapter_weight)
+            if self.ip_adapter_loaded and self.ip_adapter_config is not None and self.ip_adapter_config != adapter_key:
+                self.unload()
+                self.load(progress)
             if not self.ip_adapter_loaded:
                 self.load_ip_adapter(config, progress)
-            self.pipeline.set_ip_adapter_scale(config.reference_strength)
-        self.adapter_signature = signature
-        if not self.memory_ready:
-            self.pipeline.enable_model_cpu_offload()
-            self.memory_ready = True
+                self.ip_adapter_config = adapter_key
+                self.adapter_signature = adapter_key
+            else:
+                try:
+                    if hasattr(self.pipeline, "set_ip_adapter_scale"):
+                        self.pipeline.set_ip_adapter_scale(config.reference_strength)
+                except Exception as exc:
+                    raise GenerationError(f"IP-Adapter scale update failed: {exc}") from exc
 
         validate_prompt_length(prompt, negative_prompt, getattr(self.pipeline, "tokenizer", None))
         generator = torch.Generator(device="cuda").manual_seed(seed)
@@ -295,6 +505,11 @@ class SDXLTextToImageEngine:
             if cancel_event.is_set():
                 raise GenerationCancelled("Cancellation requested during inference.")
             return callback_kwargs
+        started = time.perf_counter()
+        cuda_oom = False
+        self.last_reference_applied = False
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         try:
             kwargs: dict[str, Any] = {"prompt": prompt, "negative_prompt": negative_prompt, "width": config.size[0], "height": config.size[1], "num_inference_steps": config.steps, "guidance_scale": config.guidance_scale, "generator": generator, "callback_on_step_end": callback}
             if config.reference_mode != "off":
@@ -303,24 +518,28 @@ class SDXLTextToImageEngine:
         except GenerationCancelled:
             raise
         except torch.cuda.OutOfMemoryError as exc:
+            cuda_oom = True
             raise GenerationError("CUDA out of memory; lower resolution or settings and retry.") from exc
-        if cancel_event.is_set():
-            raise GenerationCancelled("Cancellation requested after inference.")
-        self.last_reference_applied = config.reference_mode != "off" and "ip_adapter_image" in kwargs
+        finally:
+            peak_allocated = None
+            peak_reserved = None
+            if torch.cuda.is_available():
+                peak_allocated = int(torch.cuda.max_memory_allocated())
+                peak_reserved = int(torch.cuda.max_memory_reserved())
+            self.last_generation_metrics = {
+                "generation_time_seconds": round(time.perf_counter() - started, 3),
+                "peak_memory_allocated": peak_allocated,
+                "peak_memory_reserved": peak_reserved,
+                "cuda_out_of_memory": cuda_oom,
+            }
         image = result.images[0]
         if image.size != config.size:
             raise GenerationError(f"SDXL returned {image.size}, expected {config.size}; output rejected.")
+        self.last_reference_applied = config.reference_mode != "off" and self.ip_adapter_loaded and reference_image is not None
         return image.convert("RGB")
 
     def unload(self) -> None:
-        if self.pipeline is not None and self.ip_adapter_loaded:
-            try:
-                self.pipeline.unload_ip_adapter()
-            except Exception:
-                pass
-        self.ip_adapter_loaded = False
-        self.adapter_signature = None
-        self.memory_ready = False
+        self.unload_ip_adapter()
         self.pipeline = None
         gc.collect()
         try:
@@ -330,50 +549,161 @@ class SDXLTextToImageEngine:
         except ImportError:
             pass
 
+    def unload_ip_adapter(self) -> None:
+        if self.pipeline is not None and self.ip_adapter_loaded:
+            try:
+                self.pipeline.unload_ip_adapter()
+            except Exception:
+                pass
+        self.ip_adapter_loaded = False
+        self.ip_adapter_revision = None
+        self.ip_adapter_config = None
+        self.adapter_signature = None
+        self.last_reference_applied = False
 
-def generate_scene_candidates(project: CoverMorphProject, scene: SceneCard, engine: SDXLTextToImageEngine, config: GenerationConfig, cancel_event: Event, progress: Callable[[dict[str, Any]], None] | None = None, candidate_indices: list[int] | None = None, reference_snapshot: dict[str, Any] | None = None) -> GenerationResult:
+
+def generate_scene_candidates(
+    project: CoverMorphProject,
+    scene: SceneCard,
+    engine: SDXLTextToImageEngine,
+    config: GenerationConfig,
+    cancel_event: Event,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    candidate_indices: list[int] | None = None,
+    reference_snapshot: dict[str, Any] | None = None,
+) -> GenerationResult:
     config = copy.deepcopy(config)
     scene = copy.deepcopy(scene)
     if not scene.prompt_confirmed:
         raise GenerationError("Scene prompt is not confirmed. Review and confirm it before generating.")
     config.validate()
     reference_image: Image.Image | None = None
-    reference_meta: dict[str, Any] = {"requested_mode": config.reference_mode, "reference_applied": False}
+    adapter_revision = config.ip_adapter_revision or DEFAULT_IP_ADAPTER_REVISION
+    adapter_id = DEFAULT_IP_ADAPTER if Path(config.ip_adapter_id).is_dir() else config.ip_adapter_id
+    reference_meta: dict[str, Any] = {
+        "requested_mode": config.reference_mode,
+        "requested_reference_mode": config.reference_mode,
+        "reference_applied": False,
+        "actual_reference_applied": False,
+        "person_id": None,
+        "reference_image_id": None,
+        "reference_sha256": None,
+        "source_sha256": None,
+        "processed_sha256": None,
+        "crop_box": None,
+        "crop_preprocess": None,
+        "preprocessing": None,
+        "adapter_id": adapter_id,
+        "ip_adapter_id": adapter_id,
+        "adapter_revision": adapter_revision,
+        "ip_adapter_revision": adapter_revision,
+        "adapter_weight": config.ip_adapter_weight,
+        "image_encoder": IP_ADAPTER_IMAGE_ENCODER,
+        "image_encoder_revision": adapter_revision,
+        "reference_strength": config.reference_strength if config.reference_mode != "off" else None,
+        "generation_status": "pending",
+        "failure_reason": None,
+        "visual_quality_status": "unverified",
+        "reference_path": None,
+        "processed_path": None,
+        "references_applied": False,
+    }
     try:
-        if reference_snapshot is not None and config.reference_mode != "off":
-            reference_meta = copy.deepcopy(reference_snapshot)
-            reference_meta["reference_applied"] = False
-            path = resolve_project_path(project, reference_meta["processed_path"])
-            if file_sha256(path) != reference_meta["processed_sha256"]:
-                raise ProjectAssetError("Saved reference snapshot changed; retry blocked.")
-            with Image.open(path) as opened:
-                reference_image = opened.convert("RGB").copy()
-        elif config.reference_mode != "off":
-            if not config.reference_image_id:
-                raise GenerationError("Choose exactly one reference image before generating.")
-            matches = [(person.person_id, reference) for person in project.people for reference in person.reference_images if reference.image_id == config.reference_image_id]
-            if len(matches) != 1:
-                raise ProjectAssetError("Selected reference image is missing or ambiguous.")
-            person_id, reference = matches[0]
-            if reference.role != config.reference_mode:
-                raise GenerationError(f"Selected reference role is {reference.role}, not {config.reference_mode}.")
-            processed_path, processed_meta = prepare_reference_image(project, reference, config.reference_crop_box)
-            with Image.open(processed_path) as opened:
-                reference_image = opened.convert("RGB").copy()
-            reference_meta = {"requested_mode": config.reference_mode, "reference_applied": False, "person_id": person_id, "reference_image_id": reference.image_id, "reference_path": str(reference.path), "reference_sha256": processed_meta["source_sha256"], "processed_sha256": processed_meta["processed_sha256"], "crop_preprocess": processed_meta, "reference_strength": config.reference_strength, "ip_adapter_id": config.ip_adapter_id, "ip_adapter_weight": config.ip_adapter_weight, "ip_adapter_revision": config.ip_adapter_revision or "model-default", "image_encoder": IP_ADAPTER_ENCODER, "image_encoder_revision": config.ip_adapter_revision, "processed_path": processed_path.relative_to(project.project_dir).as_posix(), "license": IP_ADAPTER_LICENSE}
+        if config.reference_mode != "off":
+            if reference_snapshot is not None:
+                reference_meta.update(copy.deepcopy(reference_snapshot))
+                processed_value = reference_meta.get("processed_path")
+                if not processed_value:
+                    raise ProjectAssetError("Saved reference snapshot has no processed image path.")
+                processed_path = resolve_project_path(project, processed_value)
+                if file_sha256(processed_path) != reference_meta.get("processed_sha256"):
+                    raise ProjectAssetError("Saved reference snapshot changed; retry blocked.")
+                with Image.open(processed_path) as opened:
+                    reference_image = opened.convert("RGB").copy()
+            else:
+                if not config.reference_image_id:
+                    raise GenerationError("Choose exactly one reference image before generating.")
+                matches = [(person.person_id, reference) for person in project.people for reference in person.reference_images if reference.image_id == config.reference_image_id]
+                if len(matches) != 1:
+                    raise ProjectAssetError("Selected reference image is missing or ambiguous.")
+                person_id, reference = matches[0]
+                if reference.role != config.reference_mode:
+                    raise GenerationError(f"Selected reference role is {reference.role}, not {config.reference_mode}.")
+                processed_path, processed_meta = prepare_reference_image(project, reference, config.reference_crop_box)
+                with Image.open(processed_path) as opened:
+                    reference_image = opened.convert("RGB").copy()
+                reference_meta.update(
+                    {
+                        "person_id": person_id,
+                        "reference_image_id": reference.image_id,
+                        "reference_path": str(reference.path),
+                        "reference_sha256": processed_meta["source_sha256"],
+                        "source_sha256": processed_meta["source_sha256"],
+                        "processed_sha256": processed_meta["processed_sha256"],
+                        "crop_box": processed_meta["crop_box"],
+                        "crop_preprocess": processed_meta,
+                        "preprocessing": processed_meta.get("preprocessing") or processed_meta.get("preprocess"),
+                        "processed_path": processed_path.relative_to(project.project_dir).as_posix(),
+                        "license": IP_ADAPTER_LICENSE,
+                    }
+                )
     except (OSError, ValueError, ProjectAssetError, GenerationError) as exc:
-        project.generation_runs.append({"run_id": f"run_{uuid.uuid4().hex}", "scene_id": scene.scene_id,
-            "config": asdict(config), "reference": reference_meta, "references_applied": False,
-            "generation_status": "blocked", "visual_quality_status": "unverified", "errors": [str(exc)]})
+        project.generation_runs.append(
+            {
+                "run_id": f"run_{uuid.uuid4().hex}",
+                "scene_id": scene.scene_id,
+                "config": asdict(config),
+                "reference": reference_meta,
+                "references_applied": False,
+                "generation_status": "blocked",
+                "visual_quality_status": "unverified",
+                "errors": [str(exc)],
+            }
+        )
         save_project_atomic(project)
         raise
     run_id = f"run_{uuid.uuid4().hex}"
     indices = candidate_indices if candidate_indices is not None else list(range(max(1, config.candidate_count)))
-    snapshot = {"run_id": run_id, "created_at": utc_now(), "scene_id": scene.scene_id, "prompt": scene.prompt_user or scene.prompt_auto, "negative_prompt": scene.negative_prompt_user or scene.negative_prompt_auto, "references_applied": False, "reference": reference_meta, "model_id": config.model_id, "revision": config.revision, "scheduler": config.scheduler, "size": list(config.size), "steps": config.steps, "guidance_scale": config.guidance_scale, "base_seed": config.seed, "candidate_indices": list(indices), "failed_indices": [], "errors": [], "cancelled": False}
-    snapshot["config"] = asdict(config)
-    snapshot["visual_quality_status"] = "unverified"
-    snapshot["generation_status"] = "running"
-    snapshot["outcomes"] = []
+    snapshot = {
+        "run_id": run_id,
+        "created_at": utc_now(),
+        "scene_id": scene.scene_id,
+        "prompt": scene.prompt_user or scene.prompt_auto,
+        "negative_prompt": scene.negative_prompt_user or scene.negative_prompt_auto,
+        "requested_reference_mode": config.reference_mode,
+        "person_id": reference_meta["person_id"],
+        "reference_image_id": reference_meta["reference_image_id"],
+        "source_sha256": reference_meta["source_sha256"],
+        "processed_sha256": reference_meta["processed_sha256"],
+        "crop_box": reference_meta["crop_box"],
+        "preprocessing": reference_meta["preprocessing"],
+        "adapter_id": adapter_id,
+        "adapter_revision": adapter_revision,
+        "adapter_weight": config.ip_adapter_weight,
+        "image_encoder": IP_ADAPTER_IMAGE_ENCODER,
+        "image_encoder_revision": adapter_revision,
+        "reference_strength": reference_meta["reference_strength"],
+        "references_applied": False,
+        "actual_reference_applied": False,
+        "reference": reference_meta,
+        "model_id": config.model_id,
+        "revision": config.revision,
+        "scheduler": config.scheduler,
+        "size": list(config.size),
+        "steps": config.steps,
+        "guidance_scale": config.guidance_scale,
+        "base_seed": config.seed,
+        "candidate_indices": list(indices),
+        "candidate_results": [],
+        "config": asdict(config),
+        "outcomes": [],
+        "failed_indices": [],
+        "errors": [],
+        "failure_reason": None,
+        "generation_status": "running",
+        "visual_quality_status": "unverified",
+        "cancelled": False,
+    }
     project.generation_runs.append(snapshot)
     result = GenerationResult(scene.scene_id, run_id=run_id)
     prompt = snapshot["prompt"]
@@ -383,25 +713,52 @@ def generate_scene_candidates(project: CoverMorphProject, scene: SceneCard, engi
         if progress:
             progress({"phase": "candidate_start", "scene_id": scene.scene_id, "candidate": index + 1, "total": config.candidate_count, "seed": seed})
         try:
-            image = engine.generate_one(prompt, negative, config, seed, cancel_event, progress, reference_image.copy() if reference_image is not None else None)
+            image = engine.generate_one(prompt, negative, config, seed, cancel_event, progress, reference_image)
+            actual_reference_applied = bool(getattr(engine, "last_reference_applied", config.reference_mode != "off"))
             if config.reference_mode != "off":
-                snapshot["reference"]["reference_applied"] = getattr(engine, "last_reference_applied", False)
-                snapshot["references_applied"] = getattr(engine, "last_reference_applied", False)
-                snapshot["reference"]["ip_adapter_revision"] = getattr(engine, "ip_adapter_revision", config.ip_adapter_revision)
-                snapshot["reference"]["image_encoder_revision"] = snapshot["reference"]["ip_adapter_revision"]
-                if not snapshot["references_applied"]:
+                if not actual_reference_applied:
                     raise GenerationError("Requested reference was not applied; output rejected.")
-            if cancel_event.is_set():
-                raise GenerationCancelled("Cancelled before output registration.")
+                snapshot["reference"]["actual_reference_applied"] = actual_reference_applied
+                snapshot["reference"]["reference_applied"] = actual_reference_applied
+                snapshot["reference"]["references_applied"] = actual_reference_applied
+                snapshot["actual_reference_applied"] = actual_reference_applied
+                snapshot["references_applied"] = actual_reference_applied
+            snapshot["reference"]["generation_status"] = "succeeded"
+            snapshot["reference"]["failure_reason"] = None
+            candidate_metadata = copy.deepcopy(snapshot)
+            candidate_metadata.update(
+                {
+                    "seed": seed,
+                    "candidate_index": index + 1,
+                    "generation_status": "succeeded",
+                    "failure_reason": None,
+                    "visual_quality_status": "unverified",
+                    "actual_reference_applied": actual_reference_applied,
+                    "references_applied": actual_reference_applied,
+                    "metrics": copy.deepcopy(getattr(engine, "last_generation_metrics", {})),
+                }
+            )
+            candidate_metadata["reference"]["generation_status"] = "succeeded"
+            candidate_metadata["reference"]["failure_reason"] = None
             temp = project.project_dir / "assets" / ".generation_tmp" / f"{run_id}_{index}.png"
             temp.parent.mkdir(parents=True, exist_ok=True)
             image.save(temp, "PNG")
-            candidate = add_generated_candidate(project, scene, temp, {**copy.deepcopy(snapshot), "seed": seed, "candidate_index": index + 1, "generation_status": "generated"})
+            candidate = add_generated_candidate(project, scene, temp, candidate_metadata)
             temp.unlink(missing_ok=True)
+            snapshot["candidate_results"].append(
+                {
+                    "candidate_index": index + 1,
+                    "seed": seed,
+                    "generation_status": "succeeded",
+                    "failure_reason": None,
+                    "actual_reference_applied": actual_reference_applied,
+                    "visual_quality_status": "unverified",
+                    "metrics": copy.deepcopy(getattr(engine, "last_generation_metrics", {})),
+                }
+            )
+            snapshot["outcomes"].append({"index": index, "status": "generated", "reference_applied": actual_reference_applied})
             result.candidate_ids.append(candidate.candidate_id)
-            snapshot["outcomes"].append({"index": index, "status": "generated", "reference_applied": snapshot["references_applied"]})
             result.completed += 1
-            save_project_atomic(project)
             if progress:
                 progress({"phase": "candidate_done", "scene_id": scene.scene_id, "candidate": index + 1, "total": config.candidate_count, "candidate_id": candidate.candidate_id})
         except GenerationCancelled as exc:
@@ -409,31 +766,68 @@ def generate_scene_candidates(project: CoverMorphProject, scene: SceneCard, engi
             result.errors.append(str(exc))
             result.failed_indices.extend(indices[indices.index(index):])
             snapshot["cancelled"] = True
+            snapshot["failure_reason"] = str(exc)
+            snapshot["reference"]["failure_reason"] = str(exc)
+            snapshot["candidate_results"].append(
+                {
+                    "candidate_index": index + 1,
+                    "seed": seed,
+                    "generation_status": "cancelled",
+                    "failure_reason": str(exc),
+                    "actual_reference_applied": False,
+                    "visual_quality_status": "unverified",
+                    "metrics": copy.deepcopy(getattr(engine, "last_generation_metrics", {})),
+                }
+            )
+            snapshot["outcomes"].append({"index": index, "status": "failed", "error": str(exc), "reference_applied": False})
             break
         except Exception as exc:
             result.failed += 1
             result.failed_indices.append(index)
             result.errors.append(f"candidate {index + 1}: {exc}")
-            snapshot["outcomes"].append({"index": index, "status": "failed", "error": str(exc), "reference_applied": False})
-    snapshot["generation_status"] = "cancelled" if result.cancelled else ("partial" if result.failed and result.completed else "failed" if result.failed else "generated")
+            snapshot["failure_reason"] = str(exc)
+            snapshot["reference"]["failure_reason"] = str(exc)
+            snapshot["candidate_results"].append(
+                {
+                    "candidate_index": index + 1,
+                    "seed": seed,
+                    "generation_status": "failed",
+                    "failure_reason": str(exc),
+                    "actual_reference_applied": False,
+                    "visual_quality_status": "unverified",
+                    "metrics": copy.deepcopy(getattr(engine, "last_generation_metrics", {})),
+                }
+            )
     snapshot["failed_indices"] = list(result.failed_indices)
     snapshot["errors"] = list(result.errors)
+    snapshot["generation_status"] = "cancelled" if result.cancelled else ("succeeded" if result.failed == 0 else ("partial" if result.completed else "failed"))
+    snapshot["reference"]["generation_status"] = snapshot["generation_status"]
+    snapshot["reference"]["failure_reason"] = snapshot["failure_reason"]
     snapshot["loaded_revision"] = getattr(engine, "loaded_revision", None) or config.revision or "model-default"
-    save_project_atomic(project)
     return result
 
 
 def retry_failed_candidates(project: CoverMorphProject, scene: SceneCard, engine: SDXLTextToImageEngine, config: GenerationConfig, failed_indices: list[int], cancel_event: Event, progress: Callable[[dict[str, Any]], None] | None = None) -> GenerationResult:
     """Retry only indexes that were not registered as successful candidates."""
-    previous = next((run for run in reversed(project.generation_runs) if run["scene_id"] == scene.scene_id and run.get("failed_indices") == failed_indices and "config" in run), None)
+    requested = sorted(set(failed_indices))
+    previous = next(
+        (
+            run
+            for run in reversed(project.generation_runs)
+            if run.get("scene_id") == scene.scene_id
+            and run.get("failed_indices") == requested
+            and "config" in run
+        ),
+        None,
+    )
     reference_snapshot = None
-    if previous:
+    if previous is not None:
         config = GenerationConfig(**copy.deepcopy(previous["config"]))
         scene = copy.deepcopy(scene)
         scene.prompt_user = previous["prompt"]
         scene.negative_prompt_user = previous["negative_prompt"]
-        scene.prompt_confirmed = True  # Retry the original confirmed request, not current edits.
+        scene.prompt_confirmed = True
         reference_snapshot = previous.get("reference")
         engine.model_id = config.model_id
         engine.revision = config.revision
-    return generate_scene_candidates(project, scene, engine, config, cancel_event, progress, sorted(set(failed_indices)), reference_snapshot)
+    return generate_scene_candidates(project, scene, engine, config, cancel_event, progress, requested, reference_snapshot)

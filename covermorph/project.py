@@ -539,8 +539,21 @@ def prepare_reference_image(project: CoverMorphProject, reference: ReferenceImag
     cache_key = hashlib.sha256(f"{source_hash}|{crop_key}|exif_transpose|white-alpha-rgb-v2".encode()).hexdigest()[:20]
     destination = project.project_dir / "assets" / "references" / "processed" / f"{reference.image_id}_{cache_key}.png"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    processed.save(destination, "PNG")
-    return destination, {"source_sha256": source_hash, "processed_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "crop_box": list(crop_box) if crop_box else None, "preprocess": "EXIF transpose, alpha on white, RGB, optional user crop", "cache_key": cache_key}
+    if not destination.is_file():
+        processed.save(destination, "PNG")
+    try:
+        with Image.open(destination) as cached:
+            cached.verify()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ProjectAssetError(f"Processed reference cache is damaged: {destination}") from exc
+    return destination, {
+        "source_sha256": source_hash,
+        "processed_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        "crop_box": list(crop_box) if crop_box else None,
+        "preprocessing": "EXIF transpose, alpha on white, RGB, optional user crop",
+        "preprocess": "EXIF transpose, alpha on white, RGB, optional user crop",
+        "cache_key": cache_key,
+    }
 
 
 def parse_input_file(path: Path) -> list[InputRecord]:
