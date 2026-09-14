@@ -15,6 +15,14 @@ from PIL import Image, ImageColor, ImageOps, ImageTk, UnidentifiedImageError
 
 from . import __version__
 from .ai_plugins import AIBackends
+from .generation import (
+    DEFAULT_SDXL_MODEL,
+    GenerationConfig,
+    SDXLTextToImageEngine,
+    detect_generation_environment,
+    generate_scene_candidates,
+    retry_failed_candidates,
+)
 from .logger import write_exception, write_log
 from .pipeline import (
     DEFAULT_OUTPAINT_PROMPT,
@@ -48,6 +56,7 @@ from .project import (
     add_input_records,
     add_person,
     add_person_reference,
+    adopt_generated_candidate,
     adopt_removal_preview,
     configure_scene_prompt,
     create_project,
@@ -263,6 +272,13 @@ class CoverMorphApp(_CoverMorphWindow):
         self.preset_negative_prompt_var = ctk.StringVar(value="")
         self.current_scene_id: str | None = None
         self.prompt_preview_text: ctk.CTkTextbox | None = None
+        self.generation_count_var = ctk.IntVar(value=1)
+        self.generation_seed_var = ctk.IntVar(value=1000)
+        self.generation_steps_var = ctk.IntVar(value=28)
+        self.generation_guidance_var = ctk.DoubleVar(value=7.0)
+        self.generation_model_var = ctk.StringVar(value=DEFAULT_SDXL_MODEL)
+        self.generation_status_label: ctk.CTkLabel | None = None
+        self.last_generation_result: Any | None = None
 
         self.build_project_group(left)
         self.build_generation_group(left)
@@ -461,6 +477,24 @@ class CoverMorphApp(_CoverMorphWindow):
         self.prompt_preview_text.pack(fill="x", padx=12, pady=3)
         self.copy_prompt_button = ctk.CTkButton(frame, text="최종 프롬프트 복사", command=self.copy_current_prompt)
         self.copy_prompt_button.pack(fill="x", padx=12, pady=(3, 12))
+        ctk.CTkLabel(frame, text="3-A 로컬 SDXL 후보 생성 (참고 이미지는 이번 단계 미적용)", text_color="#fbbf24", anchor="w").pack(fill="x", padx=12, pady=(5, 2))
+        self.generation_count_entry = ctk.CTkEntry(frame, textvariable=self.generation_count_var)
+        self.generation_count_entry.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(frame, text="후보 수 | seed 시작값 | steps | guidance", anchor="w").pack(fill="x", padx=12, pady=2)
+        generation_row = ctk.CTkFrame(frame, fg_color="transparent")
+        generation_row.pack(fill="x", padx=12, pady=2)
+        for variable in (self.generation_seed_var, self.generation_steps_var, self.generation_guidance_var):
+            ctk.CTkEntry(generation_row, textvariable=variable, width=90).pack(side="left", padx=2, expand=True, fill="x")
+        self.generation_model_entry = ctk.CTkEntry(frame, textvariable=self.generation_model_var)
+        self.generation_model_entry.pack(fill="x", padx=12, pady=2)
+        self.download_model_button = ctk.CTkButton(frame, text="SDXL 모델 명시적 다운로드/준비", command=self.download_generation_model)
+        self.download_model_button.pack(fill="x", padx=12, pady=3)
+        self.generate_scene_button = ctk.CTkButton(frame, text="확인된 현재 장면 후보 생성", command=self.generate_current_scene)
+        self.generate_scene_button.pack(fill="x", padx=12, pady=3)
+        self.retry_generation_button = ctk.CTkButton(frame, text="실패/취소 후보만 재시도", command=self.retry_current_generation)
+        self.retry_generation_button.pack(fill="x", padx=12, pady=3)
+        self.generation_status_label = ctk.CTkLabel(frame, text="환경 확인 전", wraplength=350, justify="left", anchor="w")
+        self.generation_status_label.pack(fill="x", padx=12, pady=(2, 12))
 
     def build_ocr_group(self, parent: Any) -> None:
         frame = self.group(parent, "4. OCR 및 글자 제거")
@@ -687,6 +721,11 @@ class CoverMorphApp(_CoverMorphWindow):
             self.duplicate_scene_button,
             self.confirm_scene_button,
             self.copy_prompt_button,
+            self.generation_count_entry,
+            self.generation_model_entry,
+            self.download_model_button,
+            self.generate_scene_button,
+            self.retry_generation_button,
             self.input_type_menu,
             self.add_button,
             self.remove_button,
@@ -1080,6 +1119,85 @@ class CoverMorphApp(_CoverMorphWindow):
         if self.project is None:
             return None
         return next((scene for scene in self.project.scenes if scene.scene_id == self.current_scene_id), self.project.scenes[-1] if self.project.scenes else None)
+
+    def generate_current_scene(self) -> None:
+        scene = self.current_scene()
+        if self.project is None or scene is None:
+            messagebox.showinfo("장면 필요", "먼저 장면을 추가하고 프롬프트를 확인해 주세요.")
+            return
+        if not scene.prompt_confirmed:
+            messagebox.showwarning("프롬프트 확인 필요", "미확인 장면입니다. 프롬프트를 확인 완료한 뒤 생성해 주세요.")
+            return
+        environment = detect_generation_environment(self.root_dir, self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL)
+        if self.generation_status_label is not None:
+            self.generation_status_label.configure(text=f"생성 환경: {environment.get('status')} | 참고 이미지 적용: 아니오\n{environment.get('gpu') or 'GPU 없음'}")
+        if environment.get("status") != "ready":
+            messagebox.showwarning("SDXL 생성 불가", "CUDA GPU와 Diffusers가 준비된 환경에서만 생성합니다. CPU 자동 전환은 하지 않습니다.")
+            return
+        try:
+            config = GenerationConfig(model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL, output_ratio=scene.output_ratio, candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()))
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("생성 설정 오류", str(exc))
+            return
+        project_snapshot = self.project
+        engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
+
+        def worker() -> None:
+            result = generate_scene_candidates(project_snapshot, scene, engine, config, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
+            save_project_atomic(project_snapshot)
+            self.worker_queue.put({"type": "generation_done", "result": result})
+            engine.unload()
+
+        self.start_worker("SDXL candidate generation", worker)
+
+    def retry_current_generation(self) -> None:
+        result = self.last_generation_result
+        scene = self.current_scene()
+        if result is None or not result.failed_indices or self.project is None or scene is None:
+            messagebox.showinfo("재시도", "재시도할 실패 또는 취소 후보가 없습니다.")
+            return
+        config = GenerationConfig(model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL, output_ratio=scene.output_ratio, candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()))
+        project_snapshot = self.project
+        engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
+
+        def worker() -> None:
+            retry = retry_failed_candidates(project_snapshot, scene, engine, config, result.failed_indices, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
+            save_project_atomic(project_snapshot)
+            self.worker_queue.put({"type": "generation_done", "result": retry})
+            engine.unload()
+
+        self.start_worker("SDXL retry", worker)
+
+    def download_generation_model(self) -> None:
+        model_id = self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL
+        target = self.root_dir / "models" / "sdxl_base_1.0"
+
+        def worker() -> None:
+            SDXLTextToImageEngine.download(model_id, target, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
+            self.worker_queue.put({"type": "generation_model_ready", "path": str(target)})
+
+        self.start_worker("SDXL model download", worker)
+
+    def handle_generation_progress(self, payload: dict[str, Any]) -> None:
+        phase = payload.get("phase", "")
+        if phase == "inference":
+            self.top_current_label.configure(text=f"생성 추론 step {payload.get('step')}/{payload.get('steps')}")
+        elif phase == "candidate_start":
+            self.top_current_label.configure(text=f"장면 {payload.get('scene_id')} 후보 {payload.get('candidate')}/{payload.get('total')} seed {payload.get('seed')}")
+        elif phase == "model_loading":
+            self.top_current_label.configure(text=f"모델 로딩: {payload.get('model')}")
+        self.status.configure(text="3-A SDXL 생성 중 | 참고 이미지는 적용하지 않음")
+
+    def handle_generation_done(self, result: Any) -> None:
+        self.last_generation_result = result
+        if self.project is not None:
+            self.project_dirty = False
+            self.load_project_rows(self.project)
+            self.refresh_image_table()
+            self.update_summary()
+        self.status.configure(text=f"3-A 생성 완료: 성공 {result.completed}, 실패 {result.failed}, 취소 {result.cancelled}\n생성 후보는 품질 미검증이며 작업 원본으로 자동 채택되지 않습니다.")
+        if self.generation_status_label is not None:
+            self.generation_status_label.configure(text=f"생성 결과: 성공 {result.completed} / 실패 {result.failed} / 취소 {result.cancelled}\n참고 이미지 적용: 아니오")
 
     def show_scene_prompt(self, scene: SceneCard) -> None:
         if self.prompt_preview_text is None:
@@ -1935,6 +2053,22 @@ class CoverMorphApp(_CoverMorphWindow):
         if state is None or self.project is None or state.candidate is None:
             messagebox.showinfo("안내", "먼저 프로젝트 후보를 선택해주세요.")
             return
+        if state.candidate.generation_status == "succeeded":
+            try:
+                working_path = adopt_generated_candidate(self.project, state.candidate)
+            except ProjectAssetError as exc:
+                messagebox.showerror("생성 후보 채택 실패", str(exc))
+                return
+            state.job.source = working_path
+            state.job.auto_remove_text = False
+            state.job.manual_boxes = ()
+            state.job.ocr_boxes = ()
+            self.update_candidate_from_state(state)
+            self.mark_project_dirty()
+            self.refresh_image_table()
+            self.draw_preview()
+            self.status.configure(text=f"생성 후보를 작업 원본으로 채택했습니다.\n{working_path}")
+            return
         if state.candidate.input_type == INPUT_TYPE_TEXTLESS:
             messagebox.showinfo("안내", "글자 없는 이미지 입력은 이미 작업 원본으로 채택되어 있습니다.")
             return
@@ -2239,6 +2373,13 @@ class CoverMorphApp(_CoverMorphWindow):
             self.handle_pipeline_progress(event["payload"], event.get("row_indices"))
         elif event_type == "pipeline_done":
             self.handle_pipeline_done(event["results"], event["output_dir"], event.get("row_indices"))
+        elif event_type == "generation_progress":
+            self.handle_generation_progress(event["payload"])
+        elif event_type == "generation_done":
+            self.handle_generation_done(event["result"])
+        elif event_type == "generation_model_ready":
+            self.generation_model_var.set(event["path"])
+            self.status.configure(text=f"SDXL 모델 준비 완료: {event['path']}")
         elif event_type == "worker_error":
             self.status.configure(text=f"오류: {event['error']}\n수동 마스크나 로그를 확인해주세요.")
             messagebox.showerror("CoverMorph 오류", event["error"])

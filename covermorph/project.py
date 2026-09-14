@@ -274,6 +274,10 @@ class CandidateRecord:
     auto_quality_status: str = "not_checked"
     user_approval_status: str = "not_required"
     working_source_approved: bool = False
+    scene_id: str = ""
+    generation_status: str = "not_generated"
+    quality_status: str = "unverified"
+    generation_metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
 
@@ -303,6 +307,10 @@ class CandidateRecord:
             auto_quality_status=str(data.get("auto_quality_status") or "not_checked"),
             user_approval_status=str(data.get("user_approval_status") or "not_required"),
             working_source_approved=bool(data.get("working_source_approved", False)),
+            scene_id=str(data.get("scene_id") or ""),
+            generation_status=str(data.get("generation_status") or "not_generated"),
+            quality_status=str(data.get("quality_status") or "unverified"),
+            generation_metadata=dict(data.get("generation_metadata") or {}),
             created_at=str(data.get("created_at") or ""),
             updated_at=str(data.get("updated_at") or ""),
         )
@@ -324,6 +332,10 @@ class CandidateRecord:
             "auto_quality_status": self.auto_quality_status,
             "user_approval_status": self.user_approval_status,
             "working_source_approved": self.working_source_approved,
+            "scene_id": self.scene_id,
+            "generation_status": self.generation_status,
+            "quality_status": self.quality_status,
+            "generation_metadata": dict(self.generation_metadata),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -344,6 +356,7 @@ class CoverMorphProject:
     people: list[PersonRecord] = field(default_factory=list)
     inputs: list[InputRecord] = field(default_factory=list)
     scenes: list[SceneCard] = field(default_factory=list)
+    generation_runs: list[dict[str, Any]] = field(default_factory=list)
     selected_candidate_ids: list[str] = field(default_factory=list)
     candidates: list[CandidateRecord] = field(default_factory=list)
     created_at: str = ""
@@ -380,6 +393,7 @@ class CoverMorphProject:
             people=[PersonRecord.from_dict(item) for item in (data.get("people") or []) if isinstance(item, dict)],
             inputs=[InputRecord.from_dict(item) for item in (data.get("inputs") or []) if isinstance(item, dict)],
             scenes=[SceneCard.from_dict(item) for item in (data.get("scenes") or []) if isinstance(item, dict)],
+            generation_runs=[dict(item) for item in (data.get("generation_runs") or []) if isinstance(item, dict)],
             selected_candidate_ids=[str(item) for item in selected_ids],
             candidates=[CandidateRecord.from_dict(item) for item in candidates_data if isinstance(item, dict)],
             created_at=str(data.get("created_at") or ""),
@@ -400,6 +414,7 @@ class CoverMorphProject:
             "people": [person.to_dict() for person in self.people],
             "inputs": [item.to_dict() for item in self.inputs],
             "scenes": [scene.to_dict() for scene in self.scenes],
+            "generation_runs": [dict(item) for item in self.generation_runs],
             "selected_candidate_ids": list(self.selected_candidate_ids),
             "candidates": [candidate.to_dict() for candidate in self.candidates],
             "created_at": self.created_at,
@@ -448,7 +463,7 @@ def create_project(project_dir: Path, name: str | None = None) -> CoverMorphProj
 
 
 def ensure_project_dirs(project: CoverMorphProject) -> None:
-    for relative in ("assets/originals", "assets/removal_previews", "assets/textless", "assets/references", "assets/inputs"):
+    for relative in ("assets/originals", "assets/removal_previews", "assets/textless", "assets/references", "assets/inputs", "assets/generated"):
         (project.project_dir / relative).mkdir(parents=True, exist_ok=True)
 
 
@@ -743,6 +758,59 @@ def adopt_removal_preview(project: CoverMorphProject, candidate: CandidateRecord
     candidate.auto_quality_status = quality
     candidate.updated_at = utc_now()
     return working_dest
+
+
+def add_generated_candidate(
+    project: CoverMorphProject,
+    scene: SceneCard,
+    image_path: Path,
+    metadata: dict[str, Any],
+) -> CandidateRecord:
+    """Register a generated PNG without treating it as a reviewed work source."""
+    if not image_path.is_file():
+        raise ProjectAssetError(f"Generated image is missing: {image_path}")
+    ensure_project_dirs(project)
+    candidate_id = new_id("gen")
+    destination = project.project_dir / "assets" / "generated" / f"{candidate_id}.png"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(image_path, destination)
+    _load_rgb_image(destination).close()
+    candidate = CandidateRecord(
+        candidate_id=candidate_id,
+        display_name=f"{scene.scene_id} candidate",
+        input_type=INPUT_TYPE_TEXTLESS,
+        original_path=path_to_project_string(project, destination),
+        working_source_path="",
+        selected=False,
+        scene_id=scene.scene_id,
+        generation_status="succeeded",
+        quality_status="unverified",
+        generation_metadata=dict(metadata),
+        text_removal_status="not_needed",
+        text_removal_engine="Skipped",
+        user_approval_status="pending",
+        working_source_approved=False,
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    project.candidates.append(candidate)
+    return candidate
+
+
+def adopt_generated_candidate(project: CoverMorphProject, candidate: CandidateRecord) -> Path:
+    if candidate.generation_status != "succeeded" or not candidate.original_path:
+        raise ProjectAssetError("Only a successfully generated candidate can be adopted.")
+    source = resolve_project_path(project, candidate.original_path)
+    if not source.is_file():
+        raise ProjectAssetError(f"Generated candidate is missing: {source}")
+    destination = project.project_dir / "assets" / "textless" / f"{candidate.candidate_id}_approved.png"
+    shutil.copy2(source, destination)
+    candidate.working_source_path = path_to_project_string(project, destination)
+    candidate.working_source_approved = True
+    candidate.user_approval_status = "approved_by_user"
+    candidate.quality_status = "user_selected_unverified_quality"
+    candidate.updated_at = utc_now()
+    return destination
 
 
 def validate_project_assets(project: CoverMorphProject) -> list[ProjectIssue]:
