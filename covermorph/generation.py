@@ -118,6 +118,10 @@ def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_M
         result["diffusers"] = None
     result["model_paths"] = [str(path) for path in (app_root / "models").glob("*")] if (app_root / "models").is_dir() else []
     model_path = Path(model_id)
+    if not model_path.is_absolute():
+        candidates = [model_path, app_root / model_path]
+        model_path = next((candidate for candidate in candidates if candidate.is_dir()), candidates[-1])
+    result["resolved_model_path"] = str(model_path) if model_path.is_dir() else None
     result["model_ready"] = model_path.is_dir() and (model_path / "model_index.json").is_file()
     result["status"] = "ready" if result["cuda"] and result["diffusers"] and result["model_ready"] else ("gpu_unavailable" if not result["cuda"] else ("package_missing" if not result["diffusers"] else "model_missing"))
     return result

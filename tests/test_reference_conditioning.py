@@ -232,3 +232,16 @@ def test_requested_reference_without_actual_application_is_rejected(tmp_path):
     result = generate_scene_candidates(project, confirmed_scene(), IgnoringEngine(), GenerationConfig(reference_mode='person',reference_image_id=ref.image_id), Event())
     assert result.failed == 1 and not project.candidates
     assert 'not applied' in result.errors[0]
+
+
+def test_environment_resolves_relative_model_under_app_root(tmp_path):
+    from covermorph.generation import detect_generation_environment
+    model = tmp_path / 'models' / 'sdxl'
+    model.mkdir(parents=True)
+    (model / 'model_index.json').write_text('{}')
+    import sys
+    from types import SimpleNamespace
+    sys.modules['torch'] = SimpleNamespace(__version__='test', cuda=SimpleNamespace(is_available=lambda: False))
+    result = detect_generation_environment(tmp_path, 'models/sdxl')
+    assert result['resolved_model_path'] == str(model)
+    assert result['model_ready'] is True
