@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -520,9 +521,11 @@ def prepare_reference_image(project: CoverMorphProject, reference: ReferenceImag
     if not source.is_file():
         raise ProjectAssetError(f"Reference image is missing: {source}")
     try:
-        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
-        with Image.open(source) as opened:
-            image = ImageOps.exif_transpose(opened).convert("RGB")
+        data = source.read_bytes()
+        source_hash = hashlib.sha256(data).hexdigest()
+        with Image.open(io.BytesIO(data)) as opened:
+            rgba = ImageOps.exif_transpose(opened).convert("RGBA")
+            image = Image.alpha_composite(Image.new("RGBA", rgba.size, "white"), rgba).convert("RGB")
     except (OSError, UnidentifiedImageError) as exc:
         raise ProjectAssetError(f"Reference image is damaged or unreadable: {source}") from exc
     processed = image
@@ -533,12 +536,11 @@ def prepare_reference_image(project: CoverMorphProject, reference: ReferenceImag
             raise ProjectAssetError("Reference crop box is outside the image.")
         processed = image.crop((left, top, right, bottom))
         crop_key = f"{left}_{top}_{right}_{bottom}"
-    cache_key = hashlib.sha256(f"{source_hash}|{crop_key}|exif_transpose|rgb|ip-adapter-sdxl-v1".encode()).hexdigest()[:20]
+    cache_key = hashlib.sha256(f"{source_hash}|{crop_key}|exif_transpose|white-alpha-rgb-v2".encode()).hexdigest()[:20]
     destination = project.project_dir / "assets" / "references" / "processed" / f"{reference.image_id}_{cache_key}.png"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.is_file():
-        processed.save(destination, "PNG")
-    return destination, {"source_sha256": source_hash, "processed_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "crop_box": list(crop_box) if crop_box else None, "preprocess": "EXIF transpose, RGB, optional user crop", "cache_key": cache_key}
+    processed.save(destination, "PNG")
+    return destination, {"source_sha256": source_hash, "processed_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "crop_box": list(crop_box) if crop_box else None, "preprocess": "EXIF transpose, alpha on white, RGB, optional user crop", "cache_key": cache_key}
 
 
 def parse_input_file(path: Path) -> list[InputRecord]:
@@ -601,7 +603,9 @@ def compose_scene_prompt(project: CoverMorphProject, scene: SceneCard, preset: C
 def configure_scene_prompt(project: CoverMorphProject, scene: SceneCard, preset: ChannelGenerationPreset, *, refresh: bool = False) -> None:
     if scene.prompt_confirmed and not refresh:
         return
+    reference_settings = {key: value for key, value in scene.structured_request.items() if key.startswith("reference_")}
     scene.prompt_auto, scene.negative_prompt_auto, scene.structured_request = compose_scene_prompt(project, scene, preset)
+    scene.structured_request.update(reference_settings)
     scene.prompt_user = scene.prompt_auto
     scene.negative_prompt_user = scene.negative_prompt_auto
     scene.prompt_source_preset_id = preset.preset_id

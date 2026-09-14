@@ -38,6 +38,7 @@ class FakeEngine:
         self.seeds.append(seed)
         self.calls.append((config.reference_mode, config.reference_strength, reference_image is not None))
         self.ip_adapter_loaded = config.reference_mode != "off" and reference_image is not None
+        self.last_reference_applied = self.ip_adapter_loaded
         if seed in self.failures:
             raise GenerationError("fake failure")
         if self.cancel_after is not None and len(self.seeds) > self.cancel_after:
@@ -98,7 +99,10 @@ def test_retry_only_uses_failed_indexes(tmp_path: Path) -> None:
     assert len(project.candidates) == 3
 
 
-def test_cpu_environment_never_reports_generation_ready(tmp_path: Path) -> None:
+def test_cpu_environment_never_reports_generation_ready(tmp_path: Path, monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(__version__="test", cuda=SimpleNamespace(is_available=lambda: False)))
     environment = detect_generation_environment(tmp_path)
     assert environment["cuda"] is False
     assert environment["status"] in {"gpu_unavailable", "package_missing"}

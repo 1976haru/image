@@ -67,6 +67,7 @@ from .project import (
     load_project,
     parse_input_file,
     path_to_project_string,
+    prepare_reference_image,
     resolve_project_path,
     save_generation_presets,
     save_project_atomic,
@@ -280,6 +281,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.generation_steps_var = ctk.IntVar(value=28)
         self.generation_guidance_var = ctk.DoubleVar(value=7.0)
         self.generation_model_var = ctk.StringVar(value=DEFAULT_SDXL_MODEL)
+        self.generation_size_var = ctk.StringVar(value="정사각 생성 1024×1024")
         self.reference_mode_var = ctk.StringVar(value="off")
         self.reference_image_var = ctk.StringVar(value="선택 안 함")
         self.reference_strength_var = ctk.DoubleVar(value=0.5)
@@ -497,7 +499,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.generation_model_entry.pack(fill="x", padx=12, pady=2)
         self.download_model_button = ctk.CTkButton(frame, text="SDXL 모델 명시적 다운로드/준비", command=self.download_generation_model)
         self.download_model_button.pack(fill="x", padx=12, pady=3)
-        ctk.CTkLabel(frame, text="참고 이미지 엔진: IP-Adapter 기본 (인물 일관성 보장 아님)", anchor="w").pack(fill="x", padx=12, pady=(5, 2))
+        ctk.CTkLabel(frame, text="참고 이미지 엔진: IP-Adapter Plus · 외모 참고 (동일 인물 보장 아님)", anchor="w").pack(fill="x", padx=12, pady=(5, 2))
         self.reference_mode_menu = ctk.CTkOptionMenu(frame, variable=self.reference_mode_var, values=["off", "person", "style"], command=self.on_reference_setting_changed)
         self.reference_mode_menu.pack(fill="x", padx=12, pady=2)
         self.reference_image_menu = ctk.CTkOptionMenu(frame, variable=self.reference_image_var, values=["선택 안 함"], command=self.on_reference_setting_changed)
@@ -509,8 +511,17 @@ class CoverMorphApp(_CoverMorphWindow):
         self.reference_strength_slider.pack(fill="x", padx=12, pady=2)
         self.reference_crop_entry = ctk.CTkEntry(frame, textvariable=self.reference_crop_var, placeholder_text="선택 크롭: left,top,right,bottom (비움=전체)")
         self.reference_crop_entry.pack(fill="x", padx=12, pady=2)
+        self.reference_crop_entry.bind("<FocusOut>", self.on_reference_setting_changed)
+        self.reference_crop_entry.bind("<Return>", self.on_reference_setting_changed)
+        self.reference_crop_button = ctk.CTkButton(frame, text="참고 영역 직접 크롭", command=self.crop_reference)
+        self.reference_crop_button.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(frame, text="스타일 참고도 인물·구도에 영향을 줄 수 있습니다.\n가로 생성 1344×768 / 세로 생성 768×1344\n최종 출력 1920×1080 / 1080×1920과 다릅니다.", wraplength=340).pack(fill="x", padx=12)
         self.download_adapter_button = ctk.CTkButton(frame, text="IP-Adapter 명시적 준비", command=self.download_ip_adapter)
         self.download_adapter_button.pack(fill="x", padx=12, pady=3)
+        self.adapter_status_label = ctk.CTkLabel(frame, text="참고 모델: 명시적 준비 필요 · 생성 전 파일 검증", wraplength=340)
+        self.adapter_status_label.pack(fill="x", padx=12, pady=2)
+        self.generation_size_menu = ctk.CTkOptionMenu(frame, variable=self.generation_size_var, values=["정사각 생성 1024×1024", "가로 생성 1344×768", "세로 생성 768×1344"], command=self.on_generation_size_changed)
+        self.generation_size_menu.pack(fill="x", padx=12, pady=2)
         self.generate_scene_button = ctk.CTkButton(frame, text="확인된 현재 장면 후보 생성", command=self.generate_current_scene)
         self.generate_scene_button.pack(fill="x", padx=12, pady=3)
         self.retry_generation_button = ctk.CTkButton(frame, text="실패/취소 후보만 재시도", command=self.retry_current_generation)
@@ -751,6 +762,8 @@ class CoverMorphApp(_CoverMorphWindow):
             self.reference_preview_label,
             self.reference_strength_slider,
             self.reference_crop_entry,
+            self.reference_crop_button,
+            self.generation_size_menu,
             self.download_adapter_button,
             self.generate_scene_button,
             self.retry_generation_button,
@@ -1160,7 +1173,83 @@ class CoverMorphApp(_CoverMorphWindow):
         self.reference_image_menu.configure(values=values)
         if self.reference_image_var.get() not in values:
             self.reference_image_var.set(values[0])
-        self.reference_preview_label.configure(text=f"참고 선택: {self.reference_image_var.get()}\n실제 적용은 IP-Adapter 호출 성공 시에만 기록됩니다.")
+        self.update_reference_preview()
+
+    def on_generation_size_changed(self, value):
+        scene = self.current_scene()
+        if scene:
+            scene.output_ratio = {"정사각 생성 1024×1024": "1:1", "가로 생성 1344×768": "16:9", "세로 생성 768×1344": "9:16"}[value]
+            scene.prompt_confirmed = False
+            self.mark_project_dirty()
+
+    def selected_reference(self):
+        image_id = self.reference_image_options.get(self.reference_image_var.get(), "")
+        if self.project:
+            return next((ref for person in self.project.people for ref in person.reference_images if ref.image_id == image_id), None)
+        return None
+
+    def update_reference_preview(self) -> None:
+        reference = self.selected_reference()
+        if reference is None or self.reference_mode_var.get() == "off":
+            self.reference_preview_label.configure(image=None, text="참고 사용 안 함" if self.reference_mode_var.get() == "off" else "참고 이미지 미선택")
+            return
+        try:
+            path, _meta = prepare_reference_image(self.project, reference, self.parse_reference_crop())
+            with Image.open(path) as opened:
+                preview = opened.copy()
+            preview.thumbnail((240, 150))
+            self.reference_preview_image = ctk.CTkImage(light_image=preview, dark_image=preview, size=preview.size)
+            self.reference_preview_label.configure(image=self.reference_preview_image, compound="top", text=f"{self.reference_mode_var.get()} · 강도 {self.reference_strength_var.get():.2f}\n{reference.path}")
+        except (OSError, ValueError, ProjectAssetError, GenerationError) as exc:
+            self.reference_preview_label.configure(image=None, text=f"참고 오류: {exc}")
+
+    def crop_reference(self) -> None:
+        reference = self.selected_reference()
+        if reference is None:
+            messagebox.showinfo("참고 선택", "먼저 참고 이미지 한 장을 선택하세요.")
+            return
+        try:
+            path, _meta = prepare_reference_image(self.project, reference)
+            with Image.open(path) as opened:
+                source = opened.copy()
+        except (OSError, ProjectAssetError) as exc:
+            messagebox.showerror("참고 오류", str(exc))
+            return
+        window = ctk.CTkToplevel(self)
+        window.title("얼굴·상반신 영역 드래그 (원본 보존)")
+        preview = source.copy()
+        preview.thumbnail((700, 600))
+        canvas = tk.Canvas(window, width=preview.width, height=preview.height, highlightthickness=0)
+        canvas.pack()
+        canvas.photo = ImageTk.PhotoImage(preview)
+        canvas.create_image(0, 0, anchor="nw", image=canvas.photo)
+        selection = {}
+
+        def begin(event):
+            canvas.delete("crop")
+            selection["start"] = (event.x, event.y)
+
+        def drag(event):
+            if "start" in selection:
+                canvas.delete("crop")
+                canvas.create_rectangle(*selection["start"], event.x, event.y, outline="red", width=2, tags="crop")
+
+        def finish(event):
+            if "start" not in selection:
+                return
+            x, y = selection["start"]
+            x2, y2 = event.x, event.y
+            scale_x, scale_y = source.width / preview.width, source.height / preview.height
+            box = (max(0, int(min(x, x2) * scale_x)), max(0, int(min(y, y2) * scale_y)), min(source.width, int(max(x, x2) * scale_x)), min(source.height, int(max(y, y2) * scale_y)))
+            if box[2] > box[0] and box[3] > box[1]:
+                self.reference_crop_var.set(",".join(map(str, box)))
+                self.on_reference_setting_changed()
+                window.destroy()
+
+        canvas.bind("<ButtonPress-1>", begin)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", finish)
+        ctk.CTkButton(window, text="크롭 없이 전체 사용", command=lambda: (self.reference_crop_var.set(""), self.on_reference_setting_changed(), window.destroy())).pack(pady=8)
 
     def parse_reference_crop(self) -> tuple[int, int, int, int] | None:
         text = self.reference_crop_var.get().strip()
@@ -1182,8 +1271,13 @@ class CoverMorphApp(_CoverMorphWindow):
         scene.structured_request["reference_mode"] = self.reference_mode_var.get()
         scene.structured_request["reference_image_id"] = reference_id
         scene.structured_request["reference_strength"] = float(self.reference_strength_var.get())
-        scene.structured_request["reference_crop_box"] = list(self.parse_reference_crop()) if self.reference_crop_var.get().strip() else None
+        try:
+            crop = self.parse_reference_crop()
+        except GenerationError:
+            crop = None
+        scene.structured_request["reference_crop_box"] = list(crop) if crop else None
         scene.prompt_confirmed = False
+        self.update_reference_preview()
         self.mark_project_dirty()
         self.status.configure(text="참고 설정이 변경되어 장면 확인 상태를 미확인으로 바꿨습니다.")
 
@@ -1192,7 +1286,7 @@ class CoverMorphApp(_CoverMorphWindow):
 
         def worker() -> None:
             SDXLTextToImageEngine.download_ip_adapter(target, DEFAULT_IP_ADAPTER, progress=lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
-            self.worker_queue.put({"type": "status", "message": f"IP-Adapter 준비 완료: {target}\n{IP_ADAPTER_ENCODER}"})
+            self.worker_queue.put({"type": "status", "message": f"IP-Adapter 파일 준비 완료 (실제 추론 미검증): {target}\n{IP_ADAPTER_ENCODER}"})
 
         self.start_worker("IP-Adapter model download", worker)
 
@@ -1212,17 +1306,19 @@ class CoverMorphApp(_CoverMorphWindow):
             return
         try:
             config = GenerationConfig(model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL, output_ratio=scene.output_ratio, candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()), reference_mode=self.reference_mode_var.get(), reference_image_id=self.reference_image_options.get(self.reference_image_var.get(), ""), reference_strength=float(self.reference_strength_var.get()), reference_crop_box=self.parse_reference_crop(), ip_adapter_id=str(self.root_dir / "models" / "ip_adapter"))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, GenerationError) as exc:
             messagebox.showerror("생성 설정 오류", str(exc))
             return
         project_snapshot = self.project
         engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
 
         def worker() -> None:
-            result = generate_scene_candidates(project_snapshot, scene, engine, config, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
-            save_project_atomic(project_snapshot)
-            self.worker_queue.put({"type": "generation_done", "result": result})
-            engine.unload()
+            try:
+                result = generate_scene_candidates(project_snapshot, scene, engine, config, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
+                save_project_atomic(project_snapshot)
+                self.worker_queue.put({"type": "generation_done", "result": result})
+            finally:
+                engine.unload()
 
         self.start_worker("SDXL candidate generation", worker)
 
@@ -1232,15 +1328,25 @@ class CoverMorphApp(_CoverMorphWindow):
         if result is None or not result.failed_indices or self.project is None or scene is None:
             messagebox.showinfo("재시도", "재시도할 실패 또는 취소 후보가 없습니다.")
             return
-        config = GenerationConfig(model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL, output_ratio=scene.output_ratio, candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()), reference_mode=self.reference_mode_var.get(), reference_image_id=self.reference_image_options.get(self.reference_image_var.get(), ""), reference_strength=float(self.reference_strength_var.get()), reference_crop_box=self.parse_reference_crop(), ip_adapter_id=str(self.root_dir / "models" / "ip_adapter"))
+        saved_run = next((run for run in self.project.generation_runs if run.get("run_id") == result.run_id), None)
+        if not saved_run or "config" not in saved_run:
+            messagebox.showerror("재시도 불가", "이전 생성 설정이 없습니다. 새 요청을 확인한 뒤 생성하세요.")
+            return
+        if scene.scene_id != result.scene_id:
+            messagebox.showerror("재시도 장면", "실패한 원래 장면에서 재시도하세요.")
+            return
+        config = GenerationConfig(**saved_run["config"])
+
         project_snapshot = self.project
         engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
 
         def worker() -> None:
-            retry = retry_failed_candidates(project_snapshot, scene, engine, config, result.failed_indices, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
-            save_project_atomic(project_snapshot)
-            self.worker_queue.put({"type": "generation_done", "result": retry})
-            engine.unload()
+            try:
+                retry = retry_failed_candidates(project_snapshot, scene, engine, config, result.failed_indices, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
+                save_project_atomic(project_snapshot)
+                self.worker_queue.put({"type": "generation_done", "result": retry})
+            finally:
+                engine.unload()
 
         self.start_worker("SDXL retry", worker)
 
@@ -1262,7 +1368,7 @@ class CoverMorphApp(_CoverMorphWindow):
             self.top_current_label.configure(text=f"장면 {payload.get('scene_id')} 후보 {payload.get('candidate')}/{payload.get('total')} seed {payload.get('seed')}")
         elif phase == "model_loading":
             self.top_current_label.configure(text=f"모델 로딩: {payload.get('model')}")
-        self.status.configure(text="3-A SDXL 생성 중 | 참고 이미지는 적용하지 않음")
+        self.status.configure(text="SDXL 생성 중 · 실제 참고 적용 여부는 완료된 후보 기록에서 확인")
 
     def handle_generation_done(self, result: Any) -> None:
         self.last_generation_result = result
@@ -1276,6 +1382,15 @@ class CoverMorphApp(_CoverMorphWindow):
             self.generation_status_label.configure(text=f"생성 결과: 성공 {result.completed} / 실패 {result.failed} / 취소 {result.cancelled}\n참고 이미지 적용: 아니오")
 
     def show_scene_prompt(self, scene: SceneCard) -> None:
+        self.refresh_reference_options()
+        self.generation_size_var.set({"1:1": "정사각 생성 1024×1024", "16:9": "가로 생성 1344×768", "9:16": "세로 생성 768×1344"}[scene.output_ratio])
+        settings = scene.structured_request
+        self.reference_mode_var.set(settings.get("reference_mode", "off"))
+        self.reference_strength_var.set(settings.get("reference_strength", 0.5))
+        self.reference_crop_var.set(",".join(map(str, settings.get("reference_crop_box") or [])))
+        selected = settings.get("reference_image_id", "")
+        self.reference_image_var.set(next((label for label, value in self.reference_image_options.items() if value == selected), "선택 안 함"))
+        self.update_reference_preview()
         if self.prompt_preview_text is None:
             return
         self.prompt_preview_text.delete("1.0", "end")
@@ -1284,6 +1399,16 @@ class CoverMorphApp(_CoverMorphWindow):
     def confirm_current_scene(self) -> None:
         scene = self.current_scene()
         if scene is None:
+            return
+        try:
+            self.parse_reference_crop()
+            ref = self.selected_reference()
+            if self.reference_mode_var.get() != "off":
+                if ref is None or ref.role != self.reference_mode_var.get():
+                    raise GenerationError("선택 참고 이미지의 용도와 참고 모드를 맞춰 주세요.")
+                prepare_reference_image(self.project, ref, self.parse_reference_crop())
+        except (GenerationError, ProjectAssetError, OSError) as exc:
+            messagebox.showerror("참고 설정 오류", str(exc))
             return
         scene.prompt_confirmed = True
         self.show_scene_prompt(scene)
@@ -1377,6 +1502,13 @@ class CoverMorphApp(_CoverMorphWindow):
         finally:
             self._loading_project = False
         self.refresh_reference_options()
+        if project.scenes:
+            self.show_scene_prompt(project.scenes[-1])
+        else:
+            self.reference_mode_var.set("off")
+            self.reference_crop_var.set("")
+            self.reference_strength_var.set(0.5)
+            self.update_reference_preview()
         self.refresh_project_status()
 
     def confirm_discard_project_changes(self) -> bool:
