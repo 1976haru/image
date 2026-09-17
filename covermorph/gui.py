@@ -30,6 +30,7 @@ from .generation import (
 from .logger import write_exception, write_log
 from .pipeline import (
     DEFAULT_OUTPAINT_PROMPT,
+    FileResult,
     ImageJob,
     PipelineOptions,
     count_selected_outputs_for_jobs,
@@ -42,7 +43,6 @@ from .processor import (
     build_full_frame_outpaint_canvas,
     detect_text_boxes_multilang,
     inpaint_text_opencv,
-    make_square,
     mask_pil_from_boxes,
     render_full_frame_format,
 )
@@ -91,7 +91,6 @@ from .settings import (
     load_settings,
     open_folder,
     save_settings,
-    thumbnail_size,
 )
 
 REFERENCE_MODE_LABELS = {"off": "끔", "person": "인물", "style": "스타일"}
@@ -185,6 +184,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.image_states: list[ImageRowState] = []
         self.selected_index: int | None = None
         self.output_dir: Path | None = None
+        self.output_path_auto_selected = False
         self.project: CoverMorphProject | None = None
         self.project_dirty = False
         self._loading_project = False
@@ -354,41 +354,54 @@ class CoverMorphApp(_CoverMorphWindow):
             buttons, text="전체 취소", command=self.cancel_work, width=96, state="disabled", fg_color="#7f1d1d"
         )
         self.top_cancel_button.pack(side="left", padx=3)
+        quick = ctk.CTkFrame(bar, fg_color="transparent")
+        quick.grid(row=2, column=0, columnspan=5, sticky="ew", padx=12, pady=(0, 8))
+        ctk.CTkLabel(quick, text="빠른 시작:", anchor="w").pack(side="left", padx=(0, 8))
+        self.quick_add_image_button = ctk.CTkButton(quick, text="이미지 추가 (변환)", command=self.open_files, width=145)
+        self.quick_add_image_button.pack(side="left", padx=3)
+        self.quick_json_button = ctk.CTkButton(quick, text="가사/곡 JSON 불러오기", command=self.import_workflow_json, width=165)
+        self.quick_json_button.pack(side="left", padx=3)
+        self.quick_txt_button = ctk.CTkButton(quick, text="가사/프롬프트 TXT 불러오기", command=self.import_lyrics_txt, width=185)
+        self.quick_txt_button.pack(side="left", padx=3)
+        self.quick_project_button = ctk.CTkButton(quick, text="기존 이미지 변환", command=self.start_existing_image_mode, width=135, fg_color="#475569")
+        self.quick_project_button.pack(side="left", padx=3)
+        self.quick_generation_button = ctk.CTkButton(quick, text="자료로 새 이미지 생성", command=self.start_material_generation_mode, width=155, fg_color="#475569")
+        self.quick_generation_button.pack(side="left", padx=3)
 
     def build_workflow_group(self, parent: Any) -> None:
-        frame = self.group(parent, "Workflow: purpose / source / image plan", highlight=True)
-        ctk.CTkLabel(frame, text="Creation purpose (separate from input mode)", anchor="w").pack(fill="x", padx=12)
+        frame = self.group(parent, "워크플로: 제작 목적 / 입력 자료 / 이미지 기획", highlight=True)
+        ctk.CTkLabel(frame, text="제작 목적 (입력 방식과 별도)", anchor="w").pack(fill="x", padx=12)
         ctk.CTkOptionMenu(frame, variable=self.creation_purpose_var, values=["음원커버 후보", "썸네일 배경", "영상용 배경", "숏츠 배경", "Shopify 앱용 이미지"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=2)
-        ctk.CTkLabel(frame, text="Primary input mode (other materials may be attached)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        ctk.CTkLabel(frame, text="주 입력 방식 (보조 자료를 함께 사용할 수 있습니다)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
         ctk.CTkOptionMenu(frame, variable=self.primary_input_mode_var, values=["가사 직접 입력", "JSON 파일 불러오기", "주제어 입력", "마스터 프롬프트 입력/불러오기", "참고 이미지 중심", "직접 이미지 프롬프트 입력"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=2)
-        ctk.CTkLabel(frame, text="Materials used for this generation", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
-        for key, label, height in (("lyrics", "Lyrics (source text is preserved; not pasted wholesale into SDXL)", 5), ("keywords", "Keywords / theme", 2), ("image_master_prompt", "Image master prompt", 3), ("music_master_prompt", "Music/lyrics reference (not mixed into image description)", 3), ("image_prompt", "Direct image prompt", 3)):
+        ctk.CTkLabel(frame, text="이번 생성에 사용할 자료", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        for key, label, height in (("lyrics", "가사\n가사를 붙여넣거나 JSON에서 불러오세요.", 5), ("keywords", "주제어 / 분위기\n예: 첫눈, 추억, 조용한 카페, 따뜻한 차", 2), ("image_master_prompt", "이미지용 마스터 프롬프트\n채널에서 유지할 인물·색감·사진 스타일·구도를 입력하세요.", 3), ("music_master_prompt", "음악 분위기 참고\n음악 장르와 곡 분위기 참고 자료입니다. 이미지 묘사와 섞지 않습니다.", 3), ("image_prompt", "이미지 프롬프트 직접 입력\n예: 첫눈이 내리는 창밖을 바라보는 카페의 여인", 3)):
             ctk.CTkLabel(frame, text=label, anchor="w").pack(fill="x", padx=12, pady=(4, 0))
             widget = ctk.CTkTextbox(frame, height=height * 22)
             widget.pack(fill="x", padx=12, pady=2)
             self.workflow_fields[key] = widget
         row = ctk.CTkFrame(frame, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=3)
-        ctk.CTkButton(row, text="Load JSON/TXT", command=self.import_workflow_json).pack(side="left", fill="x", expand=True, padx=(0, 4))
-        ctk.CTkButton(row, text="Add reference", command=self.add_project_reference).pack(side="left", fill="x", expand=True, padx=4)
-        ctk.CTkButton(frame, text="Load image-master TXT", command=self.import_image_master_prompt).pack(fill="x", padx=12, pady=2)
+        ctk.CTkButton(row, text="JSON/TXT 불러오기", command=self.import_workflow_json).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ctk.CTkButton(row, text="AI 참고 이미지 추가", command=self.add_project_reference).pack(side="left", fill="x", expand=True, padx=4)
+        ctk.CTkButton(frame, text="이미지용 마스터 TXT 불러오기", command=self.import_image_master_prompt).pack(fill="x", padx=12, pady=2)
         ctk.CTkOptionMenu(frame, variable=self.input_selection_scope_var, values=["선택한 한 곡 기준", "선택한 여러 곡을 묶은 앨범 기준"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=2)
-        ctk.CTkLabel(frame, text="Candidate plan (request, not a brightness guarantee)", anchor="w").pack(fill="x", padx=12, pady=(4, 0))
+        ctk.CTkLabel(frame, text="후보 생성 계획 (요청 조건이며 실제 밝기를 보장하지 않습니다)", anchor="w").pack(fill="x", padx=12, pady=(4, 0))
         ctk.CTkOptionMenu(frame, variable=self.candidate_variation_var, values=["같은 장면에서 seed만 변경", "같은 이야기 안에서 구도 변경", "같은 이야기 안에서 배경시간대 변경", "사용자가 후보별 장면 직접 수정"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=1)
         ctk.CTkOptionMenu(frame, variable=self.brightness_request_var, values=["밝기 조건 없음", "밝은 후보 최소 1장", "중간 밝기 후보 최소 1장"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=1)
         ctk.CTkLabel(frame, textvariable=self.workflow_material_status_var, wraplength=360, justify="left", anchor="w").pack(fill="x", padx=12, pady=4)
-        ctk.CTkLabel(frame, text="Image planning (rule-based draft; user confirmation required)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
-        for key, label in (("core_subject", "Core subject"), ("emotion", "Emotion"), ("location", "Location"), ("time_or_season", "Time / season"), ("characters", "Characters"), ("action", "Action"), ("props", "Key props"), ("brightness_color", "Brightness / color")):
+        ctk.CTkLabel(frame, text="이미지 기획 (규칙 기반 초안 · 사용자 확인 필요)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        for key, label in (("core_subject", "핵심 주제"), ("emotion", "감정"), ("location", "장소"), ("time_or_season", "시간대 / 계절"), ("characters", "등장인물"), ("action", "행동"), ("props", "주요 소품"), ("brightness_color", "밝기 / 색감")):
             entry = ctk.CTkEntry(frame, placeholder_text=label)
             entry.pack(fill="x", padx=12, pady=1)
             self.workflow_fields[key] = entry
-        ctk.CTkButton(frame, text="Build reviewable image plan", command=self.build_image_plan).pack(fill="x", padx=12, pady=3)
-        ctk.CTkLabel(frame, text="Cover text to save for next-stage composition (not sent to SDXL)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
-        for key, label in (("album_title", "Album / main title"), ("subtitle", "Subtitle"), ("artist", "Artist"), ("label", "Label / channel"), ("language", "Display language")):
+        ctk.CTkButton(frame, text="이미지 기획 적용·수정·확인", command=self.build_image_plan).pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(frame, text="다음 단계 문구 입력 (SDXL에 보내지 않음)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        for key, label in (("album_title", "앨범명 / 메인 제목"), ("subtitle", "부제"), ("artist", "아티스트명"), ("label", "음반사 / 채널명"), ("language", "표기 언어")):
             entry = ctk.CTkEntry(frame, placeholder_text=label)
             entry.pack(fill="x", padx=12, pady=1)
             self.workflow_fields[key] = entry
-        ctk.CTkButton(frame, text="Save workflow inputs / plan", command=self.save_workflow_inputs).pack(fill="x", padx=12, pady=(4, 10))
+        ctk.CTkButton(frame, text="입력 자료·이미지 기획 저장", command=self.save_workflow_inputs).pack(fill="x", padx=12, pady=(4, 10))
 
     def build_input_group(self, parent: Any) -> None:
         frame = self.group(parent, "1. 입력 이미지")
@@ -433,6 +446,7 @@ class CoverMorphApp(_CoverMorphWindow):
         ctk.CTkLabel(frame, text="출력 폴더", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12)
         self.output_entry = ctk.CTkEntry(frame, textvariable=self.output_path_var)
         self.output_entry.pack(fill="x", padx=12, pady=(3, 8))
+        self.output_entry.bind("<KeyRelease>", lambda _event: setattr(self, "output_path_auto_selected", False))
 
         row = ctk.CTkFrame(frame, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=(0, 12))
@@ -850,7 +864,13 @@ class CoverMorphApp(_CoverMorphWindow):
             self.run_button,
             self.top_run_button,
             self.top_selected_button,
+            self.quick_add_image_button,
+            self.quick_json_button,
+            self.quick_txt_button,
+            self.quick_project_button,
+            self.quick_generation_button,
         ]
+        self.fixed_busy_widgets.extend(self.workflow_fields.values())
 
     def build_image_list_panel(self, parent: Any) -> None:
         frame = ctk.CTkFrame(parent)
@@ -913,7 +933,7 @@ class CoverMorphApp(_CoverMorphWindow):
         )
         self.regenerate_button.pack(side="left", padx=(8, 0))
 
-        self.canvas = tk.Canvas(frame, bg="#0f172a", highlightthickness=0, cursor="cross")
+        self.canvas = tk.Canvas(frame, bg="#0f172a", highlightthickness=0, cursor="hand2")
         self.canvas.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
@@ -1233,10 +1253,10 @@ class CoverMorphApp(_CoverMorphWindow):
             if parsed.get("needs_mapping"):
                 available = parsed.get("available_fields", [])
                 mapping: dict[str, str] = {}
-                for target, prompt in (("title", "title field (blank to skip)"), ("lyrics", "lyrics field (blank to skip)"), ("image_prompt", "image prompt field (blank to skip)"), ("theme_mood", "theme/series mood field (blank to skip)"), ("music_prompt", "music prompt field (blank to skip)")):
-                    value = simpledialog.askstring("JSON field mapping", f"{prompt}\nAvailable: {', '.join(available)}", parent=self)
+                for target, prompt in (("title", "제목 필드 (없으면 비워두세요)"), ("lyrics", "가사 필드 (없으면 비워두세요)"), ("image_prompt", "이미지 프롬프트 필드 (없으면 비워두세요)"), ("theme_mood", "주제·시리즈 분위기 필드 (없으면 비워두세요)"), ("music_prompt", "음악 프롬프트 필드 (없으면 비워두세요)")):
+                    value = simpledialog.askstring("JSON 필드 매핑", f"{prompt}\n사용 가능한 키: {', '.join(available)}", parent=self)
                     if value and value not in available:
-                        messagebox.showerror("Invalid field mapping", f"Unknown key: {value}")
+                        messagebox.showerror("필드 매핑 오류", f"알 수 없는 키입니다: {value}")
                         return
                     mapping[target] = value or ""
                 parsed = parse_input_file_detailed(Path(filename), mapping)
@@ -1244,16 +1264,11 @@ class CoverMorphApp(_CoverMorphWindow):
             if not records:
                 raise ProjectLoadError(f"No mapped song records found in {filename}")
             if len(records) > 1:
-                choices = "\n".join(f"{index + 1}. {record.title or '(untitled)'}" for index, record in enumerate(records))
-                selected_text = simpledialog.askstring("Select songs", f"Choose one or more record numbers separated by commas.\n{choices}", initialvalue=",".join(str(index + 1) for index in range(len(records))), parent=self)
-                if not selected_text:
+                selected_indexes = self.choose_input_records(records)
+                if selected_indexes is None:
                     return
-                try:
-                    selected_indexes = {int(value.strip()) - 1 for value in selected_text.split(",") if value.strip()}
-                    if not selected_indexes or not selected_indexes.issubset(set(range(len(records)))):
-                        raise ValueError
-                except ValueError:
-                    messagebox.showerror("Invalid selection", "Use valid record numbers such as 1,3.")
+                if not selected_indexes:
+                    messagebox.showerror("곡 선택 오류", "한 곡 이상 선택하세요.")
                     return
                 for index, record in enumerate(records):
                     record.selected = index in selected_indexes
@@ -1265,10 +1280,76 @@ class CoverMorphApp(_CoverMorphWindow):
             self._workflow_set("music_master_prompt", records[0].music_prompt if len(records) == 1 else "")
             self._workflow_set("keywords", records[0].theme_mood if len(records) == 1 else "")
             self.input_selection_scope_var.set("선택한 여러 곡을 묶은 앨범 기준" if len(records) > 1 else "선택한 한 곡 기준")
-            self.workflow_material_status_var.set(f"Loaded {len(records)} record(s). Selected records are grouped into one image task; per-song auto generation is disabled.")
+            selected_count = sum(1 for record in records if record.selected)
+            self.workflow_material_status_var.set(f"{Path(filename).name} | 곡 {len(records)}개, 선택 {selected_count}개. 선택 자료를 하나의 이미지 기획으로 사용하며 곡별 자동 생성은 하지 않습니다.")
             self.sync_workflow_to_project(mark_dirty=True)
         except (ProjectLoadError, ProjectAssetError) as exc:
-            messagebox.showerror("Input import failed", str(exc))
+            messagebox.showerror("자료 불러오기 실패", str(exc))
+
+    def choose_input_records(self, records: list[Any]) -> set[int] | None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("곡 목록 선택")
+        dialog.geometry("520x520")
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="이번 이미지 기획에 사용할 곡을 선택하세요.").pack(anchor="w", padx=16, pady=(16, 8))
+        scroll = ctk.CTkScrollableFrame(dialog, height=350)
+        scroll.pack(fill="both", expand=True, padx=16, pady=8)
+        variables = [tk.BooleanVar(value=True) for _ in records]
+        for index, (record, variable) in enumerate(zip(records, variables, strict=False), start=1):
+            ctk.CTkCheckBox(scroll, text=f"{index}. {record.title or '(제목 없음)'}", variable=variable).pack(anchor="w", padx=8, pady=4)
+        result: dict[str, set[int] | None] = {"selected": None}
+
+        def select_all() -> None:
+            for variable in variables:
+                variable.set(True)
+
+        def clear_all() -> None:
+            for variable in variables:
+                variable.set(False)
+
+        controls = ctk.CTkFrame(dialog, fg_color="transparent")
+        controls.pack(fill="x", padx=16, pady=8)
+        ctk.CTkButton(controls, text="전체 선택", command=select_all).pack(side="left", padx=3)
+        ctk.CTkButton(controls, text="전체 해제", command=clear_all).pack(side="left", padx=3)
+
+        def accept() -> None:
+            result["selected"] = {index for index, variable in enumerate(variables) if variable.get()}
+            dialog.destroy()
+
+        ctk.CTkButton(controls, text="선택 완료", command=accept).pack(side="right", padx=3)
+        ctk.CTkButton(controls, text="취소", command=dialog.destroy).pack(side="right", padx=3)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        self.wait_window(dialog)
+        return result["selected"]
+
+    def import_lyrics_txt(self) -> None:
+        """Dedicated quick-start TXT action; it never alters the source file."""
+        if not self.ensure_project_for_assets():
+            return
+        filename = filedialog.askopenfilename(title="가사/프롬프트 TXT 불러오기", filetypes=[("UTF-8 TXT", "*.txt"), ("모든 파일", "*.*")])
+        if not filename:
+            return
+        try:
+            parsed = parse_input_file_detailed(Path(filename))
+            records = parsed["records"]
+            add_input_records(self.project, records)  # type: ignore[arg-type]
+            self.workflow_input_records = records
+            self.project.selected_input_ids = [record.input_id for record in records]
+            self._workflow_set("lyrics", records[0].lyrics)
+            self.primary_input_mode_var.set("가사 직접 입력")
+            self.workflow_material_status_var.set(f"{Path(filename).name} | 가사 자료 1곡을 불러왔습니다. 이미지 기획에서 장면으로 변환하세요.")
+            self.sync_workflow_to_project(mark_dirty=True)
+        except (ProjectLoadError, ProjectAssetError) as exc:
+            messagebox.showerror("TXT 불러오기 실패", str(exc))
+
+    def start_existing_image_mode(self) -> None:
+        self.input_type_var.set("글자 없는 이미지")
+        self.status.configure(text="기존 이미지 변환 모드입니다. 가사나 장면 프롬프트 확인 없이 이미지 규격을 선택해 변환할 수 있습니다.")
+
+    def start_material_generation_mode(self) -> None:
+        self.creation_purpose_var.set("음원커버 후보")
+        self.status.configure(text="자료로 새 이미지 생성 모드입니다. 입력 자료를 불러온 뒤 이미지 기획을 검토·확인하세요.")
 
     def import_image_master_prompt(self) -> None:
         if not self.ensure_project_for_assets():
@@ -1849,6 +1930,20 @@ class CoverMorphApp(_CoverMorphWindow):
                 candidate=candidate,
                 clean_preview=clean_preview,
             )
+            saved_outputs = {
+                key: str(resolve_project_path(project, value))
+                for key, value in candidate.generated_paths.items()
+                if resolve_project_path(project, value).is_file()
+            }
+            if saved_outputs:
+                state.result = FileResult(
+                    source=work_path,
+                    item_dir=Path(next(iter(saved_outputs.values()))).parent,
+                    status="success",
+                    success_outputs=len(saved_outputs),
+                    failed_outputs=0,
+                    metadata={"output_files": saved_outputs},
+                )
             self.image_states.append(state)
 
         if self.image_states:
@@ -2301,6 +2396,7 @@ class CoverMorphApp(_CoverMorphWindow):
         if directory:
             self.output_path_var.set(directory)
             self.output_dir = Path(directory)
+            self.output_path_auto_selected = False
             self.save_current_settings(include_output=True)
             self.status.configure(text=f"출력 폴더:\n{self.output_dir}")
             self.update_summary()
@@ -2314,6 +2410,7 @@ class CoverMorphApp(_CoverMorphWindow):
         else:
             self.output_path_var.set(str(default_dir))
             self.output_dir = default_dir
+            self.output_path_auto_selected = True
             self.status.configure(text=f"기본 출력 폴더:\n{default_dir}")
         self.save_current_settings(include_output=True)
         self.update_summary()
@@ -2342,8 +2439,11 @@ class CoverMorphApp(_CoverMorphWindow):
 
     def validate_output_directory_for_run(self) -> Path | None:
         path_text = self.output_path_var.get().strip()
+        auto_selected = self.output_path_auto_selected
         if not path_text and self.image_states:
             path_text = str(default_output_dir_for_source(self.image_states[0].job.source))
+            auto_selected = True
+            self.output_path_auto_selected = True
             self.output_path_var.set(path_text)
         if not path_text:
             messagebox.showinfo("출력 폴더", "출력 폴더를 선택해주세요.")
@@ -2364,7 +2464,15 @@ class CoverMorphApp(_CoverMorphWindow):
             return None
 
         self.output_dir = path
+        self.output_path_auto_selected = auto_selected
         self.output_path_var.set(str(path))
+        if auto_selected:
+            source_dirs = {
+                str((Path(state.candidate.external_source_path) if state.candidate is not None and state.candidate.external_source_path else state.job.source).parent)
+                for state in self.image_states
+            }
+            if len(source_dirs) > 1:
+                self.status.configure(text="입력 폴더가 여러 개입니다. 사용자 지정 폴더가 없어 각 원본 폴더의 CoverMorph_Output에 저장합니다.")
         self.save_current_settings(include_output=True)
         return path
 
@@ -2484,8 +2592,10 @@ class CoverMorphApp(_CoverMorphWindow):
         self.draw_preview()
 
     def on_press(self, event: tk.Event) -> None:
-        if self.current_state() is not None:
-            self.drag_start = (event.x, event.y)
+        if self.current_state() is None:
+            self.open_files()
+            return
+        self.drag_start = (event.x, event.y)
 
     def on_release(self, event: tk.Event) -> None:
         state = self.current_state()
@@ -2522,7 +2632,7 @@ class CoverMorphApp(_CoverMorphWindow):
             self.canvas.create_text(
                 max(120, self.canvas.winfo_width() // 2),
                 max(100, self.canvas.winfo_height() // 2),
-                text="이미지를 추가하면 미리보기가 표시됩니다.",
+                text="여기를 클릭하거나 상단 이미지 추가를 눌러주세요.",
                 fill="#cbd5e1",
                 font=("Arial", 16),
             )
@@ -2590,18 +2700,34 @@ class CoverMorphApp(_CoverMorphWindow):
         if mode == "글자 제거 결과":
             return base
         if mode == "최종 결과":
-            if state.job.out_thumb:
-                return self.format_preview(state, base, "thumbnail", thumbnail_size(self.thumbnail_resolution.get()))
-            if state.job.out_shorts:
-                return self.format_preview(state, base, "shorts", (1080, 1920))
-            return make_square(base)
+            for key in ("square_1x1", "thumbnail_16x9", "shorts_9x16"):
+                output = self.load_generated_preview(state, key)
+                if output is not None:
+                    return output
+            return base
         if mode == "1:1 미리보기":
-            return make_square(base)
+            return self.load_generated_preview(state, "square_1x1") or base
         if mode == "16:9 미리보기":
-            return self.format_preview(state, base, "thumbnail", thumbnail_size(self.thumbnail_resolution.get()))
+            return self.load_generated_preview(state, "thumbnail_16x9") or base
         if mode == "9:16 미리보기":
-            return self.format_preview(state, base, "shorts", (1080, 1920))
+            return self.load_generated_preview(state, "shorts_9x16") or base
         return base
+
+    def load_generated_preview(self, state: ImageRowState, key: str) -> Image.Image | None:
+        if state.result is None:
+            self.preview_hint.configure(text="아직 변환하지 않은 규격입니다.")
+            return None
+        output_files = state.result.metadata.get("output_files") or {}
+        raw_path = output_files.get(key)
+        if not raw_path:
+            self.preview_hint.configure(text="아직 변환하지 않은 규격입니다.")
+            return None
+        try:
+            with Image.open(Path(raw_path)) as opened:
+                return ImageOps.exif_transpose(opened).convert("RGB")
+        except (OSError, UnidentifiedImageError):
+            self.preview_hint.configure(text="저장된 변환 결과를 읽을 수 없습니다.")
+            return None
 
     def format_preview(
         self,
@@ -3032,6 +3158,10 @@ class CoverMorphApp(_CoverMorphWindow):
                 auto_remove_text = False
                 manual_boxes = ()
                 ocr_boxes = ()
+            per_source_output = None
+            if self.output_path_auto_selected:
+                original_source = Path(state.candidate.external_source_path) if state.candidate is not None and state.candidate.external_source_path else source
+                per_source_output = default_output_dir_for_source(original_source)
             jobs.append(
                 ImageJob(
                     source=source,
@@ -3048,6 +3178,7 @@ class CoverMorphApp(_CoverMorphWindow):
                     subject_offset_y=job.subject_offset_y,
                     subject_scale=job.subject_scale,
                     outpaint_prompt=job.outpaint_prompt,
+                    output_dir=per_source_output,
                 )
             )
         return jobs

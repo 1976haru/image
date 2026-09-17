@@ -95,6 +95,7 @@ class ImageJob:
     outpaint_prompt: str = DEFAULT_OUTPAINT_PROMPT
     status: str = "대기"
     error: str = ""
+    output_dir: Path | None = None
 
 
 @dataclass(slots=True)
@@ -180,6 +181,7 @@ def options_for_job(base_options: PipelineOptions, job: ImageJob) -> PipelineOpt
     text_boxes = tuple(_dedupe_boxes([*job.ocr_boxes, *job.manual_boxes]))
     return replace(
         base_options,
+        output_dir=job.output_dir or base_options.output_dir,
         auto_remove_text=base_options.auto_remove_text if job.auto_remove_text is None else job.auto_remove_text,
         preset_name=job.preset_name,
         ocr_languages=job.ocr_languages,
