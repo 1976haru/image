@@ -128,7 +128,10 @@ def test_retry_only_uses_failed_indexes(tmp_path: Path) -> None:
     assert len(project.candidates) == 3
 
 
-def test_cpu_environment_never_reports_generation_ready(tmp_path: Path) -> None:
+def test_cpu_environment_never_reports_generation_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     environment = detect_generation_environment(tmp_path)
     assert environment["cuda"] is False
     assert environment["status"] in {"gpu_unavailable", "package_missing"}

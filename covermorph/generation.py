@@ -451,10 +451,30 @@ class SDXLTextToImageEngine:
                     local_files_only=config.local_files_only,
                 )
                 self.pipeline.register_modules(image_encoder=encoder)
+                # The pipeline was moved to CUDA before this module existed, so
+                # registering it does not migrate the encoder automatically.
+                # Move the complete pipeline again to keep image embeddings and
+                # IP-Adapter weights on the same device during inference.
+                if hasattr(self.pipeline, "to"):
+                    self.pipeline.to("cuda")
                 kwargs["image_encoder_folder"] = None
             else:
                 kwargs["image_encoder_folder"] = IP_ADAPTER_IMAGE_ENCODER
-            self.pipeline.load_ip_adapter(config.ip_adapter_id, **kwargs)
+            # Diffusers cannot replace already-sliced attention processors with
+            # IP-Adapter processors because SlicedAttnProcessor requires a
+            # slice_size constructor argument. Restore the default processors
+            # for the adapter load. Keep slicing disabled afterward because
+            # enabling it would replace IPAdapterAttnProcessor with a generic
+            # sliced processor that cannot consume image embeddings.
+            attention_slicing = hasattr(self.pipeline, "disable_attention_slicing")
+            if attention_slicing:
+                self.pipeline.disable_attention_slicing()
+            try:
+                self.pipeline.load_ip_adapter(config.ip_adapter_id, **kwargs)
+            except Exception:
+                if attention_slicing:
+                    self.pipeline.enable_attention_slicing()
+                raise
             if hasattr(self.pipeline, "set_ip_adapter_scale"):
                 self.pipeline.set_ip_adapter_scale(config.reference_strength)
             self.ip_adapter_loaded = True
