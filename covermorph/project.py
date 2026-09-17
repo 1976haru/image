@@ -33,9 +33,27 @@ class ProjectAssetError(ProjectError):
     pass
 
 
-REFERENCE_ROLES = {"person", "style", "background_composition"}
+REFERENCE_ROLES = {"lyrics_series", "image_master_prompt", "person", "style", "background_composition"}
 REFERENCE_USES = {"face", "upper_body", "full_body", "other"}
 INPUT_RECORD_TYPES = {"lyrics", "image_prompt", "theme_series_mood"}
+
+CREATION_PURPOSES = {
+    "music_cover_candidate",
+    "thumbnail_background",
+    "video_background",
+    "shorts_background",
+    "shopify_app_image",
+}
+INPUT_MODES = {
+    "lyrics",
+    "json_file",
+    "keywords",
+    "master_prompt",
+    "reference_images",
+    "image_prompt",
+}
+CANDIDATE_COUNTS = (1, 4, 6, 8, 10)
+REFERENCE_ASSET_ROLES = {"lyrics_series", "image_master_prompt", "person", "style", "background_composition"}
 
 
 @dataclass(slots=True)
@@ -139,15 +157,64 @@ class InputRecord:
     lyrics: str = ""
     image_prompt: str = ""
     theme_mood: str = ""
+    music_prompt: str = ""
+    series_description: str = ""
     source_path: str = ""
     selected: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "InputRecord":
-        return cls(str(data.get("input_id") or new_id("input")), str(data.get("input_type") or "theme_series_mood"), str(data.get("title") or ""), str(data.get("lyrics") or ""), str(data.get("image_prompt") or ""), str(data.get("theme_mood") or ""), str(data.get("source_path") or ""), bool(data.get("selected", True)))
+        return cls(str(data.get("input_id") or new_id("input")), str(data.get("input_type") or "theme_series_mood"), str(data.get("title") or ""), str(data.get("lyrics") or ""), str(data.get("image_prompt") or ""), str(data.get("theme_mood") or ""), str(data.get("music_prompt") or ""), str(data.get("series_description") or ""), str(data.get("source_path") or ""), bool(data.get("selected", True)))
 
     def to_dict(self) -> dict[str, Any]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
+
+
+@dataclass(slots=True)
+class ImagePlanningBrief:
+    """User-confirmed bridge from lyrics/music material to an image scene.
+
+    Extraction is deliberately rule-based.  The fields are a reviewable draft,
+    never presented as an AI interpretation of the complete lyrics.
+    """
+
+    core_subject: str = ""
+    emotion: str = ""
+    location: str = ""
+    time_or_season: str = ""
+    characters: str = ""
+    action: str = ""
+    props: str = ""
+    brightness_color: str = ""
+    source_input_ids: list[str] = field(default_factory=list)
+    extraction_method: str = "rule_based_draft_user_confirmation_required"
+    confirmed: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ImagePlanningBrief":
+        if not isinstance(data, dict):
+            return cls()
+        values = {name: str(data.get(name) or "") for name in ("core_subject", "emotion", "location", "time_or_season", "characters", "action", "props", "brightness_color")}
+        ids = data.get("source_input_ids") or []
+        values["source_input_ids"] = [str(item) for item in ids] if isinstance(ids, list) else []
+        values["extraction_method"] = str(data.get("extraction_method") or cls.extraction_method)
+        values["confirmed"] = bool(data.get("confirmed", False))
+        return cls(**values)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "core_subject": self.core_subject,
+            "emotion": self.emotion,
+            "location": self.location,
+            "time_or_season": self.time_or_season,
+            "characters": self.characters,
+            "action": self.action,
+            "props": self.props,
+            "brightness_color": self.brightness_color,
+            "source_input_ids": list(self.source_input_ids),
+            "extraction_method": self.extraction_method,
+            "confirmed": self.confirmed,
+        }
 
 
 @dataclass(slots=True)
@@ -352,6 +419,15 @@ class CoverMorphProject:
     channel_name: str = ""
     series_name: str = ""
     lyric_mood_text: str = ""
+    creation_purpose: str = "music_cover_candidate"
+    primary_input_mode: str = "lyrics"
+    input_selection_scope: str = "single"
+    selected_input_ids: list[str] = field(default_factory=list)
+    input_materials: dict[str, str] = field(default_factory=dict)
+    image_planning_brief: ImagePlanningBrief = field(default_factory=ImagePlanningBrief)
+    cover_text: dict[str, str] = field(default_factory=dict)
+    selected_reference_ids: dict[str, str] = field(default_factory=dict)
+    candidate_options: dict[str, Any] = field(default_factory=dict)
     song_count: int = 0
     channel_preset_id: str = ""
     channel_preset: dict[str, Any] = field(default_factory=dict)
@@ -389,6 +465,15 @@ class CoverMorphProject:
             channel_name=str(data.get("channel_name") or ""),
             series_name=str(data.get("series_name") or ""),
             lyric_mood_text=str(data.get("lyric_mood_text") or ""),
+            creation_purpose=str(data.get("creation_purpose") or "music_cover_candidate") if str(data.get("creation_purpose") or "music_cover_candidate") in CREATION_PURPOSES else "music_cover_candidate",
+            primary_input_mode=str(data.get("primary_input_mode") or "lyrics") if str(data.get("primary_input_mode") or "lyrics") in INPUT_MODES else "lyrics",
+            input_selection_scope=str(data.get("input_selection_scope") or "single") if str(data.get("input_selection_scope") or "single") in {"single", "album"} else "single",
+            selected_input_ids=[str(item) for item in (data.get("selected_input_ids") or []) if item is not None],
+            input_materials={str(key): str(value) for key, value in (data.get("input_materials") or {}).items() if value is not None},
+            image_planning_brief=ImagePlanningBrief.from_dict(data.get("image_planning_brief")),
+            cover_text={str(key): str(value) for key, value in (data.get("cover_text") or {}).items() if value is not None},
+            selected_reference_ids={str(key): str(value) for key, value in (data.get("selected_reference_ids") or {}).items() if value is not None},
+            candidate_options=dict(data.get("candidate_options") or {}),
             song_count=int(data.get("song_count") or 0),
             channel_preset_id=str(data.get("channel_preset_id") or ""),
             channel_preset=dict(data.get("channel_preset") or {}),
@@ -410,6 +495,15 @@ class CoverMorphProject:
             "channel_name": self.channel_name,
             "series_name": self.series_name,
             "lyric_mood_text": self.lyric_mood_text,
+            "creation_purpose": self.creation_purpose,
+            "primary_input_mode": self.primary_input_mode,
+            "input_selection_scope": self.input_selection_scope,
+            "selected_input_ids": list(self.selected_input_ids),
+            "input_materials": dict(self.input_materials),
+            "image_planning_brief": self.image_planning_brief.to_dict(),
+            "cover_text": dict(self.cover_text),
+            "selected_reference_ids": dict(self.selected_reference_ids),
+            "candidate_options": dict(self.candidate_options),
             "song_count": self.song_count,
             "channel_preset_id": self.channel_preset_id,
             "channel_preset": dict(self.channel_preset),
@@ -556,32 +650,92 @@ def prepare_reference_image(project: CoverMorphProject, reference: ReferenceImag
     }
 
 
-def parse_input_file(path: Path) -> list[InputRecord]:
-    """Parse common TXT/JSON shapes without pretending to understand unknown schemas."""
+def _json_field_value(item: dict[str, Any], aliases: tuple[str, ...]) -> str:
+    for key in aliases:
+        value = item.get(key)
+        if value is not None and not isinstance(value, (dict, list)):
+            return str(value)
+    return ""
+
+
+def parse_input_file_detailed(path: Path, field_mapping: dict[str, str] | None = None) -> dict[str, Any]:
+    """Read UTF-8/BOM input and return records plus explicit schema information.
+
+    Unknown JSON structures are rejected.  A caller may provide a field mapping
+    after showing the available keys to the user; no unknown key is guessed.
+    """
     try:
         raw = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise ProjectLoadError(f"Input file could not be read as UTF-8: {path}") from exc
     if path.suffix.lower() == ".txt":
-        return [InputRecord(new_id("input"), "lyrics", path.stem, lyrics=raw, source_path=str(path))]
+        record = InputRecord(new_id("input"), "lyrics", path.stem, lyrics=raw, source_path=str(path))
+        return {"records": [record], "available_fields": ["lyrics"], "field_mapping": {"title": "", "lyrics": "lyrics"}, "needs_mapping": False, "source_path": str(path)}
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ProjectLoadError(f"Input JSON is damaged: {path}") from exc
-    items = data if isinstance(data, list) else data.get("songs") or data.get("tracks") or data.get("items") if isinstance(data, dict) else None
-    if isinstance(items, list):
-        records = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            records.append(InputRecord(new_id("input"), "lyrics", str(item.get("title") or item.get("name") or ""), str(item.get("lyrics") or item.get("lyric") or ""), str(item.get("prompt") or item.get("image_prompt") or ""), str(item.get("theme") or item.get("mood") or ""), str(path)))
-        if records:
-            return records
+        raise ProjectLoadError(f"Input JSON is damaged: {path} (line {exc.lineno}, column {exc.colno})") from exc
+    collection_key = "root"
+    items: Any = data
     if isinstance(data, dict):
-        known = {"title", "name", "lyrics", "lyric", "prompt", "image_prompt", "theme", "mood"}
-        if known.intersection(data):
-            return [InputRecord(new_id("input"), "lyrics", str(data.get("title") or data.get("name") or path.stem), str(data.get("lyrics") or data.get("lyric") or ""), str(data.get("prompt") or data.get("image_prompt") or ""), str(data.get("theme") or data.get("mood") or ""), str(path))]
-    raise ProjectLoadError(f"Unknown JSON input structure; choose title/lyrics/prompt fields: {path}")
+        for key in ("songs", "tracks", "items", "records", "曲목록", "곡목록"):
+            if isinstance(data.get(key), list):
+                collection_key, items = key, data[key]
+                break
+        else:
+            items = [data] if any(key in data for key in ("title", "name", "lyrics", "lyric", "prompt", "image_prompt", "theme", "mood", "music_prompt", "series_description")) else None
+            if items is None and field_mapping and any(field_mapping.values()):
+                items = [data]
+    if not isinstance(items, list) or not items or not all(isinstance(item, dict) for item in items):
+        available = sorted(data.keys()) if isinstance(data, dict) else []
+        if isinstance(data, dict):
+            return {"records": [], "available_fields": available, "field_mapping": {}, "needs_mapping": True, "collection_key": collection_key, "source_path": str(path)}
+        raise ProjectLoadError(f"Unknown JSON input structure: {path}; choose a song-list and field mapping")
+    available_fields = sorted({str(key) for item in items for key in item})
+    mapping = dict(field_mapping or {})
+    aliases = {
+        "title": ("title", "name", "곡명", "제목"),
+        "lyrics": ("lyrics", "lyric", "가사"),
+        "image_prompt": ("image_prompt", "prompt", "imagePrompt", "이미지프롬프트"),
+        "theme_mood": ("theme", "mood", "series_description", "series_mood", "주제", "분위기"),
+        "music_prompt": ("music_prompt", "suno_prompt", "musicPrompt", "음악프롬프트"),
+    }
+    for target, names in aliases.items():
+        if target not in mapping:
+            mapping[target] = next((name for name in names if name in available_fields), "")
+    needs_mapping = not any(mapping.get(key) for key in ("title", "lyrics", "image_prompt", "theme_mood", "music_prompt"))
+    if needs_mapping:
+        return {"records": [], "available_fields": available_fields, "field_mapping": mapping, "needs_mapping": True, "collection_key": collection_key, "source_path": str(path)}
+    records = []
+    for index, item in enumerate(items, start=1):
+        title = _json_field_value(item, (mapping.get("title", ""),)) or f"{path.stem} {index}"
+        lyrics = _json_field_value(item, (mapping.get("lyrics", ""),))
+        image_prompt = _json_field_value(item, (mapping.get("image_prompt", ""),))
+        mood = _json_field_value(item, (mapping.get("theme_mood", ""),))
+        music_prompt = _json_field_value(item, (mapping.get("music_prompt", ""),))
+        records.append(InputRecord(new_id("input"), "lyrics", title, lyrics=lyrics, image_prompt=image_prompt, theme_mood=mood, music_prompt=music_prompt, source_path=str(path)))
+    return {"records": records, "available_fields": available_fields, "field_mapping": mapping, "needs_mapping": False, "collection_key": collection_key, "source_path": str(path)}
+
+
+def parse_input_file(path: Path) -> list[InputRecord]:
+    result = parse_input_file_detailed(path)
+    if result["needs_mapping"]:
+        raise ProjectLoadError(f"Unknown JSON input structure; available keys={result['available_fields']}: {path}")
+    return result["records"]
+
+
+def rule_based_image_planning(records: list[InputRecord], keywords: str = "") -> ImagePlanningBrief:
+    """Create a transparent, editable draft; this is not semantic AI analysis."""
+    selected = [record for record in records if record.selected]
+    text = " ".join([keywords, *(record.theme_mood for record in selected), *(record.image_prompt for record in selected)]).strip()
+    tokens = [token.strip(" ,。.!?、") for token in text.split() if token.strip(" ,。.!?、")]
+    return ImagePlanningBrief(core_subject=keywords or (tokens[0] if tokens else ""), emotion="", location="", time_or_season="", characters="", action="", props="", brightness_color="", source_input_ids=[record.input_id for record in selected], extraction_method="rule_based_draft_user_confirmation_required", confirmed=False)
+
+
+def validate_candidate_count(count: int) -> int:
+    if count not in CANDIDATE_COUNTS:
+        raise ProjectError(f"Candidate count must be one of {CANDIDATE_COUNTS}; received {count}")
+    return count
 
 
 def add_input_records(project: CoverMorphProject, records: list[InputRecord]) -> None:

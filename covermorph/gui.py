@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import queue
 import shutil
 import sys
@@ -7,7 +8,7 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from typing import Any
 
 import customtkinter as ctk
@@ -52,7 +53,10 @@ from .project import (
     CandidateSettings,
     ChannelGenerationPreset,
     CoverMorphProject,
+    ImagePlanningBrief,
+    InputRecord,
     ProjectAssetError,
+    ProjectError,
     ProjectLoadError,
     SceneCard,
     add_candidate_from_file,
@@ -65,12 +69,16 @@ from .project import (
     create_project,
     load_generation_presets,
     load_project,
+    new_id,
     parse_input_file,
+    parse_input_file_detailed,
     path_to_project_string,
     resolve_project_path,
+    rule_based_image_planning,
     save_generation_presets,
     save_project_atomic,
     save_removal_preview,
+    validate_candidate_count,
     validate_project_assets,
 )
 from .settings import (
@@ -269,6 +277,12 @@ class CoverMorphApp(_CoverMorphWindow):
         self.channel_name_var = ctk.StringVar(value="")
         self.series_name_var = ctk.StringVar(value="")
         self.lyric_mood_var = ctk.StringVar(value="")
+        self.creation_purpose_var = ctk.StringVar(value="음원커버 후보")
+        self.primary_input_mode_var = ctk.StringVar(value="가사 직접 입력")
+        self.input_selection_scope_var = ctk.StringVar(value="선택한 한 곡 기준")
+        self.workflow_material_status_var = ctk.StringVar(value="이번 생성에 사용할 자료가 아직 선택되지 않았습니다.")
+        self.workflow_fields: dict[str, ctk.CTkTextbox | ctk.CTkEntry] = {}
+        self.workflow_input_records: list[Any] = []
         self.input_type_var = ctk.StringVar(value="글자 없는 이미지")
 
         self.generation_presets = load_generation_presets(self.root_dir / "config" / "channel_generation_presets.json")
@@ -281,6 +295,8 @@ class CoverMorphApp(_CoverMorphWindow):
         self.current_scene_id: str | None = None
         self.prompt_preview_text: ctk.CTkTextbox | None = None
         self.generation_count_var = ctk.IntVar(value=1)
+        self.candidate_variation_var = ctk.StringVar(value="같은 장면에서 seed만 변경")
+        self.brightness_request_var = ctk.StringVar(value="밝기 조건 없음")
         self.generation_seed_var = ctk.IntVar(value=1000)
         self.generation_steps_var = ctk.IntVar(value=28)
         self.generation_guidance_var = ctk.DoubleVar(value=7.0)
@@ -296,6 +312,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.last_generation_result: Any | None = None
 
         self.build_project_group(left)
+        self.build_workflow_group(left)
         self.build_generation_group(left)
         self.build_input_group(left)
         self.build_output_folder_group(left)
@@ -337,6 +354,41 @@ class CoverMorphApp(_CoverMorphWindow):
             buttons, text="전체 취소", command=self.cancel_work, width=96, state="disabled", fg_color="#7f1d1d"
         )
         self.top_cancel_button.pack(side="left", padx=3)
+
+    def build_workflow_group(self, parent: Any) -> None:
+        frame = self.group(parent, "Workflow: purpose / source / image plan", highlight=True)
+        ctk.CTkLabel(frame, text="Creation purpose (separate from input mode)", anchor="w").pack(fill="x", padx=12)
+        ctk.CTkOptionMenu(frame, variable=self.creation_purpose_var, values=["음원커버 후보", "썸네일 배경", "영상용 배경", "숏츠 배경", "Shopify 앱용 이미지"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(frame, text="Primary input mode (other materials may be attached)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        ctk.CTkOptionMenu(frame, variable=self.primary_input_mode_var, values=["가사 직접 입력", "JSON 파일 불러오기", "주제어 입력", "마스터 프롬프트 입력/불러오기", "참고 이미지 중심", "직접 이미지 프롬프트 입력"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(frame, text="Materials used for this generation", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        for key, label, height in (("lyrics", "Lyrics (source text is preserved; not pasted wholesale into SDXL)", 5), ("keywords", "Keywords / theme", 2), ("image_master_prompt", "Image master prompt", 3), ("music_master_prompt", "Music/lyrics reference (not mixed into image description)", 3), ("image_prompt", "Direct image prompt", 3)):
+            ctk.CTkLabel(frame, text=label, anchor="w").pack(fill="x", padx=12, pady=(4, 0))
+            widget = ctk.CTkTextbox(frame, height=height * 22)
+            widget.pack(fill="x", padx=12, pady=2)
+            self.workflow_fields[key] = widget
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=3)
+        ctk.CTkButton(row, text="Load JSON/TXT", command=self.import_workflow_json).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ctk.CTkButton(row, text="Add reference", command=self.add_project_reference).pack(side="left", fill="x", expand=True, padx=4)
+        ctk.CTkButton(frame, text="Load image-master TXT", command=self.import_image_master_prompt).pack(fill="x", padx=12, pady=2)
+        ctk.CTkOptionMenu(frame, variable=self.input_selection_scope_var, values=["선택한 한 곡 기준", "선택한 여러 곡을 묶은 앨범 기준"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(frame, text="Candidate plan (request, not a brightness guarantee)", anchor="w").pack(fill="x", padx=12, pady=(4, 0))
+        ctk.CTkOptionMenu(frame, variable=self.candidate_variation_var, values=["같은 장면에서 seed만 변경", "같은 이야기 안에서 구도 변경", "같은 이야기 안에서 배경시간대 변경", "사용자가 후보별 장면 직접 수정"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=1)
+        ctk.CTkOptionMenu(frame, variable=self.brightness_request_var, values=["밝기 조건 없음", "밝은 후보 최소 1장", "중간 밝기 후보 최소 1장"], command=self.on_workflow_changed).pack(fill="x", padx=12, pady=1)
+        ctk.CTkLabel(frame, textvariable=self.workflow_material_status_var, wraplength=360, justify="left", anchor="w").pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(frame, text="Image planning (rule-based draft; user confirmation required)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        for key, label in (("core_subject", "Core subject"), ("emotion", "Emotion"), ("location", "Location"), ("time_or_season", "Time / season"), ("characters", "Characters"), ("action", "Action"), ("props", "Key props"), ("brightness_color", "Brightness / color")):
+            entry = ctk.CTkEntry(frame, placeholder_text=label)
+            entry.pack(fill="x", padx=12, pady=1)
+            self.workflow_fields[key] = entry
+        ctk.CTkButton(frame, text="Build reviewable image plan", command=self.build_image_plan).pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(frame, text="Cover text to save for next-stage composition (not sent to SDXL)", anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        for key, label in (("album_title", "Album / main title"), ("subtitle", "Subtitle"), ("artist", "Artist"), ("label", "Label / channel"), ("language", "Display language")):
+            entry = ctk.CTkEntry(frame, placeholder_text=label)
+            entry.pack(fill="x", padx=12, pady=1)
+            self.workflow_fields[key] = entry
+        ctk.CTkButton(frame, text="Save workflow inputs / plan", command=self.save_workflow_inputs).pack(fill="x", padx=12, pady=(4, 10))
 
     def build_input_group(self, parent: Any) -> None:
         frame = self.group(parent, "1. 입력 이미지")
@@ -495,6 +547,7 @@ class CoverMorphApp(_CoverMorphWindow):
         ctk.CTkLabel(frame, text="3-B1 로컬 SDXL + IP-Adapter 후보 생성", text_color="#fbbf24", anchor="w").pack(fill="x", padx=12, pady=(5, 2))
         self.generation_count_entry = ctk.CTkEntry(frame, textvariable=self.generation_count_var)
         self.generation_count_entry.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(frame, text="Allowed candidate counts: 1 / 4 / 6 / 8 / 10 (validated before run)", text_color="#cbd5e1", anchor="w").pack(fill="x", padx=12, pady=(0, 2))
         self.generation_ratio_menu = ctk.CTkOptionMenu(frame, variable=self.generation_ratio_var, values=list(GENERATION_RATIO_LABELS.values()), command=self.on_generation_ratio_changed)
         self.generation_ratio_menu.pack(fill="x", padx=12, pady=2)
         ctk.CTkLabel(frame, text="후보 수 | seed 시작값 | steps | guidance", anchor="w").pack(fill="x", padx=12, pady=2)
@@ -1125,6 +1178,142 @@ class CoverMorphApp(_CoverMorphWindow):
         self.status.configure(text=f"참고 이미지를 복사했습니다. 모델 적용은 3단계에서 연결됩니다.\n{reference.path}")
         self.refresh_reference_options()
 
+    def _workflow_get(self, key: str) -> str:
+        widget = self.workflow_fields.get(key)
+        if widget is None:
+            return ""
+        if isinstance(widget, ctk.CTkTextbox):
+            return widget.get("1.0", "end").strip()
+        return widget.get().strip()
+
+    def _workflow_set(self, key: str, value: str) -> None:
+        widget = self.workflow_fields.get(key)
+        if widget is None:
+            return
+        if isinstance(widget, ctk.CTkTextbox):
+            widget.delete("1.0", "end")
+            widget.insert("1.0", value)
+        else:
+            widget.delete(0, "end")
+            widget.insert(0, value)
+
+    def on_workflow_changed(self, *_args: Any) -> None:
+        if self.project is not None:
+            self.sync_workflow_to_project(mark_dirty=True)
+            active = ", ".join(self.project.input_materials) or "none"
+            self.workflow_material_status_var.set(f"Primary mode: {self.primary_input_mode_var.get()} | materials used: {active}. Existing text is preserved when switching modes.")
+
+    def sync_workflow_to_project(self, *, mark_dirty: bool = False) -> None:
+        if self.project is None:
+            return
+        purpose_labels = {"음원커버 후보": "music_cover_candidate", "썸네일 배경": "thumbnail_background", "영상용 배경": "video_background", "숏츠 배경": "shorts_background", "Shopify 앱용 이미지": "shopify_app_image"}
+        mode_labels = {"가사 직접 입력": "lyrics", "JSON 파일 불러오기": "json_file", "주제어 입력": "keywords", "마스터 프롬프트 입력/불러오기": "master_prompt", "참고 이미지 중심": "reference_images", "직접 이미지 프롬프트 입력": "image_prompt"}
+        self.project.creation_purpose = purpose_labels.get(self.creation_purpose_var.get(), "music_cover_candidate")
+        self.project.primary_input_mode = mode_labels.get(self.primary_input_mode_var.get(), "lyrics")
+        self.project.input_selection_scope = "album" if self.input_selection_scope_var.get().startswith("선택한 여러") else "single"
+        material_keys = ("lyrics", "keywords", "image_master_prompt", "music_master_prompt", "image_prompt")
+        self.project.input_materials = {key: self._workflow_get(key) for key in material_keys if self._workflow_get(key)}
+        self.project.cover_text = {key: self._workflow_get(key) for key in ("album_title", "subtitle", "artist", "label", "language") if self._workflow_get(key)}
+        variation = {"같은 장면에서 seed만 변경": "seed_only", "같은 이야기 안에서 구도 변경": "composition", "같은 이야기 안에서 배경시간대 변경": "background_time", "사용자가 후보별 장면 직접 수정": "manual_per_candidate"}.get(self.candidate_variation_var.get(), "seed_only")
+        brightness = {"밝기 조건 없음": "none", "밝은 후보 최소 1장": "bright_minimum_1", "중간 밝기 후보 최소 1장": "mid_brightness_minimum_1"}.get(self.brightness_request_var.get(), "none")
+        self.project.candidate_options = {"candidate_count": int(self.generation_count_var.get()), "variation": variation, "brightness_request": brightness, "confirmed_before_generation": False}
+        if self.workflow_input_records:
+            self.project.selected_input_ids = [record.input_id for record in self.workflow_input_records if record.selected]
+        if mark_dirty:
+            self.mark_project_dirty()
+
+    def import_workflow_json(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        filename = filedialog.askopenfilename(title="Lyrics / JSON / master prompt", filetypes=[("Text/JSON", "*.txt *.json"), ("All files", "*.*")])
+        if not filename:
+            return
+        try:
+            parsed = parse_input_file_detailed(Path(filename))
+            if parsed.get("needs_mapping"):
+                available = parsed.get("available_fields", [])
+                mapping: dict[str, str] = {}
+                for target, prompt in (("title", "title field (blank to skip)"), ("lyrics", "lyrics field (blank to skip)"), ("image_prompt", "image prompt field (blank to skip)"), ("theme_mood", "theme/series mood field (blank to skip)"), ("music_prompt", "music prompt field (blank to skip)")):
+                    value = simpledialog.askstring("JSON field mapping", f"{prompt}\nAvailable: {', '.join(available)}", parent=self)
+                    if value and value not in available:
+                        messagebox.showerror("Invalid field mapping", f"Unknown key: {value}")
+                        return
+                    mapping[target] = value or ""
+                parsed = parse_input_file_detailed(Path(filename), mapping)
+            records = parsed["records"]
+            if not records:
+                raise ProjectLoadError(f"No mapped song records found in {filename}")
+            if len(records) > 1:
+                choices = "\n".join(f"{index + 1}. {record.title or '(untitled)'}" for index, record in enumerate(records))
+                selected_text = simpledialog.askstring("Select songs", f"Choose one or more record numbers separated by commas.\n{choices}", initialvalue=",".join(str(index + 1) for index in range(len(records))), parent=self)
+                if not selected_text:
+                    return
+                try:
+                    selected_indexes = {int(value.strip()) - 1 for value in selected_text.split(",") if value.strip()}
+                    if not selected_indexes or not selected_indexes.issubset(set(range(len(records)))):
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Invalid selection", "Use valid record numbers such as 1,3.")
+                    return
+                for index, record in enumerate(records):
+                    record.selected = index in selected_indexes
+            add_input_records(self.project, records)  # type: ignore[arg-type]
+            self.workflow_input_records = records
+            self.project.selected_input_ids = [record.input_id for record in records if record.selected]
+            self._workflow_set("lyrics", records[0].lyrics if len(records) == 1 else "\n\n".join(record.lyrics for record in records if record.lyrics))
+            self._workflow_set("image_prompt", records[0].image_prompt if len(records) == 1 else "")
+            self._workflow_set("music_master_prompt", records[0].music_prompt if len(records) == 1 else "")
+            self._workflow_set("keywords", records[0].theme_mood if len(records) == 1 else "")
+            self.input_selection_scope_var.set("선택한 여러 곡을 묶은 앨범 기준" if len(records) > 1 else "선택한 한 곡 기준")
+            self.workflow_material_status_var.set(f"Loaded {len(records)} record(s). Selected records are grouped into one image task; per-song auto generation is disabled.")
+            self.sync_workflow_to_project(mark_dirty=True)
+        except (ProjectLoadError, ProjectAssetError) as exc:
+            messagebox.showerror("Input import failed", str(exc))
+
+    def import_image_master_prompt(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        filename = filedialog.askopenfilename(title="Image master prompt TXT", filetypes=[("UTF-8 text", "*.txt"), ("All files", "*.*")])
+        if not filename:
+            return
+        try:
+            text = Path(filename).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            messagebox.showerror("Master prompt import failed", f"{filename}: {exc}")
+            return
+        record = InputRecord(new_id("input"), "image_prompt", Path(filename).stem, image_prompt=text, source_path=str(filename))
+        try:
+            add_input_records(self.project, [record])
+        except ProjectAssetError as exc:
+            messagebox.showerror("Master prompt import failed", str(exc))
+            return
+        self.workflow_input_records.append(record)
+        self.project.selected_input_ids.append(record.input_id)
+        self._workflow_set("image_master_prompt", text)
+        self.workflow_material_status_var.set("Image master prompt loaded as a separate material. Music/lyrics instructions are not mixed into the image prompt.")
+        self.sync_workflow_to_project(mark_dirty=True)
+
+    def build_image_plan(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        records = self.workflow_input_records or [record for record in self.project.inputs if record.input_id in self.project.selected_input_ids]
+        brief = rule_based_image_planning(records, self._workflow_get("keywords"))
+        for key in ("core_subject", "emotion", "location", "time_or_season", "characters", "action", "props", "brightness_color"):
+            if not self._workflow_get(key):
+                self._workflow_set(key, getattr(brief, key))
+        self.project.image_planning_brief = ImagePlanningBrief.from_dict({key: self._workflow_get(key) for key in ("core_subject", "emotion", "location", "time_or_season", "characters", "action", "props", "brightness_color") } | {"source_input_ids": brief.source_input_ids, "extraction_method": brief.extraction_method, "confirmed": False})
+        self.workflow_material_status_var.set("Rule-based draft prepared. Review/edit the fields, then save to confirm this image plan; no semantic AI analysis is claimed.")
+        self.mark_project_dirty()
+
+    def save_workflow_inputs(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        self.sync_workflow_to_project(mark_dirty=False)
+        brief = ImagePlanningBrief.from_dict({key: self._workflow_get(key) for key in ("core_subject", "emotion", "location", "time_or_season", "characters", "action", "props", "brightness_color") } | {"source_input_ids": self.project.selected_input_ids, "extraction_method": "user_reviewed_rule_based_draft", "confirmed": True})
+        self.project.image_planning_brief = brief
+        self.mark_project_dirty()
+        self.workflow_material_status_var.set("Workflow inputs and reviewed image plan saved. Cover text is stored separately and is not sent to SDXL; composition/export remains a later step.")
+
     def import_project_input(self) -> None:
         if not self.ensure_project_for_assets():
             return
@@ -1147,8 +1336,15 @@ class CoverMorphApp(_CoverMorphWindow):
     def add_project_scene(self) -> None:
         if not self.ensure_project_for_assets():
             return
+        self.sync_workflow_to_project(mark_dirty=False)
         preset = self.selected_generation_preset()
-        scene = SceneCard(scene_id=f"scene_{len(self.project.scenes) + 1}", order=len(self.project.scenes) + 1, user_description=self.scene_description_var.get().strip())  # type: ignore[union-attr]
+        plan = self.project.image_planning_brief
+        plan_parts = [self._workflow_get(key) for key in ("core_subject", "emotion", "location", "time_or_season", "characters", "action", "props", "brightness_color")]
+        image_master = self._workflow_get("image_master_prompt")
+        direct_prompt = self._workflow_get("image_prompt")
+        user_description = ", ".join(part for part in [self.scene_description_var.get().strip(), image_master, direct_prompt, *plan_parts] if part)
+        self.sync_workflow_to_project(mark_dirty=False)
+        scene = SceneCard(scene_id=f"scene_{len(self.project.scenes) + 1}", order=len(self.project.scenes) + 1, user_description=user_description, input_id=(self.project.selected_input_ids[0] if self.project.selected_input_ids else ""), output_ratio=self.generation_ratio_key(), candidate_count=int(self.generation_count_var.get()), structured_request={"planning_source_input_ids": list(self.project.selected_input_ids), "planning_extraction_method": plan.extraction_method, "planning_confirmed": plan.confirmed, "creation_purpose": self.project.creation_purpose, "input_selection_scope": self.project.input_selection_scope, "cover_text_separate": True, "candidate_options": dict(self.project.candidate_options)})  # type: ignore[union-attr]
         configure_scene_prompt(self.project, scene, preset)  # type: ignore[arg-type]
         self.project.scenes.append(scene)  # type: ignore[union-attr]
         self.current_scene_id = scene.scene_id
@@ -1270,6 +1466,11 @@ class CoverMorphApp(_CoverMorphWindow):
         if not scene.prompt_confirmed:
             messagebox.showwarning("프롬프트 확인 필요", "미확인 장면입니다. 프롬프트를 확인 완료한 뒤 생성해 주세요.")
             return
+        try:
+            validate_candidate_count(int(self.generation_count_var.get()))
+        except (TypeError, ValueError, ProjectError) as exc:
+            messagebox.showerror("Candidate count", str(exc))
+            return
         environment = detect_generation_environment(self.root_dir, self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL)
         reference_mode = self.reference_mode_key()
         reference_ready = bool(environment.get("ip_adapter_ready"))
@@ -1293,13 +1494,16 @@ class CoverMorphApp(_CoverMorphWindow):
         except (TypeError, ValueError) as exc:
             messagebox.showerror("생성 설정 오류", str(exc))
             return
-        project_snapshot = self.project
+        # Freeze all inputs, scene text, and reference choices for this run so
+        # edits made while the worker is running cannot change the request.
+        project_snapshot = copy.deepcopy(self.project)
+        scene = next(item for item in project_snapshot.scenes if item.scene_id == scene.scene_id)
         engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
 
         def worker() -> None:
             result = generate_scene_candidates(project_snapshot, scene, engine, config, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
             save_project_atomic(project_snapshot)
-            self.worker_queue.put({"type": "generation_done", "result": result})
+            self.worker_queue.put({"type": "generation_done", "result": result, "project": project_snapshot})
             engine.unload()
 
         self.start_worker("SDXL candidate generation", worker)
@@ -1342,8 +1546,10 @@ class CoverMorphApp(_CoverMorphWindow):
             self.top_current_label.configure(text=f"모델 로딩: {payload.get('model')}")
         self.status.configure(text="3-B1 SDXL + IP-Adapter 생성 중 | 실제 적용 여부는 완료 후 기록됩니다.")
 
-    def handle_generation_done(self, result: Any) -> None:
+    def handle_generation_done(self, result: Any, project_snapshot: CoverMorphProject | None = None) -> None:
         self.last_generation_result = result
+        if project_snapshot is not None:
+            self.project = project_snapshot
         if self.project is not None:
             self.project_dirty = False
             self.load_project_rows(self.project)
@@ -1426,6 +1632,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.project.channel_name = self.channel_name_var.get().strip()
         self.project.series_name = self.series_name_var.get().strip()
         self.project.lyric_mood_text = self.lyric_mood_var.get().strip()
+        self.sync_workflow_to_project(mark_dirty=False)
         preset = self.selected_generation_preset()
         self.project.channel_preset_id = preset.preset_id
         self.project.channel_preset = preset.to_dict()
@@ -1444,6 +1651,20 @@ class CoverMorphApp(_CoverMorphWindow):
             self.channel_name_var.set(project.channel_name)
             self.series_name_var.set(project.series_name)
             self.lyric_mood_var.set(project.lyric_mood_text)
+            purpose_labels = {"music_cover_candidate": "음원커버 후보", "thumbnail_background": "썸네일 배경", "video_background": "영상용 배경", "shorts_background": "숏츠 배경", "shopify_app_image": "Shopify 앱용 이미지"}
+            mode_labels = {"lyrics": "가사 직접 입력", "json_file": "JSON 파일 불러오기", "keywords": "주제어 입력", "master_prompt": "마스터 프롬프트 입력/불러오기", "reference_images": "참고 이미지 중심", "image_prompt": "직접 이미지 프롬프트 입력"}
+            self.creation_purpose_var.set(purpose_labels.get(project.creation_purpose, "음원커버 후보"))
+            self.primary_input_mode_var.set(mode_labels.get(project.primary_input_mode, "가사 직접 입력"))
+            self.input_selection_scope_var.set("선택한 여러 곡을 묶은 앨범 기준" if project.input_selection_scope == "album" else "선택한 한 곡 기준")
+            for key, value in project.input_materials.items():
+                self._workflow_set(key, value)
+            for key, value in project.cover_text.items():
+                self._workflow_set(key, value)
+            brief = project.image_planning_brief
+            for key in ("core_subject", "emotion", "location", "time_or_season", "characters", "action", "props", "brightness_color"):
+                self._workflow_set(key, getattr(brief, key))
+            self.workflow_material_status_var.set("Workflow data restored from project. Review status is preserved; cover text remains separate from SDXL.")
+            self.workflow_input_records = list(project.inputs)
             preset_id = project.channel_preset_id
             preset = next((item for item in self.generation_presets if item.preset_id == preset_id), None)
             if preset is None and project.channel_preset:
@@ -2533,7 +2754,7 @@ class CoverMorphApp(_CoverMorphWindow):
         elif event_type == "generation_progress":
             self.handle_generation_progress(event["payload"])
         elif event_type == "generation_done":
-            self.handle_generation_done(event["result"])
+            self.handle_generation_done(event["result"], event.get("project"))
         elif event_type == "generation_model_ready":
             self.generation_model_var.set(event["path"])
             self.status.configure(text=f"SDXL 모델 준비 완료: {event['path']}")

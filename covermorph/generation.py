@@ -684,6 +684,8 @@ def generate_scene_candidates(
         raise
     run_id = f"run_{uuid.uuid4().hex}"
     indices = candidate_indices if candidate_indices is not None else list(range(max(1, config.candidate_count)))
+    candidate_options = dict(scene.structured_request.get("candidate_options") or {})
+    variation = str(candidate_options.get("variation") or "seed_only")
     snapshot = {
         "run_id": run_id,
         "created_at": utc_now(),
@@ -714,6 +716,7 @@ def generate_scene_candidates(
         "guidance_scale": config.guidance_scale,
         "base_seed": config.seed,
         "candidate_indices": list(indices),
+        "candidate_options": candidate_options,
         "candidate_results": [],
         "config": asdict(config),
         "outcomes": [],
@@ -730,10 +733,17 @@ def generate_scene_candidates(
     negative = snapshot["negative_prompt"]
     for index in indices:
         seed = config.seed + index
+        prompt_for_candidate = prompt
+        if variation == "composition":
+            prompt_for_candidate = f"{prompt}, alternative composition for candidate {index + 1}, preserve the same story and main subject"
+        elif variation == "background_time":
+            prompt_for_candidate = f"{prompt}, alternative background or time of day for candidate {index + 1}, preserve the same story and main subject"
+        elif variation == "manual_per_candidate":
+            prompt_for_candidate = str((scene.structured_request.get("candidate_prompts") or {}).get(str(index + 1)) or prompt)
         if progress:
             progress({"phase": "candidate_start", "scene_id": scene.scene_id, "candidate": index + 1, "total": config.candidate_count, "seed": seed})
         try:
-            image = engine.generate_one(prompt, negative, config, seed, cancel_event, progress, reference_image)
+            image = engine.generate_one(prompt_for_candidate, negative, config, seed, cancel_event, progress, reference_image)
             actual_reference_applied = bool(getattr(engine, "last_reference_applied", config.reference_mode != "off"))
             if config.reference_mode != "off":
                 if not actual_reference_applied:
@@ -756,6 +766,8 @@ def generate_scene_candidates(
                     "actual_reference_applied": actual_reference_applied,
                     "references_applied": actual_reference_applied,
                     "metrics": copy.deepcopy(getattr(engine, "last_generation_metrics", {})),
+                    "candidate_prompt": prompt_for_candidate,
+                    "variation": variation,
                 }
             )
             candidate_metadata["reference"]["generation_status"] = "succeeded"
@@ -774,9 +786,11 @@ def generate_scene_candidates(
                     "actual_reference_applied": actual_reference_applied,
                     "visual_quality_status": "unverified",
                     "metrics": copy.deepcopy(getattr(engine, "last_generation_metrics", {})),
+                    "candidate_prompt": prompt_for_candidate,
+                    "variation": variation,
                 }
             )
-            snapshot["outcomes"].append({"index": index, "status": "generated", "reference_applied": actual_reference_applied})
+            snapshot["outcomes"].append({"index": index, "status": "generated", "reference_applied": actual_reference_applied, "variation": variation})
             result.candidate_ids.append(candidate.candidate_id)
             result.completed += 1
             if progress:
