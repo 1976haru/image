@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -52,7 +53,7 @@ INPUT_MODES = {
     "reference_images",
     "image_prompt",
 }
-CANDIDATE_COUNTS = (1, 4, 6, 8, 10)
+CANDIDATE_COUNTS = (1, 4, 5, 6, 8, 10)
 REFERENCE_ASSET_ROLES = {"lyrics_series", "image_master_prompt", "person", "style", "background_composition"}
 
 
@@ -72,6 +73,12 @@ class ChannelGenerationPreset:
     avoid_elements: str = ""
     master_prompt: str = ""
     negative_prompt: str = ""
+    default_label: str = ""
+    default_character: str = ""
+    preferred_places_compositions: str = ""
+    cover_text_language: str = ""
+    lyrics_language: str = "auto"
+    story_viewpoint: str = "neutral"
     textless_default: bool = True
     is_draft: bool = True
 
@@ -92,24 +99,14 @@ class ChannelGenerationPreset:
 
 
 def default_generation_presets() -> list[ChannelGenerationPreset]:
-    names = [
-        ("시니어", "OldPopLounge"),
-        ("Tokyo ChillRap Love Story", "남녀 이야기"),
-        ("Tokyo ChillRap", "남자 시점"),
-        ("Tokyo ChillRap", "여자 시점"),
-        ("Tokyo ChillRap", "카페"),
-    ]
+    shared_negative = "text, typography, logo, watermark, oversaturated colors, excessive contrast"
     return [
-        ChannelGenerationPreset(
-            preset_id=f"builtin_{index + 1}",
-            name=f"{channel} / {variant}",
-            style="사용자 지정",
-            mood=f"{variant} 분위기 초안",
-            era_region="사용자 입력 전까지 미정",
-            master_prompt="글자 없는 이미지. 사용자 장면 설명을 중심으로 구성.",
-            negative_prompt="text, typography, logo, watermark",
-        )
-        for index, (channel, variant) in enumerate(names)
+        ChannelGenerationPreset("builtin_senior_kr", "한국 시니어", style="자연스러운 실사", mood="잔잔함, 추억, 계절감", color="절제된 자연색", default_label="OldPopLounge", preferred_places_compositions="계절이 느껴지는 일상 공간과 풍경, 자연스러운 중거리 구도", avoid_elements="과한 주황빛, 과포화, 과도한 대비, 획일적인 흑백", cover_text_language="한국어 또는 사용자 지정", master_prompt="natural photorealistic senior music cover, quiet memory, seasonal atmosphere, restrained natural colors, textless image", negative_prompt=shared_negative, is_draft=False),
+        ChannelGenerationPreset("builtin_jp_en", "일본 칠리랩 영어 버전", style="실사 또는 사용자 선택 일러스트", mood="도시의 일상과 관계 감정", default_label="Tokyo ChillRap", cover_text_language="영어", master_prompt="Tokyo chill rap cover, everyday relationship emotion, cinematic Japanese urban atmosphere, textless image", negative_prompt=shared_negative, is_draft=False),
+        ChannelGenerationPreset("builtin_jp_ja", "일본 칠리랩 일본어 버전", style="실사 또는 사용자 선택 일러스트", mood="도시의 일상과 관계 감정", default_label="Tokyo ChillRap", cover_text_language="일본어", master_prompt="Tokyo chill rap cover, everyday relationship emotion, cinematic urban atmosphere, textless image", negative_prompt=shared_negative, is_draft=False),
+        ChannelGenerationPreset("builtin_jp_male", "일본 칠리랩 남자 이야기", style="실사 또는 사용자 선택 일러스트", mood="남자 주인공의 일상, 관계, 감정, 행동", default_label="Tokyo ChillRap", story_viewpoint="male protagonist", cover_text_language="사용자 지정", master_prompt="Tokyo chill rap story cover, male protagonist viewpoint, everyday relationship and emotion, textless image", negative_prompt=shared_negative, is_draft=False),
+        ChannelGenerationPreset("builtin_jp_female", "일본 칠리랩 여자 이야기", style="실사 또는 사용자 선택 일러스트", mood="여자 주인공의 일상, 관계, 감정, 행동", default_label="Tokyo ChillRap", story_viewpoint="female protagonist", cover_text_language="사용자 지정", master_prompt="Tokyo chill rap story cover, female protagonist viewpoint, everyday relationship and emotion, textless image", negative_prompt=shared_negative, is_draft=False),
+        ChannelGenerationPreset("builtin_jp_cafe", "일본 칠리랩 카페", style="실사 또는 사용자 선택 일러스트", mood="카페 공간과 인물의 균형", default_label="Tokyo ChillRap", preferred_places_compositions="카페 공간 중심, 인물 중심, 인물 없는 장면 모두 허용", cover_text_language="사용자 지정", master_prompt="Tokyo chill rap cafe cover, balanced cafe space and human presence, optional empty interior, textless image", negative_prompt=shared_negative, is_draft=False),
     ]
 
 
@@ -435,6 +432,7 @@ class CoverMorphProject:
     inputs: list[InputRecord] = field(default_factory=list)
     scenes: list[SceneCard] = field(default_factory=list)
     generation_runs: list[dict[str, Any]] = field(default_factory=list)
+    cover_planning: dict[str, Any] = field(default_factory=dict)
     selected_candidate_ids: list[str] = field(default_factory=list)
     candidates: list[CandidateRecord] = field(default_factory=list)
     created_at: str = ""
@@ -481,6 +479,7 @@ class CoverMorphProject:
             inputs=[InputRecord.from_dict(item) for item in (data.get("inputs") or []) if isinstance(item, dict)],
             scenes=[SceneCard.from_dict(item) for item in (data.get("scenes") or []) if isinstance(item, dict)],
             generation_runs=[dict(item) for item in (data.get("generation_runs") or []) if isinstance(item, dict)],
+            cover_planning=dict(data.get("cover_planning") or {}),
             selected_candidate_ids=[str(item) for item in selected_ids],
             candidates=[CandidateRecord.from_dict(item) for item in candidates_data if isinstance(item, dict)],
             created_at=str(data.get("created_at") or ""),
@@ -511,6 +510,7 @@ class CoverMorphProject:
             "inputs": [item.to_dict() for item in self.inputs],
             "scenes": [scene.to_dict() for scene in self.scenes],
             "generation_runs": [dict(item) for item in self.generation_runs],
+            "cover_planning": copy.deepcopy(self.cover_planning),
             "selected_candidate_ids": list(self.selected_candidate_ids),
             "candidates": [candidate.to_dict() for candidate in self.candidates],
             "created_at": self.created_at,

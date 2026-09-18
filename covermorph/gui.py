@@ -37,6 +37,15 @@ from .pipeline import (
     output_count_by_kind,
     process_image_jobs,
 )
+from .planning import (
+    LlamaCppCliBackend,
+    PlanningError,
+    download_model,
+    generate_plans,
+    make_input_snapshot,
+    model_status,
+    replace_one_plan,
+)
 from .presets import PRESETS
 from .processor import (
     Rect,
@@ -310,8 +319,15 @@ class CoverMorphApp(_CoverMorphWindow):
         self.reference_preview_photo: ImageTk.PhotoImage | None = None
         self.generation_status_label: ctk.CTkLabel | None = None
         self.last_generation_result: Any | None = None
+        self.cover_request_var = ctk.StringVar(value="")
+        self.planning_count_var = ctk.IntVar(value=4)
+        self.planning_summary_var = ctk.StringVar(value="가사 파일이나 주제/요청을 입력해 주세요.")
+        self.planning_model_status_var = ctk.StringVar(value="기획 모델 상태 확인 전")
+        self.planning_cards_frame: ctk.CTkFrame | None = None
+        self.planning_card_widgets: dict[str, dict[str, Any]] = {}
 
         self.build_project_group(left)
+        self.build_auto_cover_group(left)
         self.build_workflow_group(left)
         self.build_generation_group(left)
         self.build_input_group(left)
@@ -326,6 +342,31 @@ class CoverMorphApp(_CoverMorphWindow):
         self.build_image_list_panel(right)
         self.build_preview_panel(right)
         self.bind_setting_traces()
+
+    def build_auto_cover_group(self, parent: Any) -> None:
+        frame = self.group(parent, "자동 음원커버 1단계: 해석과 기획", highlight=True)
+        ctk.CTkLabel(frame, text="채널/시리즈 선택", anchor="w").pack(fill="x", padx=12)
+        names = [preset.name for preset in self.generation_presets]
+        ctk.CTkOptionMenu(frame, variable=self.generation_preset_var, values=names, command=self.on_generation_preset_changed).pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(frame, text="가사 JSON/TXT는 위 빠른 시작 버튼으로 불러오세요. 파일 없이 주제나 요청만 입력해도 됩니다.", wraplength=380, justify="left", anchor="w", text_color="#cbd5e1").pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(frame, text="이번 커버 요청", anchor="w").pack(fill="x", padx=12, pady=(5, 2))
+        self.cover_request_entry = ctk.CTkEntry(frame, textvariable=self.cover_request_var, placeholder_text="예: 여자 이야기 003, 일본어 문구, 밝은 장면 포함")
+        self.cover_request_entry.pack(fill="x", padx=12, pady=2)
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(row, text="후보 수").pack(side="left")
+        ctk.CTkSegmentedButton(row, values=["4", "5"], command=lambda value: self.planning_count_var.set(int(value))).pack(side="left", padx=8)
+        self.make_plans_button = ctk.CTkButton(row, text="커버 기획 만들기", command=self.create_cover_plans)
+        self.make_plans_button.pack(side="right")
+        model_row = ctk.CTkFrame(frame, fg_color="transparent")
+        model_row.pack(fill="x", padx=12, pady=3)
+        ctk.CTkButton(model_row, text="기획 모델 준비/다운로드", command=self.prepare_planning_model).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(model_row, text="상태 확인", command=self.refresh_planning_model_status, width=80).pack(side="left")
+        ctk.CTkLabel(frame, textvariable=self.planning_model_status_var, wraplength=380, justify="left", anchor="w", text_color="#93c5fd").pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(frame, textvariable=self.planning_summary_var, wraplength=380, justify="left", anchor="w", text_color="#fbbf24").pack(fill="x", padx=12, pady=4)
+        self.planning_cards_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        self.planning_cards_frame.pack(fill="x", padx=8, pady=(2, 10))
+        self.refresh_planning_model_status()
 
     def build_top_control_bar(self) -> None:
         bar = ctk.CTkFrame(self, border_width=1, border_color="#2563eb")
@@ -1223,6 +1264,193 @@ class CoverMorphApp(_CoverMorphWindow):
             active = ", ".join(self.project.input_materials) or "none"
             self.workflow_material_status_var.set(f"Primary mode: {self.primary_input_mode_var.get()} | materials used: {active}. Existing text is preserved when switching modes.")
 
+    def refresh_planning_model_status(self) -> None:
+        status = model_status(self.root_dir)
+        if status["ready"]:
+            text = "준비 완료: Qwen2.5-7B-Instruct Q4_K_M + llama.cpp"
+        elif status["model_complete"]:
+            text = "모델 파일은 준비됨. llama-cli.exe를 tools/llama에 두거나 PATH에 설치해 주세요."
+        else:
+            text = "미준비: 버튼을 눌러 약 4.68GB 모델을 받은 뒤 llama.cpp를 준비하세요."
+        self.planning_model_status_var.set(text)
+
+    def prepare_planning_model(self) -> None:
+        def worker() -> None:
+            download_model(
+                self.root_dir,
+                lambda payload: self.worker_queue.put(
+                    {
+                        "type": "planning_progress",
+                        "payload": payload,
+                    }
+                ),
+            )
+            self.worker_queue.put({"type": "planning_model_ready"})
+
+        self.start_worker("로컬 기획 모델 다운로드", worker)
+
+    def _planning_records(self) -> list[InputRecord]:
+        if self.project is None:
+            return []
+        selected = set(self.project.selected_input_ids)
+        records = self.workflow_input_records or self.project.inputs
+        return [copy.deepcopy(record) for record in records if not selected or record.input_id in selected]
+
+    def _planning_explicit_settings(self) -> dict[str, str]:
+        return {
+            "album_title": self._workflow_get("album_title"),
+            "series": self.series_name_var.get().strip(),
+            "label": self._workflow_get("label"),
+            "character": self._workflow_get("characters"),
+            "place_time_season_weather": self._workflow_get("time_or_season"),
+            "props_composition": self._workflow_get("props"),
+            "visual_style": self.selected_generation_preset().style,
+            "cover_text_language": self._workflow_get("language"),
+            "brightness": self._workflow_get("brightness_color"),
+            "topic": self._workflow_get("keywords") or self.lyric_mood_var.get().strip(),
+            "image_master_prompt_override": self.preset_master_prompt_var.get().strip(),
+        }
+
+    def create_cover_plans(self) -> None:
+        if not self.ensure_project_for_assets():
+            return
+        self.sync_workflow_to_project(mark_dirty=False)
+        preset = self.selected_generation_preset()
+        try:
+            snapshot = make_input_snapshot(
+                preset,
+                self._planning_records(),
+                self.cover_request_var.get(),
+                self._planning_explicit_settings(),
+                int(self.planning_count_var.get()),
+                self._current_planning_reference(),
+            )
+        except PlanningError as exc:
+            messagebox.showwarning("기획 입력 확인", str(exc))
+            return
+        old = copy.deepcopy(self.project.cover_planning)
+        self.project.cover_planning["running_snapshot"] = snapshot.to_dict()
+        self.project.cover_planning["status"] = "running"
+        self.mark_project_dirty()
+        backend = LlamaCppCliBackend(self.root_dir)
+
+        def worker() -> None:
+            try:
+                result = generate_plans(snapshot, backend, self.cancel_event, retries=1)
+            except Exception:
+                self.project.cover_planning = old
+                raise
+            self.worker_queue.put({"type": "planning_done", "snapshot": snapshot.to_dict(), "result": result, "old": old})
+
+        self.start_worker("가사 해석 및 커버 기획", worker)
+
+    def _current_planning_reference(self) -> dict[str, Any]:
+        scene = self.current_scene()
+        request = scene.structured_request if scene is not None else {}
+        reference_id = str(request.get("reference_image_id") or "")
+        return {
+            "reference_image_id": reference_id,
+            "person_id": scene.person_ids[0] if scene and scene.person_ids else "",
+            "role": str(request.get("reference_mode") or "off"),
+            "strength": str(request.get("reference_strength") or ""),
+            "note": "텍스트 기획 모델은 사진 픽셀을 분석하지 않으며 ID와 등록 설명만 전달받음",
+        }
+
+    def apply_planning_result(self, snapshot: dict[str, Any], result: dict[str, Any], old: dict[str, Any]) -> None:
+        if self.project is None:
+            return
+        history = list(old.get("history") or [])
+        if old.get("result"):
+            history.append({"snapshot": old.get("input_snapshot"), "result": old.get("result")})
+        self.project.cover_planning = {
+            "status": result.get("status", "failed"),
+            "request_text": snapshot.get("request_text", ""),
+            "requested_count": snapshot.get("candidate_count", 4),
+            "model": {"id": "Qwen/Qwen2.5-7B-Instruct-GGUF", "revision": "bb5d59e06d9551d752d08b292a50eb208b07ab1f", "quantization": "Q4_K_M", "engine": "llama.cpp CLI"},
+            "input_snapshot": snapshot,
+            "result": result,
+            "history": history,
+            "failure_reason": "" if result.get("status") == "complete" else "일부 선택 곡 처리 실패",
+        }
+        self.mark_project_dirty()
+        self.render_planning_cards()
+
+    def render_planning_cards(self) -> None:
+        if self.planning_cards_frame is None:
+            return
+        for widget in self.planning_cards_frame.winfo_children():
+            widget.destroy()
+        self.planning_card_widgets.clear()
+        planning = self.project.cover_planning if self.project else {}
+        result = planning.get("result") or {}
+        interpretation = result.get("interpretation") or {}
+        summary = " / ".join(part for part in (interpretation.get("viewpoint_protagonist"), interpretation.get("album_theme"), f"후보 {planning.get('requested_count', 0)}개", interpretation.get("conflicts")) if part)
+        self.planning_summary_var.set(summary or "기획 결과가 없습니다.")
+        for index, plan in enumerate(result.get("plans") or [], 1):
+            plan_id = str(plan.get("plan_id") or f"plan-{index}")
+            plan["plan_id"] = plan_id
+            card = ctk.CTkFrame(self.planning_cards_frame, border_width=1, border_color="#475569")
+            card.pack(fill="x", pady=5)
+            ctk.CTkLabel(card, text=f"{index}. {plan.get('name_ko', '')}  [{plan.get('status', 'review')}]", font=ctk.CTkFont(weight="bold"), anchor="w").pack(fill="x", padx=8, pady=(7, 2))
+            scene = ctk.CTkTextbox(card, height=72)
+            scene.pack(fill="x", padx=8, pady=2)
+            scene.insert("1.0", str(plan.get("scene_ko") or ""))
+            title = ctk.CTkEntry(card)
+            title.pack(fill="x", padx=8, pady=2)
+            title.insert(0, str((plan.get("title") or {}).get("main") or ""))
+            details = ctk.CTkTextbox(card, height=120)
+            details.insert("1.0", f"연결 이유: {plan.get('connection_reason', '')}\n구도: {plan.get('composition_distance', '')}\n밝기/색감: {plan.get('brightness_color', '')}\n문구 영역: {plan.get('text_safe_area', '')}\n\n[영문 이미지 프롬프트]\n{plan.get('image_prompt_en', '')}\n\n[네거티브]\n{plan.get('negative_prompt', '')}")
+            buttons = ctk.CTkFrame(card, fg_color="transparent")
+            buttons.pack(fill="x", padx=8, pady=(2, 7))
+            ctk.CTkButton(buttons, text="상세 펼치기", width=90, command=lambda box=details: box.pack(fill="x", padx=8, pady=3)).pack(side="left", padx=2)
+            ctk.CTkButton(buttons, text="채택", width=60, command=lambda pid=plan_id: self.set_plan_status(pid, "accepted")).pack(side="left", padx=2)
+            ctk.CTkButton(buttons, text="제외", width=60, command=lambda pid=plan_id: self.set_plan_status(pid, "excluded")).pack(side="left", padx=2)
+            ctk.CTkButton(buttons, text="이 카드 재기획", width=90, command=lambda pid=plan_id: self.replan_one_card(pid)).pack(side="left", padx=2)
+            ctk.CTkButton(buttons, text="수정 저장", width=75, command=lambda pid=plan_id: self.save_plan_edits(pid)).pack(side="right", padx=2)
+            self.planning_card_widgets[plan_id] = {"scene": scene, "title": title}
+
+    def save_plan_edits(self, plan_id: str) -> None:
+        if self.project is None:
+            return
+        widgets = self.planning_card_widgets.get(plan_id)
+        plan = next((item for item in self.project.cover_planning.get("result", {}).get("plans", []) if item.get("plan_id") == plan_id), None)
+        if not widgets or plan is None:
+            return
+        plan["scene_ko"] = widgets["scene"].get("1.0", "end").strip()
+        plan.setdefault("title", {})["main"] = widgets["title"].get().strip()
+        plan["user_edited"] = True
+        self.mark_project_dirty()
+        self.status.configure(text="기획 카드 수정 내용을 프로젝트에 저장했습니다.")
+
+    def set_plan_status(self, plan_id: str, status: str) -> None:
+        if self.project is None:
+            return
+        plan = next((item for item in self.project.cover_planning.get("result", {}).get("plans", []) if item.get("plan_id") == plan_id), None)
+        if plan is not None:
+            plan["status"] = status
+            self.mark_project_dirty()
+            self.render_planning_cards()
+
+    def replan_one_card(self, plan_id: str) -> None:
+        if self.project is None:
+            return
+        planning = copy.deepcopy(self.project.cover_planning)
+        snapshot_data = planning.get("input_snapshot") or {}
+        if not snapshot_data:
+            messagebox.showinfo("재기획", "먼저 전체 커버 기획을 만들어 주세요.")
+            return
+        from .planning import PlanningInput
+
+        snapshot = PlanningInput(**snapshot_data)
+        backend = LlamaCppCliBackend(self.root_dir)
+
+        def worker() -> None:
+            replacement = generate_plans(snapshot, backend, self.cancel_event, retries=1)
+            merged = replace_one_plan(planning["result"], replacement, plan_id)
+            self.worker_queue.put({"type": "planning_one_done", "planning": planning, "result": merged})
+
+        self.start_worker("개별 커버 재기획", worker)
+
     def sync_workflow_to_project(self, *, mark_dirty: bool = False) -> None:
         if self.project is None:
             return
@@ -1713,6 +1941,8 @@ class CoverMorphApp(_CoverMorphWindow):
         self.project.channel_name = self.channel_name_var.get().strip()
         self.project.series_name = self.series_name_var.get().strip()
         self.project.lyric_mood_text = self.lyric_mood_var.get().strip()
+        self.project.cover_planning["request_text"] = self.cover_request_var.get().strip()
+        self.project.cover_planning["requested_count"] = int(self.planning_count_var.get())
         self.sync_workflow_to_project(mark_dirty=False)
         preset = self.selected_generation_preset()
         self.project.channel_preset_id = preset.preset_id
@@ -1732,6 +1962,8 @@ class CoverMorphApp(_CoverMorphWindow):
             self.channel_name_var.set(project.channel_name)
             self.series_name_var.set(project.series_name)
             self.lyric_mood_var.set(project.lyric_mood_text)
+            self.cover_request_var.set(str(project.cover_planning.get("request_text") or ""))
+            self.planning_count_var.set(int(project.cover_planning.get("requested_count") or 4))
             purpose_labels = {"music_cover_candidate": "음원커버 후보", "thumbnail_background": "썸네일 배경", "video_background": "영상용 배경", "shorts_background": "숏츠 배경", "shopify_app_image": "Shopify 앱용 이미지"}
             mode_labels = {"lyrics": "가사 직접 입력", "json_file": "JSON 파일 불러오기", "keywords": "주제어 입력", "master_prompt": "마스터 프롬프트 입력/불러오기", "reference_images": "참고 이미지 중심", "image_prompt": "직접 이미지 프롬프트 입력"}
             self.creation_purpose_var.set(purpose_labels.get(project.creation_purpose, "음원커버 후보"))
@@ -1760,6 +1992,7 @@ class CoverMorphApp(_CoverMorphWindow):
         finally:
             self._loading_project = False
         self.refresh_project_status()
+        self.render_planning_cards()
 
     def confirm_discard_project_changes(self) -> bool:
         if not self.project_dirty:
@@ -2884,6 +3117,24 @@ class CoverMorphApp(_CoverMorphWindow):
         elif event_type == "generation_model_ready":
             self.generation_model_var.set(event["path"])
             self.status.configure(text=f"SDXL 모델 준비 완료: {event['path']}")
+        elif event_type == "planning_progress":
+            payload = event["payload"]
+            total = max(1, int(payload.get("total") or 1))
+            downloaded = min(total, int(payload.get("downloaded") or 0))
+            self.status.configure(text=f"기획 모델 다운로드: {payload.get('file')}\n{downloaded / 1_000_000:.0f} / {total / 1_000_000:.0f} MB")
+        elif event_type == "planning_model_ready":
+            self.refresh_planning_model_status()
+            self.status.configure(text="기획 모델 파일 다운로드 완료. llama.cpp 실행 파일 상태도 확인했습니다.")
+        elif event_type == "planning_done":
+            self.apply_planning_result(event["snapshot"], event["result"], event["old"])
+            self.status.configure(text="커버 기획을 만들었습니다. 아직 완성 이미지가 아니며, 카드를 수정·채택한 뒤 프로젝트를 저장하세요.")
+        elif event_type == "planning_one_done":
+            if self.project is not None:
+                self.project.cover_planning = event["planning"]
+                self.project.cover_planning["result"] = event["result"]
+                self.mark_project_dirty()
+                self.render_planning_cards()
+                self.status.configure(text="선택한 카드만 다시 기획했습니다. 다른 카드의 수정·선택은 보존했습니다.")
         elif event_type == "worker_error":
             self.status.configure(text=f"오류: {event['error']}\n수동 마스크나 로그를 확인해주세요.")
             messagebox.showerror("CoverMorph 오류", event["error"])
