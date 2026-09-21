@@ -45,3 +45,4 @@ models/
 *.pth
 *.onnx
 tools/realesrgan-ncnn-vulkan/
+tools/llama/

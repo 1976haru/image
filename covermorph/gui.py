@@ -1366,11 +1366,11 @@ class CoverMorphApp(_CoverMorphWindow):
             "status": result.get("status", "failed"),
             "request_text": snapshot.get("request_text", ""),
             "requested_count": snapshot.get("candidate_count", 4),
-            "model": {"id": "Qwen/Qwen2.5-7B-Instruct-GGUF", "revision": "bb5d59e06d9551d752d08b292a50eb208b07ab1f", "quantization": "Q4_K_M", "engine": "llama.cpp CLI"},
+            "model": {"id": "Qwen/Qwen2.5-7B-Instruct-GGUF", "revision": "bb5d59e06d9551d752d08b292a50eb208b07ab1f", "quantization": "Q4_K_M", "engine": "llama.cpp localhost server"},
             "input_snapshot": snapshot,
             "result": result,
             "history": history,
-            "failure_reason": "" if result.get("status") == "complete" else "일부 선택 곡 처리 실패",
+            "failure_reason": "" if result.get("status") == "complete" else "자동 품질 확인이 필요하거나 일부 선택 곡 처리가 실패했습니다.",
         }
         self.mark_project_dirty()
         self.render_planning_cards()
@@ -1391,7 +1391,7 @@ class CoverMorphApp(_CoverMorphWindow):
             plan["plan_id"] = plan_id
             card = ctk.CTkFrame(self.planning_cards_frame, border_width=1, border_color="#475569")
             card.pack(fill="x", pady=5)
-            ctk.CTkLabel(card, text=f"{index}. {plan.get('name_ko', '')}  [{plan.get('status', 'review')}]", font=ctk.CTkFont(weight="bold"), anchor="w").pack(fill="x", padx=8, pady=(7, 2))
+            ctk.CTkLabel(card, text=f"{index}. {plan.get('name_ko', '')}  [자동: {plan.get('auto_quality_status', '확인 필요')} / 사용자: {plan.get('user_decision', 'unreviewed')}]", font=ctk.CTkFont(weight="bold"), anchor="w").pack(fill="x", padx=8, pady=(7, 2))
             scene = ctk.CTkTextbox(card, height=72)
             scene.pack(fill="x", padx=8, pady=2)
             scene.insert("1.0", str(plan.get("scene_ko") or ""))
@@ -1442,6 +1442,7 @@ class CoverMorphApp(_CoverMorphWindow):
         from .planning import PlanningInput
 
         snapshot = PlanningInput(**snapshot_data)
+        snapshot.candidate_count = 1
         backend = LlamaCppCliBackend(self.root_dir)
 
         def worker() -> None:

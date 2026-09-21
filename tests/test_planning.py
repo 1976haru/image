@@ -24,9 +24,15 @@ class FakeBackend:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
         self.prompt = ""
+        self.plan_call = 0
 
     def generate(self, prompt: str, schema: dict, cancel=None) -> dict:
         self.prompt = prompt
+        plans_schema = (schema.get("properties") or {}).get("plans") or {}
+        if plans_schema.get("maxItems") == 1 and self.payload.get("plans"):
+            item = self.payload["plans"][self.plan_call % len(self.payload["plans"])]
+            self.plan_call += 1
+            return {"plans": [json.loads(json.dumps(item))]}
         return self.payload
 
 
@@ -39,8 +45,7 @@ class LongAlbumBackend(FakeBackend):
         self.calls.append(prompt)
         if "다음 한 곡" in prompt:
             return {"summary": "요약", "facts": "사실", "emotion_flow": "흐름", "motifs": "상징", "viewpoint": "시점", "season_place_actions": "장소"}
-        self.prompt = prompt
-        return self.payload
+        return super().generate(prompt, schema, cancel)
 
 
 def plan(index: int, source_id: str, brightness: str, title: dict | None = None) -> dict:
@@ -55,7 +60,7 @@ def plan(index: int, source_id: str, brightness: str, title: dict | None = None)
         "composition_distance": f"구도 {index}",
         "brightness_color": brightness,
         "text_safe_area": "왼쪽 위",
-        "image_prompt_en": f"cinematic scene {index}, no text",
+        "image_prompt_en": f"cinematic scene {index}, no text, " + ("bright daylight" if index == 1 else "balanced medium light" if index == 2 else "dark ambient light"),
         "negative_prompt": "text, logo, watermark",
         "title": title or {"main": "비의 기억", "subtitle": "", "label": "Tokyo ChillRap", "series": "003", "language": "일본어", "source_type": "proposed", "source_input_id": "", "source_text": ""},
     }
@@ -143,3 +148,88 @@ def test_long_album_summarizes_every_selected_song_before_reduce() -> None:
     assert result["status"] == "complete"
     assert sum("다음 한 곡" in call for call in backend.calls) == 3
     assert "[곡별 LLM 요약]" in backend.prompt
+
+class CountingBackend(FakeBackend):
+    def __init__(self, payload: dict) -> None:
+        super().__init__(payload)
+        self.count = 0
+
+    def generate(self, prompt: str, schema: dict, cancel=None) -> dict:
+        self.count += 1
+        return super().generate(prompt, schema, cancel)
+
+
+def test_user_title_and_fixed_metadata_are_program_owned() -> None:
+    snap = snapshot()
+    snap.explicit_settings.update({"album_title": "사용자 제목", "label": "고정 채널", "series": "EP 07", "cover_text_language": "한국어"})
+    data = payload("song_1")
+    data["plans"][0]["title"] = {"main": "가짜 발췌", "subtitle": "", "label": "변경", "series": "변경", "language": "중국어", "source_type": "lyric_excerpt", "source_input_id": "song_1", "source_text": "없는 문장"}
+    result = generate_plans(snap, FakeBackend(data), retries=0)
+    for item in result["plans"]:
+        assert item["title"]["main"] == "사용자 제목"
+        assert item["title"]["label"] == "고정 채널"
+        assert item["title"]["series"] == "EP 07"
+        assert item["title"]["language"] == "한국어"
+        assert item["title"]["source_type"] == "user"
+        assert item["title"]["source_start"] == -1
+
+
+def test_title_source_validation_and_excerpt_offsets() -> None:
+    proposed = payload("song_1")
+    proposed["plans"][0]["title"].update({"main": "가사에 없는 AI 제목", "source_type": "proposed", "source_text": "", "source_input_id": ""})
+    assert generate_plans(snapshot(), FakeBackend(proposed), retries=0)["plans"][0]["title"]["main"] == "가사에 없는 AI 제목"
+    excerpt = payload("song_1")
+    excerpt["plans"][0]["title"].update({"main": "창문에 비가 내려", "source_type": "lyric_excerpt", "source_text": "창문에 비가 내려", "source_input_id": "song_1"})
+    title = generate_plans(snapshot(), FakeBackend(excerpt), retries=0)["plans"][0]["title"]
+    assert title["source_start"] == 0 and title["source_end"] == len("창문에 비가 내려")
+
+
+def test_language_roles_and_title_prompt_separation() -> None:
+    snap = snapshot()
+    snap.explicit_settings["album_title"] = "雨の距離"
+    result = generate_plans(snap, FakeBackend(payload("song_1")), retries=0)
+    assert result["quality_passed"] is True
+    assert all("雨の距離" not in item["image_prompt_en"] for item in result["plans"])
+    assert all(any("가" <= char <= "힣" for char in item["scene_ko"]) for item in result["plans"])
+    assert all(any("a" <= char.lower() <= "z" for char in item["image_prompt_en"]) for item in result["plans"])
+
+
+def test_structural_failure_retry_is_bounded() -> None:
+    backend = CountingBackend({"plans": []})
+    with pytest.raises(PlanningError, match="재시도 상한"):
+        generate_plans(snapshot(), backend, retries=99)
+    assert backend.count == 2
+
+
+def test_repeated_candidate_only_is_replanned_and_passed_cards_keep_ids() -> None:
+    first = payload("song_1")
+    for i, item in enumerate(first["plans"]):
+        item["plan_id"] = f"keep-{i}"
+    first["plans"][3] = dict(first["plans"][2])
+    first["plans"][3]["plan_id"] = "replace-me"
+    replacement = payload("song_1", 1)
+    replacement["plans"][0].update({"characters_action": "주인공이 우산을 접고 계단을 오른다", "place_time_weather_season": "역 출구, 새벽, 비", "background_props": "젖은 우산과 계단 난간", "composition_distance": "높은 각도의 전신 원경", "brightness_color": "차분한 새벽빛", "image_prompt_en": "wide high-angle station exit at dawn, woman folding an umbrella, cool ambient light, no text"})
+    class SequenceBackend:
+        def __init__(self): self.calls = 0
+        def generate(self, prompt, schema, cancel=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {"interpretation": first["interpretation"], "processed_inputs": first["processed_inputs"]}
+            if 2 <= self.calls <= 5:
+                return {"plans": [first["plans"][self.calls - 2]]}
+            return replacement
+    result = generate_plans(snapshot(), SequenceBackend(), retries=1)
+    assert result["plans"][0]["plan_id"] == "keep-0"
+    assert result["plans"][1]["plan_id"] == "keep-1"
+    assert result["plans"][2]["plan_id"] == "keep-2"
+    assert result["plans"][3]["plan_id"] != "replace-me"
+
+
+def test_truncated_server_response_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from covermorph.planning import LlamaCppCliBackend
+    backend = LlamaCppCliBackend(tmp_path)
+    monkeypatch.setattr(backend, "_ensure_server", lambda cancel=None: None)
+    replies = iter(({"prompt": "formatted"}, {"content": "{\"x\":1", "truncated": True, "stop_type": "limit"}))
+    monkeypatch.setattr(backend, "_post", lambda *args, **kwargs: next(replies))
+    with pytest.raises(PlanningError, match="잘렸"):
+        backend.generate("prompt", {"type": "object"})

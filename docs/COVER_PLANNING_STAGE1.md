@@ -19,7 +19,7 @@ IP-Adapter 경로는 유지한다.
   `qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf` (약 690MB)
 - SHA-256: 1부 `dfce12e3862a5283ccfb88221b48480e58745165de856439950d0f22590580db`,
   2부 `539cf93f78e887edea1c04e2d7d8cdaca9d01dae9c9025bcb8accbe29df3d72a`
-- 엔진/양자화: 별도 프로세스 `llama.cpp` CLI, GGUF Q4_K_M, CUDA layer offload
+- 엔진/양자화: localhost 전용 별도 프로세스 `llama.cpp` server, GGUF Q4_K_M, CUDA layer offload
 - 라이선스: Apache-2.0
 - 메모리: 모델 파일 약 4.68GB 외에 KV cache와 실행 여유가 필요하다. 기본 context는
   16,384 토큰이다. RTX 3060 12GB에서 실행하도록 정했지만 다른 GPU 작업과 동시에
@@ -38,7 +38,7 @@ IP-Adapter 경로는 유지한다.
 
 1. 앱에서 새 프로젝트를 만들거나 기존 프로젝트를 연다.
 2. `기획 모델 준비/다운로드`를 누른다. 앱 시작이나 가사 불러오기만으로 다운로드하지 않는다.
-3. Windows용 CUDA `llama-cli.exe`와 DLL을 `tools/llama/`에 두거나 `llama-cli`를 PATH에
+3. Windows용 CUDA `llama-server.exe`와 DLL을 `tools/llama/`에 두거나 `llama-server`를 PATH에
    설치한다. 공식 Windows 설치 방법은 `winget install llama.cpp`다.
 4. 상태 확인에서 모델과 실행 파일이 모두 준비됐는지 확인한다.
 5. 채널을 고르고 JSON/TXT를 불러오거나 주제/요청을 입력한다.
@@ -47,7 +47,7 @@ IP-Adapter 경로는 유지한다.
 8. 프로젝트를 저장한다.
 
 다운로드는 두 파일을 `.part`로 받은 뒤 예상 크기 이상일 때만 완료 파일로 바꾼다.
-실행할 때마다 별도 `llama-cli` 프로세스를 사용하므로 작업 종료 후 모델과 GPU 메모리가
+실행할 때마다 localhost 전용 별도 `llama-server` 프로세스를 사용하므로 작업 종료 후 모델과 GPU 메모리가
 해제된다. SDXL 등 다른 앱 작업이 실행 중이면 CoverMorph의 기존 단일 작업 잠금이 새 기획
 작업을 시작하지 않는다.
 
