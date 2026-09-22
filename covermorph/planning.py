@@ -47,6 +47,7 @@ class PlanningInput:
     explicit_settings: dict[str, str] = field(default_factory=dict)
     candidate_count: int = 4
     reference: dict[str, Any] = field(default_factory=dict)
+    intent_constraints: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,14 +128,59 @@ def make_input_snapshot(
         }
         for item in chosen
     ]
+    clean_settings = {k: v.strip() for k, v in explicit_settings.items() if v.strip()}
+    conflicts = _explicit_setting_conflicts(clean_settings)
+    if conflicts:
+        raise PlanningError("서로 충돌하는 명시적 조건이 있습니다: " + " | ".join(conflicts))
     return PlanningInput(
         channel_preset=copy.deepcopy(preset.to_dict()),
         records=clean_records,
         request_text=request_text.strip(),
-        explicit_settings={k: v.strip() for k, v in explicit_settings.items() if v.strip()},
+        explicit_settings=clean_settings,
         candidate_count=candidate_count,
         reference=copy.deepcopy(reference or {}),
+        intent_constraints=_intent_constraints(preset, clean_settings, request_text),
     )
+
+
+def _explicit_setting_conflicts(values: dict[str, str]) -> list[str]:
+    groups = {
+        "제목": ("album_title", "title"),
+        "등장인물": ("character", "characters"),
+        "장소·날씨·시간": ("place_time_season_weather", "place"),
+        "문구 언어": ("cover_text_language", "language"),
+    }
+    conflicts: list[str] = []
+    for label, keys in groups.items():
+        supplied = [(key, values[key]) for key in keys if values.get(key)]
+        if len({value for _, value in supplied}) > 1:
+            conflicts.append(f"{label}: " + ", ".join(f"{key}={value}" for key, value in supplied))
+    return conflicts
+
+
+def _intent_constraints(preset: ChannelGenerationPreset, values: dict[str, str], request_text: str) -> dict[str, Any]:
+    fixed_map = {
+        "character": values.get("character") or values.get("characters") or "",
+        "place_weather_time": values.get("place_time_season_weather") or values.get("place") or "",
+        "props_composition": values.get("props_composition", ""),
+        "brightness_color": values.get("brightness", ""),
+        "title": values.get("album_title") or values.get("title") or "",
+        "cover_text_language": values.get("cover_text_language") or values.get("language") or "",
+        "image_master_prompt": values.get("image_master_prompt_override", ""),
+    }
+    fixed = [
+        {"field": key, "value": value, "source": "사용자가 명시적으로 고정한 설정"}
+        for key, value in fixed_map.items() if value
+    ]
+    return {
+        "channel_audience": {"value": preset.name, "source": "선택한 채널 기본값", "visual_character_constraint": False},
+        "visual_style": {"value": values.get("visual_style") or preset.style, "source": "사용자가 명시적으로 고정한 설정" if values.get("visual_style") else "선택한 채널 기본값"},
+        "fixed": fixed,
+        "request": {"value": request_text.strip(), "source": "이번 사용자 요청"},
+        "ai_inference_policy": "가사에서 AI가 추론한 내용은 fixed를 변경할 수 없음",
+        "mutable": ["가사 기반 감정", "행동", "구도", "비필수 소품", "고정 조건 안의 세부 배경"],
+        "conflicts": [],
+    }
 
 
 def planning_schema(count: int) -> dict[str, Any]:
@@ -211,6 +257,67 @@ processed_inputs.status는 ok 또는 failed만 사용한다. 중심 정서, 화�
 {json.dumps(snapshot.to_dict(), ensure_ascii=False)}"""
 
 
+OUTLINE_FIELDS = ("action", "place", "composition", "props", "lighting")
+
+
+def outline_schema(snapshot: PlanningInput) -> dict[str, Any]:
+    ids = [item["input_id"] for item in snapshot.records]
+    properties = {
+        "related_input_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ids}},
+        "lyric_grounding": {"type": "string"},
+        "emotion": {"type": "string"},
+        "action": {"type": "string"},
+        "place": {"type": "string"},
+        "composition": {"type": "string"},
+        "props": {"type": "string"},
+        "lighting": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "properties": {"outlines": {"type": "array", "minItems": snapshot.candidate_count, "maxItems": snapshot.candidate_count, "items": {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}}},
+        "required": ["outlines"],
+        "additionalProperties": False,
+    }
+
+
+def build_outline_prompt(snapshot: PlanningInput, interpretation: dict[str, Any]) -> str:
+    return f"""긴 기획문을 쓰기 전에 {snapshot.candidate_count}개 후보의 짧은 장면 구성표만 한국어로 설계하라.
+각 구성표에 연결 곡 ID와 가사 근거, 감정, 행동, 장소, 카메라 거리·구도, 소품, 조명을 쓴다.
+각 후보는 앞 후보와 action/place/composition/props/lighting 중 최소 두 요소가 의미 있게 달라야 한다. 후보별 역할을 강제로 분리한다: 1번은 장소 전체를 보여주는 밝은 넓은 구도, 2번은 인물의 손동작이나 표정을 담는 중간 밝기 친밀 구도, 3번은 이동·경계 공간과 측면/후면/높은 시점, 4번은 실내외 전환·보호 공간과 앞 후보와 다른 행동, 5번은 상징 소품 중심의 다른 거리·시점이다(후보 수가 4개면 5번 역할은 생략). 역할 이름만 바꾸지 말고 action/place/composition/props/lighting의 실제 내용을 달리하라. 앞 구성표의 문장을 재사용하지 말라.
+단, intent_constraints.fixed는 모든 후보에서 유지하고 다양성을 위해 바꾸지 않는다.
+channel_audience는 시청자 대상일 뿐 등장인물의 나이·외모 조건이 아니다.
+가사와 무관한 장소를 다양성만을 위해 만들지 말고, 음악 장르·발성 지시를 이미지 장면으로 복사하지 말라.
+검증된 가사 해석: {json.dumps(interpretation, ensure_ascii=False)}
+입력 스냅샷: {json.dumps(snapshot.to_dict(), ensure_ascii=False)}"""
+
+
+def _validate_outlines(raw: dict[str, Any], snapshot: PlanningInput) -> list[dict[str, Any]]:
+    outlines = raw.get("outlines")
+    if not isinstance(outlines, list) or len(outlines) != snapshot.candidate_count:
+        raise PlanningError("후보 장면 구성표 수가 올바르지 않습니다.")
+    known = {item["input_id"] for item in snapshot.records}
+    result: list[dict[str, Any]] = []
+    for index, outline in enumerate(outlines):
+        if not isinstance(outline, dict) or any(not str(outline.get(key) or "").strip() for key in ("lyric_grounding", "emotion", *OUTLINE_FIELDS)):
+            raise PlanningError(f"{index + 1}번 후보 장면 구성표 필드가 비었습니다.")
+        related = {str(value) for value in outline.get("related_input_ids") or []}
+        if not related or not related.issubset(known):
+            raise PlanningError(f"{index + 1}번 후보 장면 구성표의 곡 ID가 올바르지 않습니다.")
+        outline_copy = copy.deepcopy(outline)
+        outline_issues: list[str] = []
+        for prior_index, prior in enumerate(result):
+            differences = sum(
+                re.sub(r"\s+", "", str(outline[key]).lower()) != re.sub(r"\s+", "", str(prior[key]).lower())
+                for key in OUTLINE_FIELDS
+            )
+            if differences < 2:
+                outline_issues.append(f"{prior_index + 1}번 후보와 두 요소 이상 다르지 않음 ({differences}/5)")
+        outline_copy["outline_quality_status"] = "pass" if not outline_issues else "review"
+        outline_copy["outline_quality_issues"] = outline_issues
+        result.append(outline_copy)
+    return result
+
+
 PLAN_ROLES = (
     "밝은 조명의 넓은 맥락 장면. 장소 전체와 인물 행동을 원경 또는 넓은 중경으로 보여준다.",
     "중간 밝기의 친밀한 행동 장면. 인물의 손동작이나 표정을 근경으로 보여준다.",
@@ -220,13 +327,15 @@ PLAN_ROLES = (
 )
 
 
-def build_plan_prompt(snapshot: PlanningInput, interpretation: dict[str, Any], index: int, accepted: list[dict[str, Any]]) -> str:
+def build_plan_prompt(snapshot: PlanningInput, interpretation: dict[str, Any], index: int, accepted: list[dict[str, Any]], outline: dict[str, Any]) -> str:
     return build_prompt(snapshot) + f"""
 검증된 가사 해석 JSON:
 {json.dumps(interpretation, ensure_ascii=False)}
 지금은 전체 {snapshot.candidate_count}개 중 {index + 1}번 카드 하나만 만든다.
 이 카드의 역할: {PLAN_ROLES[index]}
+검증된 이 카드의 장면 구성표: {json.dumps(outline, ensure_ascii=False)}
 이미 만든 카드 요약: {json.dumps(accepted, ensure_ascii=False)}
+구성표의 연결 곡·가사 근거·감정·행동·장소·구도·소품·조명을 같은 의미로 확장하라.
 사용자 필수 날씨·시간·인물·장소를 그대로 유지하면서 이미 만든 카드와 행동·카메라 거리/구도·주요 소품·조명 중 최소 세 가지를 다르게 하라.
 plans 배열에 카드 하나만 반환하라."""
 
@@ -355,6 +464,12 @@ def validate_result(raw: dict[str, Any], snapshot: PlanningInput) -> dict[str, A
         _apply_fixed_values(plan, snapshot)
         _validate_excerpt(plan.title, snapshot.records)
         plan.reference = copy.deepcopy(snapshot.reference)
+        plan.reference["intent_constraints"] = copy.deepcopy(snapshot.intent_constraints)
+        plan.reference["image_prompt_components"] = {
+            "ai_scene_en": plan.image_prompt_en,
+            "fixed_conditions": copy.deepcopy(snapshot.intent_constraints.get("fixed", [])),
+            "assembly_status": "structured_for_stage2_not_rendered",
+        }
         plan.status = "draft"
         plans.append(plan)
     quality: list[dict[str, Any]] = []
@@ -414,10 +529,13 @@ def generate_plans(snapshot: PlanningInput, backend: PlanningBackend, cancel: An
                 analysis_errors.append(str(exc))
         if analysis is None:
             raise PlanningError(f"가사 해석 재시도 상한에 도달했습니다: {analysis_errors[-1] if analysis_errors else ''}")
+        outline_response = backend.generate(build_outline_prompt(working, analysis), outline_schema(working), cancel)
+        calls += 1
+        outlines = _validate_outlines(outline_response, working)
         raw_plans: list[dict[str, Any]] = []
         accepted: list[dict[str, Any]] = []
         for index in range(snapshot.candidate_count):
-            response = backend.generate(build_plan_prompt(working, analysis, index, accepted), plans_only_schema(1, snapshot), cancel)
+            response = backend.generate(build_plan_prompt(working, analysis, index, accepted, outlines[index]), plans_only_schema(1, snapshot), cancel)
             calls += 1
             items = response.get("plans") or []
             if len(items) != 1 or not isinstance(items[0], dict):
@@ -430,6 +548,8 @@ def generate_plans(snapshot: PlanningInput, backend: PlanningBackend, cancel: An
         failed = [i for i, plan in enumerate(result["plans"]) if plan.get("auto_quality_status") != "pass"]
         if failed and retries > 0:
             for target in failed:
+                if calls >= max_calls:
+                    break
                 replacement = backend.generate(_repair_prompt(working, result, [target]), plans_only_schema(1, snapshot), cancel).get("plans") or []
                 calls += 1
                 if len(replacement) != 1 or not isinstance(replacement[0], dict):
@@ -438,8 +558,19 @@ def generate_plans(snapshot: PlanningInput, backend: PlanningBackend, cancel: An
                 result["plans"][target] = replacement[0]
             merged = {"interpretation": copy.deepcopy(result["interpretation"]), "processed_inputs": copy.deepcopy(result["processed_inputs"]), "plans": copy.deepcopy(result["plans"])}
             result = validate_result(merged, snapshot)
+        result["scene_outlines"] = outlines
+        outline_failed = any(item.get("outline_quality_status") != "pass" for item in outlines)
+        if outline_failed:
+            result["quality_passed"] = False
+            result["status"] = "review_required"
+        result["validation_state"] = {
+            "execution": "success",
+            "structure_and_fixed_conditions": "pass" if not result["missing_input_ids"] else "failed",
+            "semantic_diversity_language_review": "automatic_pass_human_review_required" if result["quality_passed"] and not outline_failed else "review_required",
+            "user_adoption": "unreviewed",
+        }
         result["attempts"] = calls
-        result["retry_limit"] = {"analysis_format": 1, "per_candidate_quality_repair": 1, "total_calls": max_calls}
+        result["retry_limit"] = {"analysis_format": 1, "outline_generation": 0, "per_candidate_quality_repair": 1, "total_calls": max_calls}
         return result
     finally:
         close = getattr(backend, "close", None)

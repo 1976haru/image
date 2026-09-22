@@ -28,6 +28,14 @@ class FakeBackend:
 
     def generate(self, prompt: str, schema: dict, cancel=None) -> dict:
         self.prompt = prompt
+        outlines_schema = (schema.get("properties") or {}).get("outlines") or {}
+        if outlines_schema:
+            count = outlines_schema.get("maxItems", 4)
+            source_id = self.payload.get("processed_inputs", [{"input_id": "song_1"}])[0]["input_id"]
+            return {"outlines": [
+                {"related_input_ids": [source_id], "lyric_grounding": f"가사 근거 {i}", "emotion": "그리움", "action": f"행동 {i}", "place": f"장소 {i}", "composition": f"구도 {i}", "props": f"소품 {i}", "lighting": f"조명 {i}"}
+                for i in range(count)
+            ]}
         plans_schema = (schema.get("properties") or {}).get("plans") or {}
         if plans_schema.get("maxItems") == 1 and self.payload.get("plans"):
             item = self.payload["plans"][self.plan_call % len(self.payload["plans"])]
@@ -215,8 +223,13 @@ def test_repeated_candidate_only_is_replanned_and_passed_cards_keep_ids() -> Non
             self.calls += 1
             if self.calls == 1:
                 return {"interpretation": first["interpretation"], "processed_inputs": first["processed_inputs"]}
-            if 2 <= self.calls <= 5:
-                return {"plans": [first["plans"][self.calls - 2]]}
+            if self.calls == 2:
+                return {"outlines": [
+                    {"related_input_ids": ["song_1"], "lyric_grounding": f"근거 {i}", "emotion": "그리움", "action": f"행동 {i}", "place": f"장소 {i}", "composition": f"구도 {i}", "props": f"소품 {i}", "lighting": f"조명 {i}"}
+                    for i in range(4)
+                ]}
+            if 3 <= self.calls <= 6:
+                return {"plans": [first["plans"][self.calls - 3]]}
             return replacement
     result = generate_plans(snapshot(), SequenceBackend(), retries=1)
     assert result["plans"][0]["plan_id"] == "keep-0"
@@ -233,3 +246,55 @@ def test_truncated_server_response_is_rejected(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(backend, "_post", lambda *args, **kwargs: next(replies))
     with pytest.raises(PlanningError, match="잘렸"):
         backend.generate("prompt", {"type": "object"})
+
+def test_audience_is_not_silently_promoted_to_character_and_sources_are_recorded() -> None:
+    record = InputRecord("song_1", "lyrics", "눈", lyrics="첫눈이 내린다")
+    snap = make_input_snapshot(default_generation_presets()[0], [record], "잔잔한 발라드", {"visual_style": "실사"}, 4)
+    constraints = snap.intent_constraints
+    assert constraints["channel_audience"]["value"] == "한국 시니어"
+    assert constraints["channel_audience"]["visual_character_constraint"] is False
+    assert not any(item["field"] == "character" for item in constraints["fixed"])
+    assert constraints["visual_style"]["source"] == "사용자가 명시적으로 고정한 설정"
+
+
+def test_conflicting_explicit_conditions_are_shown_instead_of_overwritten() -> None:
+    record = InputRecord("song_1", "lyrics", "눈", lyrics="첫눈")
+    with pytest.raises(PlanningError, match="충돌.*등장인물"):
+        make_input_snapshot(default_generation_presets()[0], [record], "", {"character": "여성 1명", "characters": "남성 2명"}, 4)
+
+
+def test_scene_outlines_precede_cards_and_require_two_meaningful_differences() -> None:
+    result = generate_plans(snapshot(), FakeBackend(payload("song_1")), retries=0)
+    assert len(result["scene_outlines"]) == 4
+    assert result["attempts"] == 6
+    assert result["validation_state"] == {
+        "execution": "success",
+        "structure_and_fixed_conditions": "pass",
+        "semantic_diversity_language_review": "automatic_pass_human_review_required",
+        "user_adoption": "unreviewed",
+    }
+
+    class DuplicateOutlineBackend(FakeBackend):
+        def generate(self, prompt, schema, cancel=None):
+            response = super().generate(prompt, schema, cancel)
+            if "outlines" in response:
+                response["outlines"][1] = json.loads(json.dumps(response["outlines"][0]))
+            return response
+
+    duplicate_result = generate_plans(snapshot(), DuplicateOutlineBackend(payload("song_1")), retries=0)
+    assert duplicate_result["scene_outlines"][1]["outline_quality_status"] == "review"
+    assert duplicate_result["quality_passed"] is False
+
+
+def test_fixed_conditions_are_kept_as_structured_prompt_components() -> None:
+    snap = snapshot()
+    snap.explicit_settings["character"] = "20대 일본 여성 1명"
+    snap.intent_constraints["fixed"].append({"field": "character", "value": "20대 일본 여성 1명", "source": "사용자가 명시적으로 고정한 설정"})
+    data = payload("song_1")
+    for item in data["plans"]:
+        item["scene_ko"] += " 20대 일본 여성 1명"
+    result = generate_plans(snap, FakeBackend(data), retries=0)
+    components = result["plans"][0]["reference"]["image_prompt_components"]
+    assert components["ai_scene_en"] == result["plans"][0]["image_prompt_en"]
+    assert components["fixed_conditions"][0]["value"] == "20대 일본 여성 1명"
+    assert components["assembly_status"] == "structured_for_stage2_not_rendered"
