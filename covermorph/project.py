@@ -259,6 +259,57 @@ class SceneCard:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
 
 
+def cover_plan_version(plan: dict[str, Any]) -> str:
+    """Stable version for the exact user-approved planning-card inputs."""
+    payload = {key: plan.get(key) for key in ("plan_id", "scene_ko", "characters_action", "place_time_weather_season", "background_props", "composition_distance", "brightness_color", "image_prompt_en", "negative_prompt", "title", "reference")}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def scene_from_approved_cover_plan(plan: dict[str, Any], order: int = 1) -> SceneCard:
+    """Build one frozen, textless SDXL scene only from an explicit user approval."""
+    if str(plan.get("user_decision") or "") != "approved_for_generation":
+        raise ProjectError("기획 카드는 사용자가 최종 입력을 승인한 뒤에만 생성할 수 있습니다.")
+    approval = dict(plan.get("generation_approval") or {})
+    version = cover_plan_version(plan)
+    if not approval.get("approved") or approval.get("card_version") != version:
+        raise ProjectError("기획 카드가 수정되었거나 최종 생성 입력 승인이 없습니다.")
+    title = dict(plan.get("title") or {})
+    return SceneCard(
+        scene_id=new_id("scene"),
+        order=order,
+        input_id=str((plan.get("related_input_ids") or [""])[0]),
+        location=str(plan.get("place_time_weather_season") or ""),
+        action=str(plan.get("characters_action") or ""),
+        emotion=str(plan.get("connection_reason") or ""),
+        composition=str(plan.get("composition_distance") or ""),
+        output_ratio="1:1",
+        candidate_count=1,
+        user_description=str(plan.get("scene_ko") or ""),
+        prompt_auto=str(plan.get("image_prompt_en") or ""),
+        negative_prompt_auto=str(plan.get("negative_prompt") or ""),
+        prompt_user=str(plan.get("image_prompt_en") or ""),
+        negative_prompt_user=str(plan.get("negative_prompt") or ""),
+        prompt_confirmed=True,
+        prompt_source_preset_id="cover_plan",
+        prompt_source_preset_version=1,
+        structured_request={
+            "cover_plan_id": str(plan.get("plan_id") or ""),
+            "cover_plan_version": version,
+            "cover_plan_title": title,
+            "reference_mode": "off",
+            "reference_image_id": "",
+            "reference_strength": 0.0,
+            "reference_crop_box": None,
+            "candidate_options": {"variation": "manual_per_candidate", "candidate_count": 1},
+            "textless": True,
+            "approval_snapshot": {
+                "scene_ko": str(plan.get("scene_ko") or ""),
+                "image_prompt_en": str(plan.get("image_prompt_en") or ""),
+                "negative_prompt": str(plan.get("negative_prompt") or ""),
+            },
+        },
+    )
+
 @dataclass(slots=True)
 class ProjectIssue:
     candidate_id: str

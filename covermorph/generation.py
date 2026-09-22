@@ -671,7 +671,11 @@ def generate_scene_candidates(
         project.generation_runs.append(
             {
                 "run_id": f"run_{uuid.uuid4().hex}",
-                "scene_id": scene.scene_id,
+                "project_id": project.project_id,
+        "scene_id": scene.scene_id,
+        "cover_plan_id": str(scene.structured_request.get("cover_plan_id") or ""),
+        "cover_plan_version": str(scene.structured_request.get("cover_plan_version") or ""),
+        "cover_plan_title": copy.deepcopy(scene.structured_request.get("cover_plan_title") or {}),
                 "config": asdict(config),
                 "reference": reference_meta,
                 "references_applied": False,
@@ -687,6 +691,10 @@ def generate_scene_candidates(
     candidate_options = dict(scene.structured_request.get("candidate_options") or {})
     variation = str(candidate_options.get("variation") or "seed_only")
     snapshot = {
+        "project_id": project.project_id,
+        "cover_plan_id": str(scene.structured_request.get("cover_plan_id") or ""),
+        "cover_plan_version": str(scene.structured_request.get("cover_plan_version") or ""),
+        "cover_plan_title": copy.deepcopy(scene.structured_request.get("cover_plan_title") or {}),
         "run_id": run_id,
         "created_at": utc_now(),
         "scene_id": scene.scene_id,

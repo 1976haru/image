@@ -75,6 +75,7 @@ from .project import (
     adopt_generated_candidate,
     adopt_removal_preview,
     configure_scene_prompt,
+    cover_plan_version,
     create_project,
     load_generation_presets,
     load_project,
@@ -87,6 +88,7 @@ from .project import (
     save_generation_presets,
     save_project_atomic,
     save_removal_preview,
+    scene_from_approved_cover_plan,
     validate_candidate_count,
     validate_project_assets,
 )
@@ -1398,17 +1400,25 @@ class CoverMorphApp(_CoverMorphWindow):
             title = ctk.CTkEntry(card)
             title.pack(fill="x", padx=8, pady=2)
             title.insert(0, str((plan.get("title") or {}).get("main") or ""))
-            details = ctk.CTkTextbox(card, height=120)
-            details.insert("1.0", f"연결 이유: {plan.get('connection_reason', '')}\n구도: {plan.get('composition_distance', '')}\n밝기/색감: {plan.get('brightness_color', '')}\n문구 영역: {plan.get('text_safe_area', '')}\n\n[영문 이미지 프롬프트]\n{plan.get('image_prompt_en', '')}\n\n[네거티브]\n{plan.get('negative_prompt', '')}")
+            prompt = ctk.CTkTextbox(card, height=76)
+            prompt.insert("1.0", str(plan.get("image_prompt_en") or ""))
+            prompt.pack(fill="x", padx=8, pady=2)
+            negative = ctk.CTkTextbox(card, height=52)
+            negative.insert("1.0", str(plan.get("negative_prompt") or ""))
+            negative.pack(fill="x", padx=8, pady=2)
+            conditions = ctk.CTkTextbox(card, height=100)
+            conditions.insert("1.0", f"인물/행동: {plan.get('characters_action', '')}\n장소/시간/날씨: {plan.get('place_time_weather_season', '')}\n소품: {plan.get('background_props', '')}\n구도: {plan.get('composition_distance', '')}\n조명: {plan.get('brightness_color', '')}")
+            conditions.pack(fill="x", padx=8, pady=2)
             buttons = ctk.CTkFrame(card, fg_color="transparent")
             buttons.pack(fill="x", padx=8, pady=(2, 7))
-            ctk.CTkButton(buttons, text="상세 펼치기", width=90, command=lambda box=details: box.pack(fill="x", padx=8, pady=3)).pack(side="left", padx=2)
+            ctk.CTkLabel(card, text="영어 프롬프트 / 네거티브 / 생성 조건은 최종 승인 전에 직접 확인하세요.", anchor="w").pack(fill="x", padx=8)
             ctk.CTkButton(buttons, text="채택", width=60, command=lambda pid=plan_id: self.set_plan_status(pid, "accepted")).pack(side="left", padx=2)
+            ctk.CTkButton(buttons, text="최종 입력 승인", width=105, command=lambda pid=plan_id: self.approve_plan_for_generation(pid)).pack(side="left", padx=2)
+            ctk.CTkButton(buttons, text="이 카드 1장 생성", width=105, command=lambda pid=plan_id: self.generate_approved_plan(pid)).pack(side="left", padx=2)
             ctk.CTkButton(buttons, text="제외", width=60, command=lambda pid=plan_id: self.set_plan_status(pid, "excluded")).pack(side="left", padx=2)
             ctk.CTkButton(buttons, text="이 카드 재기획", width=90, command=lambda pid=plan_id: self.replan_one_card(pid)).pack(side="left", padx=2)
             ctk.CTkButton(buttons, text="수정 저장", width=75, command=lambda pid=plan_id: self.save_plan_edits(pid)).pack(side="right", padx=2)
-            self.planning_card_widgets[plan_id] = {"scene": scene, "title": title}
-
+            self.planning_card_widgets[plan_id] = {"scene": scene, "title": title, "prompt": prompt, "negative": negative, "conditions": conditions}
     def save_plan_edits(self, plan_id: str) -> None:
         if self.project is None:
             return
@@ -1418,19 +1428,104 @@ class CoverMorphApp(_CoverMorphWindow):
             return
         plan["scene_ko"] = widgets["scene"].get("1.0", "end").strip()
         plan.setdefault("title", {})["main"] = widgets["title"].get().strip()
+        plan["image_prompt_en"] = widgets["prompt"].get("1.0", "end").strip()
+        plan["negative_prompt"] = widgets["negative"].get("1.0", "end").strip()
+        values = {}
+        for line in widgets["conditions"].get("1.0", "end").splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                values[key.strip()] = value.strip()
+        plan["characters_action"] = values.get("인물/행동", plan.get("characters_action", ""))
+        plan["place_time_weather_season"] = values.get("장소/시간/날씨", plan.get("place_time_weather_season", ""))
+        plan["background_props"] = values.get("소품", plan.get("background_props", ""))
+        plan["composition_distance"] = values.get("구도", plan.get("composition_distance", ""))
+        plan["brightness_color"] = values.get("조명", plan.get("brightness_color", ""))
         plan["user_edited"] = True
+        plan["user_decision"] = "unreviewed"
+        plan["generation_approval"] = {"approved": False, "reason": "기획 카드가 수정되어 재확인 필요"}
         self.mark_project_dirty()
-        self.status.configure(text="기획 카드 수정 내용을 프로젝트에 저장했습니다.")
-
+        self.render_planning_cards()
+        self.status.configure(text="기획 카드 수정 내용을 저장했습니다. 최종 생성 입력 승인이 해제되었습니다.")
     def set_plan_status(self, plan_id: str, status: str) -> None:
         if self.project is None:
             return
         plan = next((item for item in self.project.cover_planning.get("result", {}).get("plans", []) if item.get("plan_id") == plan_id), None)
         if plan is not None:
             plan["status"] = status
+            plan["user_decision"] = "accepted" if status == "accepted" else "excluded" if status == "excluded" else "unreviewed"
             self.mark_project_dirty()
             self.render_planning_cards()
 
+    def approve_plan_for_generation(self, plan_id: str) -> None:
+        if self.project is None:
+            return
+        self.save_plan_edits(plan_id)
+        plan = next((item for item in self.project.cover_planning.get("result", {}).get("plans", []) if item.get("plan_id") == plan_id), None)
+        if plan is None:
+            return
+        version = cover_plan_version(plan)
+        plan["user_decision"] = "approved_for_generation"
+        plan["status"] = "accepted"
+        plan["generation_approval"] = {"approved": True, "card_version": version, "reference_mode": "off", "size": [1024, 1024]}
+        self.mark_project_dirty()
+        self.render_planning_cards()
+        self.status.configure(text=f"기획 카드 {plan_id}의 최종 생성 입력을 승인했습니다. 이제 이 카드 1장만 생성할 수 있습니다.")
+
+    def generate_approved_plan(self, plan_id: str) -> None:
+        if self.project is None:
+            return
+        plan = next((item for item in self.project.cover_planning.get("result", {}).get("plans", []) if item.get("plan_id") == plan_id), None)
+        if plan is None:
+            return
+        try:
+            scene = scene_from_approved_cover_plan(plan, order=len(self.project.scenes) + 1)
+        except ProjectError as exc:
+            messagebox.showwarning("최종 승인 필요", str(exc))
+            return
+        environment = detect_generation_environment(self.root_dir, self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL)
+        if environment.get("status") != "ready":
+            reason = environment.get("model", {}).get("failure_reason") or environment.get("status")
+            messagebox.showwarning("SDXL 생성 불가", f"기존 SDXL 모델 준비가 필요합니다.\n{reason}")
+            return
+        try:
+            config = GenerationConfig(
+                model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL,
+                output_ratio="1:1",
+                candidate_count=1,
+                seed=int(self.generation_seed_var.get()),
+                steps=max(1, int(self.generation_steps_var.get())),
+                guidance_scale=float(self.generation_guidance_var.get()),
+                local_files_only=True,
+                reference_mode="off",
+                reference_image_id="",
+                reference_strength=0.0,
+                ip_adapter_id=str(self.root_dir / "models" / "ip_adapter"),
+            )
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("생성 설정 오류", str(exc))
+            return
+        project_snapshot = copy.deepcopy(self.project)
+        project_snapshot.scenes.append(scene)
+
+        engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
+
+        def worker() -> None:
+            try:
+                result = generate_scene_candidates(
+                    project_snapshot,
+                    scene,
+                    engine,
+                    config,
+                    self.cancel_event,
+                    lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}),
+                    candidate_indices=[0],
+                )
+                save_project_atomic(project_snapshot)
+                self.worker_queue.put({"type": "generation_done", "result": result, "project": project_snapshot})
+            finally:
+                engine.unload()
+
+        self.start_worker("승인 기획 1장 SDXL 생성", worker)
     def replan_one_card(self, plan_id: str) -> None:
         if self.project is None:
             return

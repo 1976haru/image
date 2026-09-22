@@ -14,6 +14,7 @@ from covermorph.project import (
     ChannelGenerationPreset,
     InputRecord,
     ProjectAssetError,
+    ProjectError,
     ProjectLoadError,
     SceneCard,
     add_candidate_from_file,
@@ -22,12 +23,14 @@ from covermorph.project import (
     add_person_reference,
     adopt_removal_preview,
     configure_scene_prompt,
+    cover_plan_version,
     create_project,
     load_project,
     parse_input_file,
     resolve_project_path,
     save_project_atomic,
     save_removal_preview,
+    scene_from_approved_cover_plan,
     validate_project_assets,
 )
 
@@ -271,3 +274,35 @@ def test_utf8_bom_input_and_unknown_json_are_reported(tmp_path: Path) -> None:
     unknown.write_text(json.dumps({"mystery": 1}), encoding="utf-8")
     with pytest.raises(ProjectLoadError, match="Unknown JSON"):
         parse_input_file(unknown)
+
+
+def test_approved_cover_plan_is_required_and_freezes_prompt_snapshot() -> None:
+    plan = {
+        "plan_id": "plan-1",
+        "user_decision": "review",
+        "scene_ko": "창가의 인물",
+        "characters_action": "인물이 창밖을 본다",
+        "place_time_weather_season": "실내 창가, 저녁, 비",
+        "background_props": "찻잔",
+        "composition_distance": "중경",
+        "brightness_color": "중간 밝기",
+        "image_prompt_en": "A person looking through a rainy window, textless image",
+        "negative_prompt": "text, logo, watermark",
+        "title": {"main": "사용자 제목", "source_type": "user"},
+        "related_input_ids": ["song-1"],
+    }
+    with pytest.raises(ProjectError, match="최종 입력"):
+        scene_from_approved_cover_plan(plan)
+    plan["user_decision"] = "approved_for_generation"
+    plan["generation_approval"] = {"approved": True, "card_version": cover_plan_version(plan)}
+    scene = scene_from_approved_cover_plan(plan)
+    assert scene.prompt_confirmed is True
+    assert scene.output_ratio == "1:1"
+    assert scene.candidate_count == 1
+    assert scene.prompt_user == plan["image_prompt_en"]
+    assert scene.negative_prompt_user == plan["negative_prompt"]
+    assert scene.structured_request["cover_plan_id"] == "plan-1"
+    assert scene.structured_request["reference_mode"] == "off"
+    plan["image_prompt_en"] = "changed prompt"
+    with pytest.raises(ProjectError, match="수정되었거나"):
+        scene_from_approved_cover_plan(plan)

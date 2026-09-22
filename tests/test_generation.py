@@ -76,7 +76,7 @@ class RecordingPipeline:
 
 
 def confirmed_scene() -> SceneCard:
-    return SceneCard("scene-1", prompt_auto="a scene", negative_prompt_auto="text", prompt_user="a scene", negative_prompt_user="text", prompt_confirmed=True, structured_request={"reference_image_ids": ["ref-1"]})
+    return SceneCard("scene-1", prompt_auto="a scene", negative_prompt_auto="text", prompt_user="a scene", negative_prompt_user="text", prompt_confirmed=True, structured_request={"reference_image_ids": ["ref-1"], "cover_plan_id": "plan-1", "cover_plan_version": "v1", "cover_plan_title": {"main": "title"}})
 
 
 def test_unconfirmed_scene_is_rejected(tmp_path: Path) -> None:
@@ -103,6 +103,9 @@ def test_candidates_run_sequentially_with_distinct_seeds_and_round_trip(tmp_path
     assert len(loaded.generation_runs) == 1
     assert len(loaded.candidates) == 4
     assert loaded.candidates[0].generation_metadata["seed"] == 900
+    assert loaded.generation_runs[0]["project_id"] == project.project_id
+    assert loaded.generation_runs[0]["cover_plan_id"] == "plan-1"
+    assert loaded.generation_runs[0]["cover_plan_version"] == "v1"
 
 
 def test_failed_and_cancelled_items_are_not_registered(tmp_path: Path) -> None:
