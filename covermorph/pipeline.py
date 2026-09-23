@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Callable, Sequence
@@ -280,6 +281,7 @@ def _detect_and_remove_text(
     if not boxes:
         metadata["text_removal_engine"] = "No text mask"
         metadata["inpaint_engine"] = "No text mask"
+        metadata["text_removal_status"] = "no_text_detected_unverified"
         return img.copy(), boxes, errors
 
     _emit(progress_callback, type="file_stage", status="글자 제거 중")
@@ -288,6 +290,7 @@ def _detect_and_remove_text(
             clean, engine = ai.inpaint(img, mask_pil_from_boxes(img.size, boxes))
             metadata["text_removal_engine"] = engine
             metadata["inpaint_engine"] = engine
+            metadata["text_removal_status"] = "completed"
             return clean, boxes, errors
         except Exception as exc:
             write_exception(root, "LaMa fallback", exc)
@@ -297,6 +300,7 @@ def _detect_and_remove_text(
         clean = inpaint_text_opencv(img, boxes)
         metadata["text_removal_engine"] = "OpenCV NS/Telea (quality selected)"
         metadata["inpaint_engine"] = "OpenCV NS/Telea (quality selected)"
+        metadata["text_removal_status"] = "completed"
         return clean, boxes, errors
     except Exception as exc:
         write_exception(root, "OpenCV inpaint failed", exc)
@@ -305,6 +309,7 @@ def _detect_and_remove_text(
         )
         metadata["text_removal_engine"] = "Failed; original kept"
         metadata["inpaint_engine"] = "Failed; original kept"
+        metadata["text_removal_status"] = "failed_original_kept"
         return img.copy(), boxes, errors
 
 
@@ -597,6 +602,25 @@ def process_image_file(
         progress_callback,
     )
     errors.extend(text_errors)
+
+    # Keep the mask and cleaned intermediate separate from final outputs so a
+    # retry never overwrites the input and the exact transform can be audited.
+    try:
+        mask_path = item_dir / f"{source.stem}_text_mask.png"
+        mask_pil_from_boxes(img.size, _boxes).save(mask_path, "PNG")
+        clean_path = item_dir / f"{source.stem}_clean_intermediate.png"
+        clean.save(clean_path, "PNG")
+        metadata["intermediate_files"] = {
+            "text_mask": str(mask_path),
+            "clean_image": str(clean_path),
+        }
+        metadata["intermediate_sha256"] = {
+            "source": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "clean_image": hashlib.sha256(clean_path.read_bytes()).hexdigest(),
+            "text_mask": hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+        }
+    except OSError as exc:
+        errors.append(_error("intermediate_save_failed", "중간 결과를 저장하지 못했습니다.", str(exc)))
 
     if options.enhance:
         clean = mild_enhance(clean, preset.enhance_strength)

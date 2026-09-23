@@ -131,7 +131,9 @@ class AIBackends:
 
         if self._sdxl is None:
             dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-            kwargs = {"torch_dtype": dtype, "use_safetensors": True}
+            # Advanced outpainting must use an explicitly prepared local
+            # inpainting checkpoint.  Never download one implicitly.
+            kwargs = {"torch_dtype": dtype, "use_safetensors": True, "local_files_only": True}
             if torch.cuda.is_available():
                 kwargs["variant"] = "fp16"
             self._sdxl = AutoPipelineForInpainting.from_pretrained(model_id, **kwargs)

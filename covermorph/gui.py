@@ -200,6 +200,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.project: CoverMorphProject | None = None
         self.project_dirty = False
         self._loading_project = False
+        self.quick_mode = False
 
         self.preview_tk: ImageTk.PhotoImage | None = None
         self.preview_scale = 1.0
@@ -401,7 +402,7 @@ class CoverMorphApp(_CoverMorphWindow):
         quick = ctk.CTkFrame(bar, fg_color="transparent")
         quick.grid(row=2, column=0, columnspan=5, sticky="ew", padx=12, pady=(0, 8))
         ctk.CTkLabel(quick, text="빠른 시작:", anchor="w").pack(side="left", padx=(0, 8))
-        self.quick_add_image_button = ctk.CTkButton(quick, text="이미지 추가 (변환)", command=self.open_files, width=145)
+        self.quick_add_image_button = ctk.CTkButton(quick, text="이미지 추가 (변환)", command=self.quick_existing_add, width=145)
         self.quick_add_image_button.pack(side="left", padx=3)
         self.quick_json_button = ctk.CTkButton(quick, text="가사/곡 JSON 불러오기", command=self.import_workflow_json, width=165)
         self.quick_json_button.pack(side="left", padx=3)
@@ -1669,12 +1670,166 @@ class CoverMorphApp(_CoverMorphWindow):
             messagebox.showerror("TXT 불러오기 실패", str(exc))
 
     def start_existing_image_mode(self) -> None:
-        self.input_type_var.set("글자 없는 이미지")
-        self.status.configure(text="기존 이미지 변환 모드입니다. 가사나 장면 프롬프트 확인 없이 이미지 규격을 선택해 변환할 수 있습니다.")
+        self.quick_mode = True
+        self.ensure_quick_project()
+        existing_label = next((label for label, key in INPUT_TYPE_LABELS.items() if key == INPUT_TYPE_EXISTING_COVER), "")
+        self.input_type_var.set(existing_label)
+        self.output_square_var.set(False)
+        self.output_thumb_var.set(True)
+        self.output_shorts_var.set(True)
+        self.auto_remove.set(True)
+        self.prefer_esrgan.set(False)
+        self.extension_mode_label.set(EXTENSION_MODES.get("natural", self.extension_mode_label.get()))
+        self.status.configure(text="기존 커버 변환: 이미지 추가 → 출력 선택 → 변환 시작 순서로 진행하세요.")
 
     def start_material_generation_mode(self) -> None:
+        self.quick_mode = True
+        self.ensure_quick_project()
         self.creation_purpose_var.set("음원커버 후보")
-        self.status.configure(text="자료로 새 이미지 생성 모드입니다. 입력 자료를 불러온 뒤 이미지 기획을 검토·확인하세요.")
+        self.open_quick_generation_dialog()
+
+    def ensure_quick_project(self) -> bool:
+        if self.project is not None:
+            return True
+        try:
+            quick_root = self.root_dir / "projects"
+            quick_root.mkdir(parents=True, exist_ok=True)
+            project_dir = quick_root / f"quick_{new_id('job').split('_', 1)[-1]}"
+            project = create_project(project_dir, "빠른 작업")
+            self.project = project
+            self.project_dirty = False
+            self.apply_project_to_ui(project)
+            save_project_atomic(project)
+            return True
+        except (OSError, ProjectError, ValueError) as exc:
+            write_exception(self.root_dir, "Quick project create", exc)
+            messagebox.showerror("빠른 작업 준비 실패", str(exc))
+            return False
+
+    def quick_existing_add(self) -> None:
+        self.start_existing_image_mode()
+        self.open_files()
+
+    def open_quick_generation_dialog(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            messagebox.showinfo("작업 중", "현재 작업이 끝난 뒤 새 생성을 시작하세요.")
+            return
+        if not self.ensure_quick_project():
+            return
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("새 이미지 생성")
+        dialog.geometry("640x560")
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="새 이미지 생성", font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w", padx=18, pady=(18, 4))
+        ctk.CTkLabel(dialog, text="한두 줄 설명, 완성 프롬프트, 가사/곡 자료를 입력하세요. 결과는 글자 없는 배경 후보입니다.", wraplength=580, justify="left").pack(anchor="w", padx=18, pady=(0, 10))
+        request = ctk.CTkTextbox(dialog, height=180)
+        request.pack(fill="both", expand=True, padx=18, pady=6)
+        request.insert("1.0", self.cover_request_var.get().strip() or self._workflow_get("image_prompt").strip() or self._workflow_get("keywords").strip())
+        controls = ctk.CTkFrame(dialog, fg_color="transparent")
+        controls.pack(fill="x", padx=18, pady=8)
+        ctk.CTkLabel(controls, text="후보 수").pack(side="left")
+        count_var = ctk.StringVar(value="1")
+        ctk.CTkSegmentedButton(controls, values=["1", "4", "5"], variable=count_var).pack(side="left", padx=8)
+        ctk.CTkLabel(controls, text="생성 형태").pack(side="left", padx=(16, 4))
+        ratio_var = ctk.StringVar(value=GENERATION_RATIO_LABELS["1:1"])
+        ctk.CTkOptionMenu(controls, variable=ratio_var, values=list(GENERATION_RATIO_LABELS.values()), width=150).pack(side="left")
+        status = ctk.CTkLabel(dialog, text="참고 이미지는 고급 설정에서 선택할 수 있습니다.", text_color="#93c5fd", wraplength=580, justify="left")
+        status.pack(anchor="w", padx=18, pady=5)
+
+        def load_material() -> None:
+            filename = filedialog.askopenfilename(filetypes=[("JSON/TXT", "*.json *.txt"), ("모든 파일", "*.*")])
+            if not filename:
+                return
+            try:
+                parsed = parse_input_file_detailed(Path(filename))
+                records = parsed["records"]
+                if parsed.get("needs_mapping"):
+                    status.configure(text="필드 매핑이 필요한 JSON입니다. 고급 입력 화면에서 필드를 확인하세요.")
+                    return
+                add_input_records(self.project, records)  # type: ignore[arg-type]
+                self.workflow_input_records = list(records)
+                self.project.selected_input_ids = [record.input_id for record in records]
+                prompts = [record.image_prompt or record.theme_mood or record.lyrics[:300] for record in records]
+                request.delete("1.0", "end")
+                request.insert("1.0", "\n".join(item for item in prompts if item).strip())
+                self.mark_project_dirty()
+                status.configure(text=f"{Path(filename).name}: {len(records)}곡 자료를 불러왔습니다. 전체 곡이 선택되었습니다.")
+            except (ProjectLoadError, ProjectAssetError, OSError, UnicodeError) as exc:
+                status.configure(text=f"자료를 읽지 못했습니다: {exc}")
+
+        def submit() -> None:
+            prompt = request.get("1.0", "end").strip()
+            if not prompt:
+                messagebox.showwarning("입력 필요", "이미지 설명이나 프롬프트를 입력하세요.", parent=dialog)
+                return
+            ratio = GENERATION_RATIO_KEYS.get(ratio_var.get(), "1:1")
+            dialog.destroy()
+            self.run_quick_generation(prompt, int(count_var.get()), ratio)
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.pack(fill="x", padx=18, pady=(4, 18))
+        ctk.CTkButton(actions, text="JSON/TXT 불러오기", command=load_material).pack(side="left")
+        ctk.CTkButton(actions, text="이미지 생성", command=submit).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(actions, text="취소", command=dialog.destroy).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
+    def run_quick_generation(self, prompt: str, count: int, ratio: str) -> None:
+        if self.project is None or not self.ensure_quick_project():
+            return
+        try:
+            validate_candidate_count(count)
+            model_path = resolve_sdxl_model_path(self.root_dir, self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL)
+            environment = detect_generation_environment(self.root_dir, str(model_path))
+            if environment.get("status") != "ready":
+                messagebox.showwarning("SDXL 준비 필요", f"로컬 SDXL 모델이 준비되지 않았습니다. 다운로드하지 않고 중단합니다.\n{environment.get('status')}")
+                return
+            scene = SceneCard(
+                scene_id=new_id("quick_scene"),
+                order=len(self.project.scenes) + 1,
+                user_description=prompt,
+                prompt_user=prompt,
+                negative_prompt_user="text, letters, logo, watermark, distorted face, extra limbs",
+                output_ratio=ratio,
+                candidate_count=count,
+                prompt_confirmed=True,
+                structured_request={
+                    "approval_source": "quick_generate",
+                    "textless_background": True,
+                    "source_input_ids": list(self.project.selected_input_ids),
+                    "candidate_options": {"variation": "seed_only"},
+                },
+            )
+            self.project.scenes.append(scene)
+            self.current_scene_id = scene.scene_id
+            snapshot = copy.deepcopy(self.project)
+            config = GenerationConfig(
+                model_id=str(model_path),
+                output_ratio=ratio,
+                candidate_count=count,
+                seed=int(self.generation_seed_var.get()),
+                steps=max(1, int(self.generation_steps_var.get())),
+                guidance_scale=float(self.generation_guidance_var.get()),
+                reference_mode="off",
+                local_files_only=True,
+            )
+            engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
+        except (TypeError, ValueError, ProjectError, GenerationError) as exc:
+            messagebox.showerror("생성 준비 실패", str(exc))
+            return
+        self.cancel_event.clear()
+        def worker() -> None:
+            try:
+                result = generate_scene_candidates(snapshot, scene, engine, config, self.cancel_event, lambda payload: self.worker_queue.put({"type": "generation_progress", "payload": payload}))
+                save_project_atomic(snapshot)
+                self.worker_queue.put({"type": "generation_done", "result": result, "project": snapshot})
+            except Exception as exc:
+                write_exception(self.root_dir, "Quick generation", exc)
+                self.worker_queue.put({"type": "status", "message": f"새 이미지 생성 실패: {exc}"})
+            finally:
+                engine.unload()
+        self.start_worker("Quick SDXL generation", worker)
+        self.status.configure(text=f"자료 읽기 → 이미지 기획 → 모델 준비 → 0/{count}장 생성 → 저장\n글자 없는 배경 후보를 생성하는 중입니다.")
 
     def import_image_master_prompt(self) -> None:
         if not self.ensure_project_for_assets():
@@ -2107,6 +2262,8 @@ class CoverMorphApp(_CoverMorphWindow):
     def ensure_project_for_assets(self) -> bool:
         if self.project is not None:
             return True
+        if self.quick_mode:
+            return self.ensure_quick_project()
         messagebox.showinfo("프로젝트 필요", "이미지를 프로젝트 내부에 보존하려면 먼저 프로젝트 폴더를 만들어주세요.")
         return self.new_project()
 
@@ -3335,6 +3492,8 @@ class CoverMorphApp(_CoverMorphWindow):
         for result in results:
             generated_keys.update(result.metadata.get("output_files", {}))
             failed_names.extend(result.failed_file_names)
+            if result.metadata.get("text_removal_status") == "no_text_detected_unverified":
+                fallback_lines.append(f"{result.source.name}: 글자 탐지 0개라 글자 제거 여부는 미검증입니다.")
             for fallback in result.metadata.get("extension_fallbacks", []):
                 fallback_lines.append(f"{result.source.name}: {fallback.get('message', fallback.get('category', 'fallback'))}")
 
@@ -3356,17 +3515,33 @@ class CoverMorphApp(_CoverMorphWindow):
             message += "\n\n엔진 오류/처리 기록:\n" + "\n".join(fallback_lines[:8])
             if len(fallback_lines) > 8:
                 message += f"\n...외 {len(fallback_lines) - 8}건"
-        self.status.configure(text=f"완료\n{output_dir}\n생성 {generated_count}개")
-        self.show_completion_dialog(message, output_dir)
+        error_lines = [
+            f"{result.source.name}: {error.get('message', error.get('category', '알 수 없는 오류'))}"
+            for result in results
+            for error in result.errors
+        ]
+        if error_lines:
+            message += "\n\n상세 오류:\n" + "\n".join(error_lines[:10])
+        cancelled = any(getattr(result, "status", "") == "cancelled" for result in results)
+        if cancelled:
+            completion = "취소"
+        elif generated_count == 0:
+            completion = "전체 실패"
+        elif failed_outputs or skipped_outputs or error_lines:
+            completion = f"일부 성공: {generated_count}개 저장 / {failed_outputs + skipped_outputs}개 미완료"
+        else:
+            completion = "전체 성공"
+        self.status.configure(text=f"{completion}\n{output_dir}\n생성 {generated_count}개")
+        self.show_completion_dialog(message, output_dir, title=completion)
         self.update_summary()
 
-    def show_completion_dialog(self, message: str, output_dir: Path) -> None:
+    def show_completion_dialog(self, message: str, output_dir: Path, title: str = "변환 결과") -> None:
         dialog = ctk.CTkToplevel(self)
-        dialog.title("CoverMorph 완료")
+        dialog.title(f"CoverMorph - {title}")
         dialog.geometry("540x400")
         dialog.transient(self)
         dialog.grab_set()
-        ctk.CTkLabel(dialog, text="변환 완료", font=ctk.CTkFont(size=18, weight="bold")).pack(
+        ctk.CTkLabel(dialog, text=title, font=ctk.CTkFont(size=18, weight="bold")).pack(
             anchor="w",
             padx=18,
             pady=(18, 8),
@@ -3480,7 +3655,7 @@ class CoverMorphApp(_CoverMorphWindow):
             duplicate_policy=self.duplicate_policy_key(),
             extension_mode=self.extension_key(),
             protect_core=self.protect_core.get(),
-            use_sdxl=True,
+            use_sdxl=not self.quick_mode,
             protect_person=self.protect_person.get(),
             outpaint_prompt=self.outpaint_prompt.get("1.0", "end").strip(),
         )
@@ -3503,9 +3678,15 @@ class CoverMorphApp(_CoverMorphWindow):
                 working = self.candidate_working_path(state.candidate)
                 if working is not None:
                     source = working
-                auto_remove_text = False
-                manual_boxes = ()
-                ocr_boxes = ()
+                if not self.quick_mode or working is not None:
+                    auto_remove_text = False
+                    manual_boxes = ()
+                    ocr_boxes = ()
+                elif self.quick_mode:
+                    original = self.candidate_original_path(state.candidate)
+                    if original is not None:
+                        source = original
+                    auto_remove_text = self.auto_remove.get()
             per_source_output = None
             if self.output_path_auto_selected:
                 original_source = Path(state.candidate.external_source_path) if state.candidate is not None and state.candidate.external_source_path else source
@@ -3538,6 +3719,11 @@ class CoverMorphApp(_CoverMorphWindow):
             state = self.image_states[row_index]
             candidate = state.candidate
             if candidate is None:
+                continue
+            if self.quick_mode and candidate.original_path:
+                original = self.candidate_original_path(candidate)
+                if original is None or not original.is_file():
+                    missing.append(f"{candidate.display_name}: 원본 파일")
                 continue
             if not candidate.working_source_path or not candidate.working_source_approved:
                 unapproved.append(candidate.display_name)
