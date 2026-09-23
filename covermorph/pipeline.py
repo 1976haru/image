@@ -278,6 +278,25 @@ def _detect_and_remove_text(
     metadata["detected_text_regions"] = len(detected_boxes)
     metadata["text_boxes_total"] = len(boxes)
 
+    # OCR can occasionally return a canvas-sized region for stylized cover
+    # lettering. Treat that as a review stop instead of destroying faces and
+    # background with an oversized inpaint mask.
+    covered = sum(max(0, x2 - x1) * max(0, y2 - y1) for x1, y1, x2, y2 in boxes)
+    coverage = covered / max(1, img.width * img.height)
+    metadata["text_mask_coverage_ratio"] = round(coverage, 5)
+    if detected_boxes and coverage > 0.35 and not options.manual_boxes:
+        metadata["text_removal_status"] = "manual_review_required"
+        metadata["text_removal_engine"] = "OCR mask too large; original kept"
+        metadata["inpaint_engine"] = "Manual review required"
+        errors.append(
+            _error(
+                "ocr_mask_suspect",
+                "글자 마스크가 이미지의 35%를 초과해 자동 제거를 중단했습니다. 마스크를 수정한 뒤 다시 실행하세요.",
+                f"coverage={coverage:.5f}, boxes={len(boxes)}",
+            )
+        )
+        return img.copy(), boxes, errors
+
     if not boxes:
         metadata["text_removal_engine"] = "No text mask"
         metadata["inpaint_engine"] = "No text mask"
@@ -414,10 +433,13 @@ def _outpaint_or_fallback(
         local, engine = _local_format(img, preset, kind, size, options)
         return local, engine, errors, person_engine
 
-    if not options.use_sdxl or not ai.sdxl_available():
+    inpaint_available = getattr(ai, "sdxl_inpaint_available", lambda: True)()
+    if not options.use_sdxl or not ai.sdxl_available() or not inpaint_available:
+        reason = "SDXL 인페인팅 모델이 준비되지 않았습니다." if not inpaint_available else "SDXL 의존성이 준비되지 않았습니다."
         error = _error(
             "sdxl_unavailable",
-            f"SDXL unavailable for {kind}; choose a local extension mode explicitly.",
+            f"{reason} {kind} 출력은 저장하지 않았습니다.",
+            f"inpainting_model={getattr(ai, 'sdxl_inpaint_model_path', lambda: 'not reported')()}",
         )
         write_log(root, error["message"])
         raise OutputEngineFailure(error["message"], error)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import queue
 import shutil
 import sys
@@ -794,6 +795,14 @@ class CoverMorphApp(_CoverMorphWindow):
             fg_color="#4b5563",
         )
         self.ai_status_button.pack(fill="x", padx=12, pady=(4, 12))
+        self.prepare_inpaint_button = ctk.CTkButton(
+            frame,
+            text="AI 확장 모델 준비(약 7GB)",
+            command=self.prepare_inpaint_model,
+            height=30,
+            fg_color="#475569",
+        )
+        self.prepare_inpaint_button.pack(fill="x", padx=12, pady=(0, 12))
 
     def build_progress_group(self, parent: Any) -> None:
         frame = self.group(parent, "8. 진행 상태")
@@ -905,6 +914,7 @@ class CoverMorphApp(_CoverMorphWindow):
             self.prefer_esrgan_check,
             self.protect_person_check,
             self.ai_status_button,
+            self.prepare_inpaint_button,
             self.duplicate_policy_menu,
             self.run_button,
             self.top_run_button,
@@ -1095,6 +1105,10 @@ class CoverMorphApp(_CoverMorphWindow):
         }
 
     def save_current_settings(self, *, include_output: bool = True) -> None:
+        # Quick jobs intentionally use temporary defaults; do not silently
+        # overwrite the user's saved advanced-mode defaults.
+        if self.quick_mode:
+            return
         self.settings = self.settings_payload(include_output=include_output)
         try:
             save_settings(self.root_dir, self.settings)
@@ -1115,11 +1129,11 @@ class CoverMorphApp(_CoverMorphWindow):
     def on_extension_changed(self, *_args: Any) -> None:
         key = self.extension_key()
         if key == "ai_natural":
-            desc = "AI 자연 배경 확장: SDXL로 부족한 배경만 생성하고 원본 핵심 영역을 복원합니다."
+            desc = "AI 배경 확장: 호환 인페인팅 모델로 주변만 생성합니다. 모델이 없으면 저장하지 않습니다."
         elif key == "smart_crop":
-            desc = "스마트 크롭: 원본을 확대해 화면을 채웁니다. 가장자리는 일부 잘릴 수 있습니다."
+            desc = "화면 채우기 크롭: 원본 비율을 유지하며 가장자리가 일부 잘릴 수 있습니다. AI 확장이 아닙니다."
         elif key == "natural":
-            desc = "자연 배경 확장: 로컬 가장자리 미러링과 블렌딩으로 빈틈 없이 확장합니다."
+            desc = "자연 가장자리 확장: 로컬 미러링·블렌딩 기반의 고급 비AI 방식입니다. AI 확장이 아닙니다."
         elif key == "blur":
             desc = "블러 배경: 사용자가 직접 선택한 경우에만 기존 방식으로 생성합니다."
         else:
@@ -1679,8 +1693,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.output_shorts_var.set(True)
         self.auto_remove.set(True)
         self.prefer_esrgan.set(False)
-        self.extension_mode_label.set(EXTENSION_MODES.get("natural", self.extension_mode_label.get()))
-        self.status.configure(text="기존 커버 변환: 이미지 추가 → 출력 선택 → 변환 시작 순서로 진행하세요.")
+        self.status.configure(text="기존 커버 변환: 이미지 추가 → 확장 방식·출력 선택 → 변환 시작 순서로 진행하세요.")
 
     def start_material_generation_mode(self) -> None:
         self.quick_mode = True
@@ -3494,6 +3507,8 @@ class CoverMorphApp(_CoverMorphWindow):
             failed_names.extend(result.failed_file_names)
             if result.metadata.get("text_removal_status") == "no_text_detected_unverified":
                 fallback_lines.append(f"{result.source.name}: 글자 탐지 0개라 글자 제거 여부는 미검증입니다.")
+            if result.metadata.get("text_removal_status") == "manual_review_required":
+                fallback_lines.append(f"{result.source.name}: OCR 마스크가 너무 커 자동 제거를 중단했습니다. 마스크를 수정하세요.")
             for fallback in result.metadata.get("extension_fallbacks", []):
                 fallback_lines.append(f"{result.source.name}: {fallback.get('message', fallback.get('category', 'fallback'))}")
 
@@ -3587,6 +3602,41 @@ class CoverMorphApp(_CoverMorphWindow):
         self.status_thread.start()
         self.after(100, self.poll_worker_queue)
 
+    def prepare_inpaint_model(self) -> None:
+        from .ai_plugins import SDXL_INPAINT_MODEL_ID, SDXL_INPAINT_MODEL_REVISION
+
+        target = self.root_dir / "models" / "sdxl_inpainting_0.1"
+        if not messagebox.askyesno(
+            "AI 확장 모델 준비",
+            "공식 diffusers/stable-diffusion-xl-1.0-inpainting-0.1 모델을 다운로드합니다.\n"
+            "약 7GB의 저장 공간과 네트워크가 필요하며, Stable Diffusion XL 계열 라이선스를 따릅니다. 계속할까요?",
+        ):
+            return
+
+        def worker() -> None:
+            try:
+                from huggingface_hub import snapshot_download
+
+                snapshot_download(
+                    repo_id=SDXL_INPAINT_MODEL_ID,
+                    revision=SDXL_INPAINT_MODEL_REVISION,
+                    local_dir=str(target),
+                    local_dir_use_symlinks=False,
+                )
+                ready = self.ai.sdxl_inpaint_available()
+                if not ready:
+                    raise RuntimeError("다운로드 후 필수 인페인팅 구성 요소·가중치 검증에 실패했습니다.")
+                (target / "covermorph_model_manifest.json").write_text(
+                    json.dumps({"model_id": SDXL_INPAINT_MODEL_ID, "revision": SDXL_INPAINT_MODEL_REVISION}, indent=2),
+                    encoding="utf-8",
+                )
+                self.worker_queue.put({"type": "status", "message": f"AI 확장 모델 준비 완료: {target}"})
+            except Exception as exc:
+                write_exception(self.root_dir, "SDXL inpainting model preparation", exc)
+                self.worker_queue.put({"type": "status", "message": f"AI 확장 모델 준비 실패: {exc}"})
+
+        self.start_worker("SDXL inpainting model preparation", worker)
+
     def apply_ai_status(self, status: dict[str, bool]) -> None:
         lines = [
             f"LaMa: {'사용 가능' if status.get('lama') else '미설치'}",
@@ -3599,6 +3649,7 @@ class CoverMorphApp(_CoverMorphWindow):
         lines.extend(
             [
                 f"SDXL 모델 준비: {'완료' if environment.get('model_ready') else '미완료'}",
+                f"AI 확장 모델: {'완료' if environment.get('inpaint_model_ready') else '미준비'}",
                 f"IP-Adapter 준비: {'완료' if environment.get('ip_adapter_ready') else '미완료'}",
             ]
         )
@@ -3655,7 +3706,7 @@ class CoverMorphApp(_CoverMorphWindow):
             duplicate_policy=self.duplicate_policy_key(),
             extension_mode=self.extension_key(),
             protect_core=self.protect_core.get(),
-            use_sdxl=not self.quick_mode,
+            use_sdxl=self.extension_key() == "ai_natural",
             protect_person=self.protect_person.get(),
             outpaint_prompt=self.outpaint_prompt.get("1.0", "end").strip(),
         )

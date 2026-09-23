@@ -30,11 +30,11 @@ DUPLICATE_POLICIES = {
     "skip": "건너뛰기",
 }
 EXTENSION_MODES = {
-    "ai_natural": "AI 자연 배경 확장",
-    "smart_crop": "스마트 크롭",
-    "natural": "자연 배경 확장",
-    "blur": "블러 배경",
-    "fit": "원본 전체 맞춤",
+    "ai_natural": "AI 배경 확장 (모델 필요)",
+    "smart_crop": "화면 채우기 크롭 (가장자리 잘림 가능)",
+    "natural": "자연 가장자리 확장 (고급·비AI)",
+    "blur": "블러 배경 (고급·비AI)",
+    "fit": "원본 전체 맞춤 (여백 가능)",
 }
 
 

@@ -323,6 +323,9 @@ def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_M
     result["model_prepared"] = result["model"]["ready"]
     # Keep the original marker-level field for clients that used it before strict inspection.
     result["model_ready"] = model_path.is_dir() and (model_path / "model_index.json").is_file()
+    inpaint_path = app_root / "models" / "sdxl_inpainting_0.1"
+    result["inpaint_model_path"] = str(inpaint_path)
+    result["inpaint_model_ready"] = inpaint_path.is_dir() and (inpaint_path / "model_index.json").is_file() and (any(inpaint_path.rglob("*.safetensors")) or any(inpaint_path.rglob("*.bin")))
     result["ip_adapter"] = inspect_ip_adapter(app_root / "models" / "ip_adapter")
     result["ip_adapter_ready"] = result["ip_adapter"]["ready"]
     packages_ready = all(result[name] for name in ("diffusers", "transformers", "accelerate", "safetensors"))

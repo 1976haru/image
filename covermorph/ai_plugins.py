@@ -9,6 +9,9 @@ from pathlib import Path
 
 from PIL import Image
 
+SDXL_INPAINT_MODEL_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+SDXL_INPAINT_MODEL_REVISION = "main"
+
 
 class AIBackends:
     def __init__(self, app_root: Path):
@@ -106,6 +109,24 @@ class AIBackends:
         except Exception:
             return False
 
+    def sdxl_inpaint_model_path(self) -> Path:
+        return self.app_root / "models" / "sdxl_inpainting_0.1"
+
+    def sdxl_inpaint_available(self) -> bool:
+        model = self.sdxl_inpaint_model_path()
+        if not model.is_dir() or not (model / "model_index.json").is_file():
+            return False
+        try:
+            import json
+
+            index = json.loads((model / "model_index.json").read_text(encoding="utf-8"))
+            required = [name for name in ("unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2", "scheduler") if name in index]
+            if len(required) < 5:
+                return False
+        except (OSError, UnicodeError, ValueError):
+            return False
+        return any(model.rglob("*.safetensors")) or any(model.rglob("*.bin"))
+
     def status(self) -> dict[str, bool]:
         return {
             "lama": self.lama_available(),
@@ -113,6 +134,7 @@ class AIBackends:
             "cuda": self.cuda_available(),
             "rembg": self.rembg_available(),
             "sdxl": self.sdxl_available(),
+            "sdxl_inpaint": self.sdxl_inpaint_available(),
         }
 
     def person_mask(self, img: Image.Image) -> tuple[Image.Image, str]:
@@ -123,12 +145,18 @@ class AIBackends:
         rgba = remove(img.convert("RGBA"), only_mask=False)
         return rgba.getchannel("A").convert("L"), "rembg/U2Net"
 
-    def _load_sdxl(self, model_id: str):
+    def _load_sdxl(self, model_id: str | None = None):
         if not self.sdxl_available():
             raise RuntimeError("SDXL dependencies unavailable")
         import torch
         from diffusers import AutoPipelineForInpainting
 
+        resolved_model = Path(model_id) if model_id else self.sdxl_inpaint_model_path()
+        if not resolved_model.is_dir() or not (resolved_model / "model_index.json").is_file():
+            raise RuntimeError(
+                "호환되는 SDXL 인페인팅 모델이 준비되지 않았습니다. "
+                f"필요 경로: {resolved_model}"
+            )
         if self._sdxl is None:
             dtype = torch.float16 if torch.cuda.is_available() else torch.float32
             # Advanced outpainting must use an explicitly prepared local
@@ -136,7 +164,7 @@ class AIBackends:
             kwargs = {"torch_dtype": dtype, "use_safetensors": True, "local_files_only": True}
             if torch.cuda.is_available():
                 kwargs["variant"] = "fp16"
-            self._sdxl = AutoPipelineForInpainting.from_pretrained(model_id, **kwargs)
+            self._sdxl = AutoPipelineForInpainting.from_pretrained(str(resolved_model), **kwargs)
             self._sdxl.enable_attention_slicing()
             self._sdxl.to("cuda" if torch.cuda.is_available() else "cpu")
         return self._sdxl
@@ -148,7 +176,7 @@ class AIBackends:
         prompt: str,
         negative_prompt: str,
         steps: int = 28,
-        model_id: str = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+        model_id: str | None = None,
     ) -> tuple[Image.Image, str]:
         pipe = self._load_sdxl(model_id)
         if canvas.width >= canvas.height:
@@ -163,17 +191,31 @@ class AIBackends:
             )
         work = canvas.convert("RGB").resize(work_size, Image.Resampling.LANCZOS)
         work_mask = mask.convert("L").resize(work_size, Image.Resampling.NEAREST)
+        # SDXL inpainting checkpoints commonly require square latent sizes.
+        # Pad without rescaling the rectangular target, then crop the generated
+        # square back to the target. This avoids non-uniform stretching.
+        side = max(work_size)
+        left = (side - work.width) // 2
+        top = (side - work.height) // 2
+        padded = Image.new("RGB", (side, side), work.getpixel((0, 0)))
+        padded.paste(work, (left, top))
+        padded_mask = Image.new("L", (side, side), 0)
+        padded_mask.paste(work_mask, (left, top))
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            image=work,
-            mask_image=work_mask,
+            image=padded,
+            mask_image=padded_mask,
             num_inference_steps=max(10, min(60, int(steps))),
             guidance_scale=7.0,
         ).images[0]
-        if result.size != work_size:
-            raise ValueError("SDXL returned unexpected dimensions; distorted output rejected")
-        restored = result.resize(canvas.size, Image.Resampling.LANCZOS).convert("RGB")
+        if result.size != (side, side):
+            raise ValueError(
+                "SDXL returned unexpected dimensions; "
+                f"expected latent {(side, side)} after square padding, got {result.size}; output rejected"
+            )
+        cropped = result.crop((left, top, left + work.width, top + work.height))
+        restored = cropped.resize(canvas.size, Image.Resampling.LANCZOS).convert("RGB")
         return Image.composite(restored, canvas.convert("RGB"), mask.convert("L")), "SDXL Outpainting"
 
     def inpaint(self, img: Image.Image, mask: Image.Image) -> tuple[Image.Image, str]:
