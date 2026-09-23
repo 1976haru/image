@@ -284,7 +284,12 @@ def _detect_and_remove_text(
     covered = sum(max(0, x2 - x1) * max(0, y2 - y1) for x1, y1, x2, y2 in boxes)
     coverage = covered / max(1, img.width * img.height)
     metadata["text_mask_coverage_ratio"] = round(coverage, 5)
-    if detected_boxes and coverage > 0.35 and not options.manual_boxes:
+    max_box_ratio = max(
+        ((x2 - x1) / max(1, img.width), (y2 - y1) / max(1, img.height))
+        for x1, y1, x2, y2 in boxes
+    ) if boxes else (0.0, 0.0)
+    metadata["text_mask_max_box_ratio"] = [round(max_box_ratio[0], 5), round(max_box_ratio[1], 5)]
+    if detected_boxes and (coverage > 0.35 or max_box_ratio[0] > 0.6 or max_box_ratio[1] > 0.3) and not options.manual_boxes:
         metadata["text_removal_status"] = "manual_review_required"
         metadata["text_removal_engine"] = "OCR mask too large; original kept"
         metadata["inpaint_engine"] = "Manual review required"
@@ -292,7 +297,7 @@ def _detect_and_remove_text(
             _error(
                 "ocr_mask_suspect",
                 "글자 마스크가 이미지의 35%를 초과해 자동 제거를 중단했습니다. 마스크를 수정한 뒤 다시 실행하세요.",
-                f"coverage={coverage:.5f}, boxes={len(boxes)}",
+                f"coverage={coverage:.5f}, max_box={max_box_ratio}, boxes={len(boxes)}",
             )
         )
         return img.copy(), boxes, errors
