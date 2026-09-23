@@ -106,6 +106,17 @@ def inspect_sdxl_model(model_path: Path) -> dict[str, Any]:
     return result
 
 
+def resolve_sdxl_model_path(app_root: Path, model_id: str) -> Path:
+    """Resolve explicit paths and the app's prepared copy of the default model."""
+    requested = Path(model_id)
+    if requested.is_absolute():
+        return requested
+    candidates = [requested, app_root / requested]
+    if model_id == DEFAULT_SDXL_MODEL:
+        candidates.append(app_root / "models" / "sdxl_base_1.0")
+    return next((candidate.resolve() for candidate in candidates if candidate.is_dir()), candidates[-1].resolve())
+
+
 def inspect_ip_adapter(
     destination: Path,
     model_id: str = DEFAULT_IP_ADAPTER,
@@ -306,10 +317,7 @@ def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_M
     except (ImportError, AttributeError):
         pass
     result["model_paths"] = [str(path) for path in (app_root / "models").glob("*")] if (app_root / "models").is_dir() else []
-    model_path = Path(model_id)
-    if not model_path.is_absolute():
-        candidates = [model_path, app_root / model_path]
-        model_path = next((candidate for candidate in candidates if candidate.is_dir()), candidates[-1])
+    model_path = resolve_sdxl_model_path(app_root, model_id)
     result["resolved_model_path"] = str(model_path) if model_path.is_dir() else None
     result["model"] = inspect_sdxl_model(model_path)
     result["model_prepared"] = result["model"]["ready"]

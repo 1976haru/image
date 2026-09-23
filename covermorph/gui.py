@@ -25,6 +25,7 @@ from .generation import (
     SDXLTextToImageEngine,
     detect_generation_environment,
     generate_scene_candidates,
+    resolve_sdxl_model_path,
     retry_failed_candidates,
 )
 from .logger import write_exception, write_log
@@ -1489,7 +1490,7 @@ class CoverMorphApp(_CoverMorphWindow):
             return
         try:
             config = GenerationConfig(
-                model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL,
+                model_id=str(resolve_sdxl_model_path(self.root_dir, self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL)),
                 output_ratio="1:1",
                 candidate_count=1,
                 seed=int(self.generation_seed_var.get()),
@@ -1895,7 +1896,7 @@ class CoverMorphApp(_CoverMorphWindow):
             messagebox.showwarning("참고 이미지 생성 불가", f"IP-Adapter 준비가 완료되지 않았습니다.\n{reason}")
             return
         try:
-            config = GenerationConfig(model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL, output_ratio=self.generation_ratio_key(), candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()), reference_mode=reference_mode, reference_image_id=self.reference_image_options.get(self.reference_image_var.get(), ""), reference_strength=float(self.reference_strength_var.get()), reference_crop_box=self.parse_reference_crop(), ip_adapter_id=str(self.root_dir / "models" / "ip_adapter"))
+            config = GenerationConfig(model_id=str(resolve_sdxl_model_path(self.root_dir, self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL)), output_ratio=self.generation_ratio_key(), candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()), reference_mode=reference_mode, reference_image_id=self.reference_image_options.get(self.reference_image_var.get(), ""), reference_strength=float(self.reference_strength_var.get()), reference_crop_box=self.parse_reference_crop(), ip_adapter_id=str(self.root_dir / "models" / "ip_adapter"))
         except (TypeError, ValueError) as exc:
             messagebox.showerror("생성 설정 오류", str(exc))
             return
@@ -1919,7 +1920,7 @@ class CoverMorphApp(_CoverMorphWindow):
         if result is None or not result.failed_indices or self.project is None or scene is None:
             messagebox.showinfo("재시도", "재시도할 실패 또는 취소 후보가 없습니다.")
             return
-        config = GenerationConfig(model_id=self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL, output_ratio=self.generation_ratio_key(), candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()), reference_mode=self.reference_mode_key(), reference_image_id=self.reference_image_options.get(self.reference_image_var.get(), ""), reference_strength=float(self.reference_strength_var.get()), reference_crop_box=self.parse_reference_crop(), ip_adapter_id=str(self.root_dir / "models" / "ip_adapter"))
+        config = GenerationConfig(model_id=str(resolve_sdxl_model_path(self.root_dir, self.generation_model_var.get().strip() or DEFAULT_SDXL_MODEL)), output_ratio=self.generation_ratio_key(), candidate_count=max(1, int(self.generation_count_var.get())), seed=int(self.generation_seed_var.get()), steps=max(1, int(self.generation_steps_var.get())), guidance_scale=float(self.generation_guidance_var.get()), reference_mode=self.reference_mode_key(), reference_image_id=self.reference_image_options.get(self.reference_image_var.get(), ""), reference_strength=float(self.reference_strength_var.get()), reference_crop_box=self.parse_reference_crop(), ip_adapter_id=str(self.root_dir / "models" / "ip_adapter"))
         project_snapshot = self.project
         engine = SDXLTextToImageEngine(config.model_id, config.revision, config.local_files_only)
 

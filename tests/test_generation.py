@@ -21,6 +21,7 @@ from covermorph.generation import (
     detect_generation_environment,
     generate_scene_candidates,
     inspect_ip_adapter,
+    resolve_sdxl_model_path,
     retry_failed_candidates,
 )
 from covermorph.project import (
@@ -138,6 +139,14 @@ def test_cpu_environment_never_reports_generation_ready(tmp_path: Path, monkeypa
     environment = detect_generation_environment(tmp_path)
     assert environment["cuda"] is False
     assert environment["status"] in {"gpu_unavailable", "package_missing"}
+
+
+def test_default_model_id_reuses_prepared_app_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = Path("D:/covermorph-test-app")
+    prepared = app_root / "models" / "sdxl_base_1.0"
+    monkeypatch.setattr(Path, "is_dir", lambda path: path == prepared)
+    resolved = resolve_sdxl_model_path(app_root, "stabilityai/stable-diffusion-xl-base-1.0")
+    assert resolved == prepared.resolve()
 
 
 def test_reference_off_and_on_pass_the_expected_condition(tmp_path: Path) -> None:
