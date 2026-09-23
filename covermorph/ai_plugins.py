@@ -20,6 +20,7 @@ class AIBackends:
         self._lama = None
         self._sdxl = None
         self.last_outpaint_metrics: dict[str, object] = {}
+        self.last_outpaint_artifacts: dict[str, Image.Image] = {}
 
     def lama_available(self) -> bool:
         if self.lama_python() is not None:
@@ -229,6 +230,13 @@ class AIBackends:
         }
         cropped = result.crop((left, top, left + work.width, top + work.height))
         restored = cropped.resize(canvas.size, Image.Resampling.LANCZOS).convert("RGB")
+        self.last_outpaint_artifacts = {
+            "padded_generation": result.copy(),
+            "cropped_generation": cropped.copy(),
+            "restored_generation": restored.copy(),
+            "canvas": canvas.copy(),
+            "mask": mask.convert("L").copy(),
+        }
         return Image.composite(restored, canvas.convert("RGB"), mask.convert("L")), "SDXL Outpainting"
 
     def inpaint(self, img: Image.Image, mask: Image.Image) -> tuple[Image.Image, str]:
