@@ -29,10 +29,12 @@ from covermorph.project import (
     SceneCard,
     add_person,
     add_person_reference,
+    cover_plan_version,
     create_project,
     load_project,
     prepare_reference_image,
     save_project_atomic,
+    scene_from_approved_cover_plan,
 )
 
 
@@ -130,6 +132,110 @@ def test_retry_only_uses_failed_indexes(tmp_path: Path) -> None:
     assert retry_engine.seeds == [101]
     assert retry.completed == 1
     assert len(project.candidates) == 3
+
+
+def test_approved_plan_generation_round_trip_keeps_link_and_pending_adoption(tmp_path: Path) -> None:
+    plan = {
+        "plan_id": "approved-plan-1",
+        "user_decision": "approved_for_generation",
+        "scene_ko": "rainy window portrait",
+        "characters_action": "a woman looks outside",
+        "place_time_weather_season": "apartment, evening, rain",
+        "background_props": "window and city lights",
+        "composition_distance": "medium shot",
+        "brightness_color": "warm interior, cool exterior",
+        "image_prompt_en": "A woman beside a rainy window, cinematic, textless image",
+        "negative_prompt": "text, logo, watermark",
+        "title": {"main": "Test title", "source_type": "user"},
+        "related_input_ids": ["song-1"],
+    }
+    plan["generation_approval"] = {"approved": True, "card_version": cover_plan_version(plan)}
+    project = create_project(tmp_path / "project", "approved round trip")
+    project.cover_planning = {"result": {"plans": [plan]}}
+    scene = scene_from_approved_cover_plan(plan)
+    project.scenes.append(scene)
+
+    result = generate_scene_candidates(project, scene, FakeEngine(), GenerationConfig(candidate_count=1, seed=44), Event())
+    save_project_atomic(project)
+    loaded = load_project(project.project_file)
+
+    assert result.completed == 1
+    loaded_plan = loaded.cover_planning["result"]["plans"][0]
+    assert loaded_plan["generation_approval"]["card_version"] == cover_plan_version(loaded_plan)
+    candidate = loaded.candidates[0]
+    assert candidate.generation_metadata["cover_plan_id"] == plan["plan_id"]
+    assert candidate.generation_metadata["cover_plan_version"] == cover_plan_version(plan)
+    assert candidate.generation_status == "succeeded"
+    assert candidate.user_approval_status == "pending"
+    assert candidate.working_source_approved is False
+    assert candidate.working_source_path == ""
+
+
+def test_failed_and_cancelled_runs_preserve_existing_completed_candidate(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "preserve completed")
+    scene = confirmed_scene()
+    baseline = generate_scene_candidates(project, scene, FakeEngine(), GenerationConfig(candidate_count=1, seed=10), Event())
+    assert baseline.completed == 1
+    candidate = project.candidates[0]
+    original_path = project.project_dir / candidate.original_path
+    original_bytes = original_path.read_bytes()
+
+    failed = generate_scene_candidates(project, scene, FakeEngine({20}), GenerationConfig(candidate_count=1, seed=20), Event())
+    cancelled = generate_scene_candidates(project, scene, FakeEngine(cancel_after=0), GenerationConfig(candidate_count=1, seed=30), Event())
+    save_project_atomic(project)
+    loaded = load_project(project.project_file)
+
+    assert failed.failed == 1 and failed.completed == 0
+    assert cancelled.cancelled is True and cancelled.completed == 0
+    assert len(loaded.candidates) == 1
+    assert loaded.candidates[0].candidate_id == candidate.candidate_id
+    assert original_path.read_bytes() == original_bytes
+    assert loaded.candidates[0].working_source_approved is False
+
+
+def test_gui_card_edit_clears_previous_generation_approval() -> None:
+    from types import SimpleNamespace
+
+    from covermorph.gui import CoverMorphApp
+
+    class TextWidget:
+        def __init__(self, value: str):
+            self.value = value
+
+        def get(self, *_args: object) -> str:
+            return self.value
+
+    plan = {
+        "plan_id": "plan-edit",
+        "scene_ko": "old scene",
+        "image_prompt_en": "old prompt",
+        "negative_prompt": "old negative",
+        "title": {"main": "old title"},
+        "user_decision": "approved_for_generation",
+        "generation_approval": {"approved": True, "card_version": "old-version"},
+    }
+    status = SimpleNamespace(configure=lambda **_kwargs: None)
+    app = SimpleNamespace(
+        project=SimpleNamespace(cover_planning={"result": {"plans": [plan]}}),
+        planning_card_widgets={
+            "plan-edit": {
+                "scene": TextWidget("edited scene"),
+                "title": TextWidget("edited title"),
+                "prompt": TextWidget("edited prompt"),
+                "negative": TextWidget("edited negative"),
+                "conditions": TextWidget(""),
+            }
+        },
+        mark_project_dirty=lambda: None,
+        render_planning_cards=lambda: None,
+        status=status,
+    )
+
+    CoverMorphApp.save_plan_edits(app, "plan-edit")
+
+    assert plan["image_prompt_en"] == "edited prompt"
+    assert plan["user_decision"] == "unreviewed"
+    assert plan["generation_approval"]["approved"] is False
 
 
 def test_cpu_environment_never_reports_generation_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
