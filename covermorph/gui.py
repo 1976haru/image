@@ -3008,7 +3008,8 @@ class CoverMorphApp(_CoverMorphWindow):
                 return self.ai.inpaint(img, mask_pil_from_boxes(img.size, boxes))
             except Exception as exc:
                 write_exception(self.root_dir, "LaMa preview fallback", exc)
-        return inpaint_text_opencv(img, boxes), "OpenCV NS/Telea (quality selected)"
+                return img.copy(), "LaMa failed; original kept"
+        return inpaint_text_opencv(img, boxes), "OpenCV NS/Telea (explicit simple restore)"
 
     def preview_remove(self) -> None:
         state = self.current_state()

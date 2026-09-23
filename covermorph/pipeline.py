@@ -318,7 +318,11 @@ def _detect_and_remove_text(
             return clean, boxes, errors
         except Exception as exc:
             write_exception(root, "LaMa fallback", exc)
-            errors.append(_error("lama_failed", "LaMa failed; OpenCV fallback was used.", str(exc)))
+            errors.append(_error("lama_failed", "LaMa 복원이 실패해 원본을 유지했습니다. OpenCV로 자동 대체하지 않았습니다.", str(exc)))
+            metadata["text_removal_engine"] = "LaMa failed; original kept"
+            metadata["inpaint_engine"] = "LaMa failed; original kept"
+            metadata["text_removal_status"] = "failed_original_kept"
+            return img.copy(), boxes, errors
 
     try:
         clean = inpaint_text_opencv(img, boxes)
@@ -430,6 +434,7 @@ def _outpaint_or_fallback(
     kind: str,
     size: tuple[int, int],
     anchor: str,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[Image.Image, str, list[dict[str, str]], str]:
     errors: list[dict[str, str]] = []
     person_engine = "Disabled" if not options.protect_person else "Pending"
@@ -478,6 +483,9 @@ def _outpaint_or_fallback(
             options.outpaint_prompt.strip() or DEFAULT_OUTPAINT_PROMPT,
             NEGATIVE_OUTPAINT_PROMPT,
         )
+        metrics = getattr(ai, "last_outpaint_metrics", None)
+        if metrics and metadata is not None:
+            metadata.setdefault("ai_extension_metrics", {})[kind] = dict(metrics)
         return restore_protected_pixels(generated, protect), f"{engine} + {person_engine}", errors, person_engine
     except OutputEngineFailure:
         raise
@@ -718,6 +726,7 @@ def process_image_file(
                 "thumbnail",
                 thumb_size,
                 preset.person_anchor_16x9,
+                metadata,
             )
             metadata["thumbnail_16x9_engine"] = engine
             metadata["actual_extension_engines"]["thumbnail_16x9"] = engine
@@ -772,6 +781,7 @@ def process_image_file(
                 "shorts",
                 (1080, 1920),
                 preset.person_anchor_9x16,
+                metadata,
             )
             metadata["shorts_9x16_engine"] = engine
             metadata["actual_extension_engines"]["shorts_9x16"] = engine

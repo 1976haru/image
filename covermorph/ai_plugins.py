@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 from PIL import Image
@@ -15,9 +16,10 @@ SDXL_INPAINT_MODEL_REVISION = "main"
 
 class AIBackends:
     def __init__(self, app_root: Path):
-        self.app_root = app_root
+        self.app_root = app_root.resolve()
         self._lama = None
         self._sdxl = None
+        self.last_outpaint_metrics: dict[str, object] = {}
 
     def lama_available(self) -> bool:
         if self.lama_python() is not None:
@@ -30,10 +32,12 @@ class AIBackends:
             return False
 
     def lama_python(self) -> Path | None:
-        for relative in (".venv_lama/Scripts/python.exe", ".venv_lama/bin/python"):
-            candidate = self.app_root / relative
-            if candidate.is_file() and (self.app_root / ".venv_lama/READY").is_file():
-                return candidate
+        roots = [self.app_root, self.app_root.parent / "image_github", self.app_root.parent]
+        for root in roots:
+            for relative in (".venv_lama/Scripts/python.exe", ".venv_lama/bin/python"):
+                candidate = root / relative
+                if candidate.is_file() and (candidate.parent.parent.parent / ".venv_lama/READY").is_file():
+                    return candidate
         return None
 
     def _runtime_roots(self) -> list[Path]:
@@ -214,6 +218,15 @@ class AIBackends:
                 "SDXL returned unexpected dimensions; "
                 f"expected latent {(side, side)} after square padding, got {result.size}; output rejected"
             )
+        self.last_outpaint_metrics = {
+            "model_path": str(self.sdxl_inpaint_model_path() if model_id is None else model_id),
+            "device": str(getattr(pipe, "device", "cpu")),
+            "canvas_size": list(canvas.size),
+            "requested_work_size": list(work_size),
+            "latent_inference_size": [side, side],
+            "returned_size": list(result.size),
+            "padding": {"left": left, "top": top, "right": side - (left + work.width), "bottom": side - (top + work.height)},
+        }
         cropped = result.crop((left, top, left + work.width, top + work.height))
         restored = cropped.resize(canvas.size, Image.Resampling.LANCZOS).convert("RGB")
         return Image.composite(restored, canvas.convert("RGB"), mask.convert("L")), "SDXL Outpainting"
@@ -223,7 +236,15 @@ class AIBackends:
             raise ValueError("Restoration mask size differs from source")
         isolated = self.lama_python()
         if isolated is not None:
-            with tempfile.TemporaryDirectory(prefix="covermorph_lama_") as directory:
+            # Windows sandboxed TEMP can create ACL-locked 0700 folders.
+            # Keep the isolated worker's transient files under the writable
+            # application workspace instead, and remove them after the run.
+            work_root = self.app_root / ".covermorph_tmp" / "lama"
+            work_root.mkdir(parents=True, exist_ok=True)
+            run_dir = work_root / f"run_{uuid.uuid4().hex}"
+            run_dir.mkdir(parents=True, exist_ok=False)
+            directory = str(run_dir)
+            try:
                 path = Path(directory)
                 img.convert("RGB").save(path / "input.png")
                 mask.convert("L").save(path / "mask.png")
@@ -238,7 +259,15 @@ class AIBackends:
                     raise RuntimeError((proc.stderr or proc.stdout or "LaMa failed")[-2000:])
                 with Image.open(path / "output.png") as opened:
                     result = opened.convert("RGB")
+                if result.size != img.size:
+                    source_ratio = img.width / max(1, img.height)
+                    result_ratio = result.width / max(1, result.height)
+                    if abs(source_ratio - result_ratio) > 0.01:
+                        raise ValueError(f"LaMa changed aspect ratio from {img.size} to {result.size}; output rejected")
+                    result = result.resize(img.size, Image.Resampling.LANCZOS)
                 return self.merge_restoration(img, result, mask), "LaMa isolated"
+            finally:
+                shutil.rmtree(run_dir, ignore_errors=True)
         if not self.lama_available():
             raise RuntimeError("LaMa unavailable")
         from simple_lama_inpainting import SimpleLama
@@ -246,6 +275,12 @@ class AIBackends:
         if self._lama is None:
             self._lama = SimpleLama()
         result = self._lama(img.convert("RGB"), mask.convert("L"))
+        if result.size != img.size:
+            source_ratio = img.width / max(1, img.height)
+            result_ratio = result.width / max(1, result.height)
+            if abs(source_ratio - result_ratio) > 0.01:
+                raise ValueError(f"LaMa changed aspect ratio from {img.size} to {result.size}; output rejected")
+            result = result.resize(img.size, Image.Resampling.LANCZOS)
         return self.merge_restoration(img, result, mask), "LaMa"
 
     @staticmethod
