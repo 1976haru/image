@@ -566,7 +566,10 @@ def build_full_frame_outpaint_canvas(
         )
         if protected_rect[2] > protected_rect[0] and protected_rect[3] > protected_rect[1]:
             gen_mask.paste(0, protected_rect)
-        gen_mask = gen_mask.filter(ImageFilter.GaussianBlur(max(5, safe // 2)))
+    # Give SDXL a wider transition zone at the protected foreground boundary.
+    # A narrow 9px feather left a visible hard seam between generated and
+    # protected pixels in the outpaint result.
+    gen_mask = gen_mask.filter(ImageFilter.GaussianBlur(max(8, safe * 3)))
     return base, gen_mask, protect
 
 
