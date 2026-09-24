@@ -267,12 +267,7 @@ class AIBackends:
                     raise RuntimeError((proc.stderr or proc.stdout or "LaMa failed")[-2000:])
                 with Image.open(path / "output.png") as opened:
                     result = opened.convert("RGB")
-                if result.size != img.size:
-                    source_ratio = img.width / max(1, img.height)
-                    result_ratio = result.width / max(1, result.height)
-                    if abs(source_ratio - result_ratio) > 0.01:
-                        raise ValueError(f"LaMa changed aspect ratio from {img.size} to {result.size}; output rejected")
-                    result = result.resize(img.size, Image.Resampling.LANCZOS)
+                result = self._restore_lama_size(result, img.size)
                 return self.merge_restoration(img, result, mask), "LaMa isolated"
             finally:
                 shutil.rmtree(run_dir, ignore_errors=True)
@@ -283,13 +278,23 @@ class AIBackends:
         if self._lama is None:
             self._lama = SimpleLama()
         result = self._lama(img.convert("RGB"), mask.convert("L"))
-        if result.size != img.size:
-            source_ratio = img.width / max(1, img.height)
-            result_ratio = result.width / max(1, result.height)
-            if abs(source_ratio - result_ratio) > 0.01:
-                raise ValueError(f"LaMa changed aspect ratio from {img.size} to {result.size}; output rejected")
-            result = result.resize(img.size, Image.Resampling.LANCZOS)
+        result = self._restore_lama_size(result, img.size)
         return self.merge_restoration(img, result, mask), "LaMa"
+
+    @staticmethod
+    def _restore_lama_size(result: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+        """Undo simple_lama right/bottom modulo padding without resampling."""
+        if result.size == target_size:
+            return result
+        extra_w = result.width - target_size[0]
+        extra_h = result.height - target_size[1]
+        if 0 <= extra_w < 8 and 0 <= extra_h < 8:
+            return result.crop((0, 0, target_size[0], target_size[1]))
+        source_ratio = target_size[0] / max(1, target_size[1])
+        result_ratio = result.width / max(1, result.height)
+        if abs(source_ratio - result_ratio) > 0.01:
+            raise ValueError(f"LaMa changed aspect ratio from {target_size} to {result.size}; output rejected")
+        raise ValueError(f"LaMa returned unsupported dimensions {result.size}; expected {target_size} or right/bottom padding")
 
     @staticmethod
     def merge_restoration(img: Image.Image, result: Image.Image, mask: Image.Image) -> Image.Image:
