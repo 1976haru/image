@@ -744,6 +744,7 @@ class QuickCoverApp(ctk.CTk):
             )
         elif phase == "candidate_done":
             complete = min(self.task.requested, self.task.completed + 1)
+            inherited_edit = self.current_edit()
             self.task.update(
                 job_id,
                 "저장",
@@ -757,6 +758,7 @@ class QuickCoverApp(ctk.CTk):
                 (item for item in self.project.candidates if item.candidate_id == candidate_id), None
             )
             if completed_candidate is not None:
+                save_candidate_edit(self.project, completed_candidate, inherited_edit)
                 self.select_candidate(completed_candidate)
             self.autosave()
 
