@@ -134,6 +134,42 @@ def test_retry_only_uses_failed_indexes(tmp_path: Path) -> None:
     assert len(project.candidates) == 3
 
 
+def test_five_candidate_cancel_then_retry_preserves_completed_candidates(tmp_path: Path) -> None:
+    project = create_project(tmp_path / "project", "cancel-five")
+    scene = confirmed_scene()
+    config = GenerationConfig(candidate_count=5, seed=500)
+    cancelled = generate_scene_candidates(
+        project,
+        scene,
+        FakeEngine(cancel_after=2),
+        config,
+        Event(),
+    )
+    original_ids = [candidate.candidate_id for candidate in project.candidates]
+    assert cancelled.cancelled is True
+    assert cancelled.completed == 2
+    assert cancelled.failed_indices == [2, 3, 4]
+
+    retried = retry_failed_candidates(
+        project,
+        scene,
+        FakeEngine(),
+        config,
+        cancelled.failed_indices,
+        Event(),
+    )
+    assert retried.completed == 3
+    assert [candidate.candidate_id for candidate in project.candidates[:2]] == original_ids
+    assert len(project.candidates) == 5
+    assert [candidate.generation_metadata["seed"] for candidate in project.candidates] == [
+        500,
+        501,
+        502,
+        503,
+        504,
+    ]
+
+
 def test_approved_plan_generation_round_trip_keeps_link_and_pending_adoption(tmp_path: Path) -> None:
     plan = {
         "plan_id": "approved-plan-1",

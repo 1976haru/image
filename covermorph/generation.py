@@ -818,6 +818,8 @@ def generate_scene_candidates(
             snapshot["outcomes"].append({"index": index, "status": "generated", "reference_applied": actual_reference_applied, "variation": variation})
             result.candidate_ids.append(candidate.candidate_id)
             result.completed += 1
+            # A later cancellation or interruption must not discard a completed candidate.
+            save_project_atomic(project)
             if progress:
                 progress({"phase": "candidate_done", "scene_id": scene.scene_id, "candidate": index + 1, "total": config.candidate_count, "candidate_id": candidate.candidate_id})
         except GenerationCancelled as exc:
@@ -863,6 +865,7 @@ def generate_scene_candidates(
     snapshot["reference"]["generation_status"] = snapshot["generation_status"]
     snapshot["reference"]["failure_reason"] = snapshot["failure_reason"]
     snapshot["loaded_revision"] = getattr(engine, "loaded_revision", None) or config.revision or "model-default"
+    save_project_atomic(project)
     return result
 
 

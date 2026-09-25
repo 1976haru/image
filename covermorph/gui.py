@@ -772,6 +772,13 @@ class CoverMorphApp(_CoverMorphWindow):
         self.outpaint_prompt.insert("1.0", DEFAULT_OUTPAINT_PROMPT)
 
     def build_ai_group(self, parent: Any) -> None:
+        ctk.CTkLabel(
+            parent,
+            text="기존 커버 글자 제거·AI 확장 — 시험 기능: 결과 확인 필요",
+            wraplength=350,
+            justify="left",
+            text_color="#fbbf24",
+        ).pack(fill="x", padx=20, pady=(4, 0))
         frame = self.group(parent, "7. AI 엔진")
         self.prefer_esrgan_check = ctk.CTkCheckBox(
             frame,

@@ -88,12 +88,12 @@ def test_output_sizes() -> None:
     assert make_fit_original(img, (1920, 1080)).size == (1920, 1080)
 
 
-def test_preview_renderer_is_shared_geometry_for_saved_formats() -> None:
+def test_preview_renderer_is_shared_geometry_for_saved_formats(tmp_path: Path) -> None:
     img = sample_image()
     preset = PRESETS["OldPopLounge"]
     for kind, size in (("thumbnail", (1920, 1080)), ("shorts", (1080, 1920))):
         preview, _ = render_full_frame_format(img, size, preset, kind, mode="natural")
-        saved_path = Path(".pytest_tmp") / f"{kind}_shared.jpg"
+        saved_path = tmp_path / f"{kind}_shared.jpg"
         save_jpg(preview, saved_path)
         with Image.open(saved_path) as saved:
             assert saved.size == preview.size

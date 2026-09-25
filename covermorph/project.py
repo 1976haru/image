@@ -726,6 +726,14 @@ def parse_input_file_detailed(path: Path, field_mapping: dict[str, str] | None =
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ProjectLoadError(f"Input JSON is damaged: {path} (line {exc.lineno}, column {exc.colno})") from exc
+    cover_text = {"title": "", "subtitle": "", "label": ""}
+    if isinstance(data, dict):
+        for target, aliases in {
+            "title": ("album_title", "albumTitle", "release_title"),
+            "subtitle": ("album_subtitle", "albumSubtitle", "subtitle"),
+            "label": ("channel_name", "channelName", "label", "record_label"),
+        }.items():
+            cover_text[target] = _json_field_value(data, aliases)
     collection_key = "root"
     items: Any = data
     if isinstance(data, dict):
@@ -740,7 +748,7 @@ def parse_input_file_detailed(path: Path, field_mapping: dict[str, str] | None =
     if not isinstance(items, list) or not items or not all(isinstance(item, dict) for item in items):
         available = sorted(data.keys()) if isinstance(data, dict) else []
         if isinstance(data, dict):
-            return {"records": [], "available_fields": available, "field_mapping": {}, "needs_mapping": True, "collection_key": collection_key, "source_path": str(path)}
+            return {"records": [], "available_fields": available, "field_mapping": {}, "needs_mapping": True, "collection_key": collection_key, "source_path": str(path), "cover_text": cover_text}
         raise ProjectLoadError(f"Unknown JSON input structure: {path}; choose a song-list and field mapping")
     available_fields = sorted({str(key) for item in items for key in item})
     mapping = dict(field_mapping or {})
@@ -756,7 +764,7 @@ def parse_input_file_detailed(path: Path, field_mapping: dict[str, str] | None =
             mapping[target] = next((name for name in names if name in available_fields), "")
     needs_mapping = not any(mapping.get(key) for key in ("title", "lyrics", "image_prompt", "theme_mood", "music_prompt"))
     if needs_mapping:
-        return {"records": [], "available_fields": available_fields, "field_mapping": mapping, "needs_mapping": True, "collection_key": collection_key, "source_path": str(path)}
+        return {"records": [], "available_fields": available_fields, "field_mapping": mapping, "needs_mapping": True, "collection_key": collection_key, "source_path": str(path), "cover_text": cover_text}
     records = []
     for index, item in enumerate(items, start=1):
         title = _json_field_value(item, (mapping.get("title", ""),)) or f"{path.stem} {index}"
@@ -765,7 +773,7 @@ def parse_input_file_detailed(path: Path, field_mapping: dict[str, str] | None =
         mood = _json_field_value(item, (mapping.get("theme_mood", ""),))
         music_prompt = _json_field_value(item, (mapping.get("music_prompt", ""),))
         records.append(InputRecord(new_id("input"), "lyrics", title, lyrics=lyrics, image_prompt=image_prompt, theme_mood=mood, music_prompt=music_prompt, source_path=str(path)))
-    return {"records": records, "available_fields": available_fields, "field_mapping": mapping, "needs_mapping": False, "collection_key": collection_key, "source_path": str(path)}
+    return {"records": records, "available_fields": available_fields, "field_mapping": mapping, "needs_mapping": False, "collection_key": collection_key, "source_path": str(path), "cover_text": cover_text}
 
 
 def parse_input_file(path: Path) -> list[InputRecord]:
