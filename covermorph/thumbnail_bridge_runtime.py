@@ -59,7 +59,11 @@ def _log(message: str) -> None:
 
 # ------------------------------------------------------------------ environment / models
 def resolve_models_dir(request: ThumbnailBridgeRequest) -> Path:
-    configured = str(request.options.get("models_dir") or os.environ.get("COVERMORPH_MODELS_DIR") or "")
+    """options.models_dir > COVERMORPH_MODELS_DIR > folder saved in the app's AI 이미지 스튜디오 settings."""
+    from .creator_settings import load_creator_settings
+
+    configured = str(request.options.get("models_dir") or os.environ.get("COVERMORPH_MODELS_DIR")
+                     or load_creator_settings(_app_root()).get("models_dir") or "")
     return Path(configured).expanduser() if configured else _app_root() / "models"
 
 

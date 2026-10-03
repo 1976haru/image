@@ -297,6 +297,57 @@ def ascii_file(path: Path) -> Path:
     return path if str(path).isascii() else ascii_dir(path.parent) / path.name
 
 
+# ------------------------------------------------------------------ one diffusion engine per machine
+class EngineLock:
+    """Machine-wide lock (a locked file under the ASCII work folder) so the studio queue and a youtubesum
+    bridge call never run two diffusion engines at the same time. Waits while another process holds it."""
+
+    def __init__(self, cancel: Event | None = None, on_wait: Callable[[str], None] | None = None):
+        self.cancel = cancel
+        self.on_wait = on_wait
+        self._handle = None
+
+    def acquire(self) -> None:
+        import msvcrt
+        path = ascii_work_root() / "engine.lock"
+        handle = open(path, "a+b")
+        announced = False
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                self._handle = handle
+                return
+            except OSError:
+                if not announced and self.on_wait:
+                    self.on_wait("다른 작업이 GPU 엔진을 사용 중 — 대기")
+                    announced = True
+                if self.cancel is not None and self.cancel.wait(0.5):
+                    handle.close()
+                    raise EngineCancelled("Cancelled while waiting for the GPU engine.")
+                if self.cancel is None:
+                    time.sleep(0.5)
+
+    def release(self) -> None:
+        if self._handle is not None:
+            import msvcrt
+            try:
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            self._handle.close()
+            self._handle = None
+
+    def __enter__(self) -> "EngineLock":
+        if os.name == "nt":
+            self.acquire()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
+
 def default_sdcpp_dir(models_dir: Path) -> Path:
     return Path(os.environ.get("COVERMORPH_SDCPP_DIR") or Path(models_dir) / "quality_v2" / "sdcpp")
 
@@ -361,7 +412,8 @@ class SdCppBackend(ImageBackend):
             before = resource_snapshot()
             started = time.perf_counter()
             lines: list[str] = []
-            with VramSampler() as sampler:
+            wait_note = (lambda text: progress({"phase": "waiting", "message": text})) if progress else None
+            with EngineLock(cancel, wait_note), VramSampler() as sampler:
                 self._process = subprocess.Popen(
                     command, cwd=str(self.sdcpp_dir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding="utf-8", errors="replace",
@@ -458,12 +510,16 @@ class RealVisDiffusersBackend(ImageBackend):
         super().__init__(models_dir)
         self.memory_profile = memory_profile
         self.engine: Any = None
+        self._lock: EngineLock | None = None  # held from load until unload: the pipeline stays resident
 
     def required_files(self) -> dict[str, Path]:
         return {"checkpoint": self.models_dir / "realvisxl_v5.0"}
 
     def _engine(self) -> Any:
         if self.engine is None:
+            if self._lock is None and os.name == "nt":
+                self._lock = EngineLock()
+                self._lock.acquire()
             from .generation import SDXLTextToImageEngine
             from .person_quality import MODEL_PROFILES
             from .thumbnail_bridge_ai import MEMORY_PROFILES
@@ -514,6 +570,9 @@ class RealVisDiffusersBackend(ImageBackend):
         if self.engine is not None:
             self.engine.unload()
             self.engine = None
+        if self._lock is not None:
+            self._lock.release()
+            self._lock = None
 
 
 BACKENDS: dict[str, type[ImageBackend]] = {

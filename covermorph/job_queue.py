@@ -104,6 +104,24 @@ class JobQueue:
             self.save()
             return count
 
+    def remove(self, job_ids: list[str]) -> int:
+        """Delete jobs that are not running (pending/cancelled/failed/done)."""
+        with self._lock:
+            before = len(self.jobs)
+            self.jobs = [job for job in self.jobs if job.id not in job_ids or job.state == RUNNING]
+            self.save()
+            return before - len(self.jobs)
+
+    def retry(self, job_id: str) -> bool:
+        """Put a failed/cancelled job back in the queue."""
+        with self._lock:
+            job = self.get(job_id)
+            if job is None or job.state not in (FAILED, CANCELLED):
+                return False
+            job.state, job.error, job.started, job.finished, job.result = PENDING, "", None, None, None
+            self.save()
+            return True
+
     def pause_after_current(self) -> None:
         with self._lock:
             self.paused = True

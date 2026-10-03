@@ -263,6 +263,9 @@ def test_low_memory_shrinks_wide_shopify_generation():
     final, work = qm._generation_size("shopify_hero_banner", "interactive_low_memory")
     assert final == (1792, 768) and work[0] * work[1] <= qm.LOW_MEMORY_MAX_PIXELS and work[0] % 16 == 0
     assert qm._generation_size("shopify_hero_banner", "night_best") == ((1792, 768), (1792, 768))
+    final, work = qm._generation_size("x", "interactive_low_memory", (1600, 1200))
+    assert final == (1600, 1200) and work[0] % 16 == 0 and work[1] % 16 == 0
+    assert abs(work[0] / work[1] - 4 / 3) < 0.03 and work[0] * work[1] <= qm.LOW_MEMORY_MAX_PIXELS
     assert qm._generation_size("youtube_thumbnail_background", "interactive_low_memory")[1] == (1280, 720)
 
 

@@ -39,9 +39,11 @@ QUALITY_MODES_V2: dict[str, dict[str, list[tuple[str, int]]]] = {
 }
 # Memory profile chosen per mode unless the caller asks for one.
 MODE_MEMORY = {"preview": "interactive_low_memory", "balanced": "interactive_low_memory", "best": "night_best"}
-# In low-memory mode, generations wider than this are made at a reduced size and upscaled (Lanczos):
-# 1792x768 peaked at 10.4 GiB, 1280x720 at 7.3 GiB on the RTX 3060.
+# Generation pixel budget per memory profile; larger canvases are generated at the same aspect ratio and
+# Lanczos-upscaled. Measured on the RTX 3060: 1280x720 peaked at 7.3 GiB, 1792x768 (1.38 MP) at 10.4 GiB.
 LOW_MEMORY_MAX_PIXELS = 1280 * 768
+MAX_GENERATION_PIXELS = {"interactive_low_memory": LOW_MEMORY_MAX_PIXELS, "balanced_idle": 1_150_000,
+                         "night_best": 1_400_000}
 
 
 def plan_engines(mode: str, *, has_references: bool, edit: bool = False,
@@ -60,12 +62,14 @@ def plan_engines(mode: str, *, has_references: bool, edit: bool = False,
     return plan
 
 
-def _generation_size(purpose: str, memory_profile: str) -> tuple[tuple[int, int], tuple[int, int]]:
-    final = PURPOSES[purpose]["size"]
-    if memory_profile != "interactive_low_memory" or final[0] * final[1] <= LOW_MEMORY_MAX_PIXELS:
-        return final, final
-    scale = (LOW_MEMORY_MAX_PIXELS / (final[0] * final[1])) ** 0.5
-    return final, (int(final[0] * scale) // 16 * 16, int(final[1] * scale) // 16 * 16)
+def _generation_size(purpose: str, memory_profile: str,
+                     canvas: tuple[int, int] | None = None) -> tuple[tuple[int, int], tuple[int, int]]:
+    """(final canvas, engine size): engine size keeps the aspect, is a multiple of 16 and fits the budget."""
+    final = tuple(int(v) for v in canvas) if canvas else PURPOSES[purpose]["size"]
+    budget = MAX_GENERATION_PIXELS.get(memory_profile, LOW_MEMORY_MAX_PIXELS)
+    scale = min(1.0, (budget / (final[0] * final[1])) ** 0.5)
+    work = (max(256, int(final[0] * scale) // 16 * 16), max(256, int(final[1] * scale) // 16 * 16))
+    return final, work
 
 
 def score_candidate(qa: dict[str, Any], people: int) -> float:
@@ -121,7 +125,7 @@ def run_quality_job(payload: dict[str, Any], cancel: Event | None = None,
         plan = [(engine, min(count, int(payload["max_candidates_per_engine"]))) for engine, count in plan]
     if not plan:
         raise EngineError("No image engine is installed for this request (edit needs FLUX.2-klein).")
-    final_size, work_size = _generation_size(purpose, memory_profile)
+    final_size, work_size = _generation_size(purpose, memory_profile, payload.get("canvas"))
     yunet = models_dir / "face_detection" / YUNET_FILENAME
     candidates: list[dict[str, Any]] = []
     warnings: list[str] = list(warnings_from_translation)

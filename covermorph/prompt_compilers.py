@@ -124,12 +124,16 @@ def compile_zimage(user_prompt: str, channel: str = "", purpose: str = "youtube_
 
 
 ROLE_INSTRUCTIONS = {
-    "PERSON": "keep the same person from image {i}: same face, hairstyle and clothing",
-    "PRODUCT": "use the exact product from image {i}, preserving its shape, colors, materials and logo",
-    "STYLE": "match the color palette, lighting and photographic style of image {i}",
-    "COMPOSITION": "follow the subject placement and framing of image {i}",
-    "BACKGROUND": "use the location and background of image {i}",
-    "EDIT": "image {i} is the photo being edited: keep its people exactly as they are, with the same faces, hair, clothes and poses",
+    "PERSON": "keep the same person from image {i}: same face, hairstyle, clothing and pose unless this prompt "
+              "changes them",
+    "PRODUCT": "use the exact product from image {i}, preserving its shape, material, color, packaging and visible "
+               "branding",
+    "STYLE": "take only the lighting, color palette and mood from image {i}, not its subjects or layout",
+    "COMPOSITION": "follow the subject placement and negative space of image {i}, not the identity of anything in it",
+    "BACKGROUND": "use the environment of image {i} as inspiration for the setting, without copying its foreground "
+                  "subjects",
+    "EDIT": "image {i} is the photo being edited: keep its people exactly as they are, with the same faces, "
+            "hair, clothes and poses",
 }
 
 
