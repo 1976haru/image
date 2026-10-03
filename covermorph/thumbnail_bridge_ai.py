@@ -61,7 +61,9 @@ SCENE_TERMS = {
     "네온": "neon lights", "ネオン": "neon lights", "레트로": "retro", "レトロ": "retro",
     "쇼와": "Showa era", "昭和": "Showa era", "우산": "umbrella", "傘": "umbrella",
     "두 사람": "two people", "二人": "two people", "커플": "couple", "カップル": "couple",
-    "남자": "man", "男性": "man", "여자": "woman", "女性": "woman", "재즈": "jazz lounge", "ジャズ": "jazz lounge",
+    "남자": "man", "男性": "man", "남성": "man", "여자": "woman", "女性": "woman", "여성": "woman",
+    "젊은": "young", "若い": "young", "옆모습": "side profile", "横顔": "side profile",
+    "중년": "middle-aged", "中年": "middle-aged", "재즈": "jazz lounge", "ジャズ": "jazz lounge",
 }
 _CJK = re.compile(r"[ᄀ-ᇿ぀-ヿ㄰-㆏㐀-鿿가-힯ｦ-ﾟ]")
 

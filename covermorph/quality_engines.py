@@ -241,6 +241,61 @@ class ImageBackend:
         """Release models. Subprocess backends hold nothing between jobs."""
 
 
+# ------------------------------------------------------------------ ASCII paths for sd-cli
+# sd-cli opens model/image files with narrow-char APIs: a Korean/Japanese folder name makes it report
+# "file not found" (measured 2026-10-04). Non-ASCII folders are handed to it via their 8.3 short name or,
+# when short names are disabled, an ASCII directory junction (no admin rights needed, target untouched).
+def _short_path(path: Path) -> str | None:
+    if os.name != "nt":
+        return None
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+    return buffer.value if 0 < length < len(buffer) else None
+
+
+def ascii_work_root() -> Path:
+    candidates = [os.environ.get("COVERMORPH_ASCII_WORKDIR"), os.environ.get("LOCALAPPDATA"),
+                  os.environ.get("PUBLIC"), os.environ.get("ProgramData"), tempfile.gettempdir()]
+    for base in filter(None, candidates):
+        root = Path(base) / "CoverMorph" / "sdcpp"
+        if not str(root).isascii():
+            continue
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            return root
+        except OSError:
+            continue
+    raise EngineError("No writable ASCII-only folder for stable-diffusion.cpp; set COVERMORPH_ASCII_WORKDIR.")
+
+
+def ascii_dir(path: Path) -> Path:
+    """An ASCII-only path to the same existing directory."""
+    path = Path(path)
+    if str(path).isascii():
+        return path
+    short = _short_path(path)
+    if short and short.isascii():
+        return Path(short)
+    import hashlib
+    link = ascii_work_root() / "links" / hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+    if not link.exists():
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(link):  # stale junction whose target moved: rmdir removes only the link
+            subprocess.run(["cmd", "/c", "rmdir", str(link)], capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(path)], capture_output=True,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if done.returncode != 0 or not link.exists():
+            raise EngineError(f"Could not create an ASCII junction for {path}; move the models to an ASCII folder "
+                              "or set COVERMORPH_ASCII_WORKDIR.")
+    return link
+
+
+def ascii_file(path: Path) -> Path:
+    path = Path(path)
+    return path if str(path).isascii() else ascii_dir(path.parent) / path.name
+
+
 def default_sdcpp_dir(models_dir: Path) -> Path:
     return Path(os.environ.get("COVERMORPH_SDCPP_DIR") or Path(models_dir) / "quality_v2" / "sdcpp")
 
@@ -269,8 +324,8 @@ class SdCppBackend(ImageBackend):
 
     def build_command(self, job: EngineJob, output: Path, reference_paths: list[Path] | None = None) -> list[str]:
         files = self.required_files()
-        command = [str(files["sd_cli"]), "--diffusion-model", str(files["diffusion_model"]), "--vae", str(files["vae"]),
-                   "--llm", str(files["llm"]), "-p", job.prompt, "-W", str(job.width), "-H", str(job.height),
+        command = [str(files["sd_cli"]), "--diffusion-model", str(ascii_file(files["diffusion_model"])),
+                   "--vae", str(ascii_file(files["vae"])), "--llm", str(ascii_file(files["llm"])), "-p", job.prompt, "-W", str(job.width), "-H", str(job.height),
                    "--steps", str(job.steps or self.info.default_steps),
                    "--cfg-scale", str(job.guidance if job.guidance is not None else self.info.default_guidance),
                    "-s", str(job.seed), "-o", str(output), "--diffusion-fa", *self.extra_args]
@@ -298,7 +353,8 @@ class SdCppBackend(ImageBackend):
     def _run(self, job: EngineJob, cancel: Event | None, progress: Callable[[dict[str, Any]], None] | None) -> EngineResult:
         self.prepare()
         cancel = cancel or Event()
-        with tempfile.TemporaryDirectory(prefix="covermorph_sdcpp_") as tmp:
+        temp_parent = None if tempfile.gettempdir().isascii() else ascii_work_root()
+        with tempfile.TemporaryDirectory(prefix="covermorph_sdcpp_", dir=temp_parent) as tmp:
             output = Path(tmp) / "out.png"
             command = self.build_command(job, output, self._stage_references(job, Path(tmp)))
             before = resource_snapshot()

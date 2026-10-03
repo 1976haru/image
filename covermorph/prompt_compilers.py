@@ -68,9 +68,24 @@ def _negative_space(text_side: str, person: bool = True) -> str:
     return "Leave a calm, uncluttered area of the frame for a large title."
 
 
+_NO_PEOPLE_WORDS = ("no people", "no person", "nobody", "no one", "without people", "empty of people", "unpeopled",
+                    "사람 없", "사람없", "인물 없", "無人", "人がいない", "人のいない", "誰もいない")
+
+
 def _scene(user_prompt: str) -> tuple[str, list[str]]:
+    """Qwen3-based engines read Korean/Japanese natively: keep the user's words, add English terms as a hint.
+
+    (The SDXL vocabulary translator keeps only words it knows; using it alone dropped e.g. "젊은 여성 옆모습".)
+    """
     translated, found, _ = translate_scene_terms(user_prompt)
-    return translated or user_prompt, found
+    if found and not user_prompt.isascii():
+        return f"{user_prompt.strip()} ({translated})", found
+    return user_prompt.strip() or translated, found
+
+
+def _explicitly_empty(user_prompt: str) -> bool:
+    text = user_prompt.casefold()
+    return any(word in text for word in _NO_PEOPLE_WORDS)
 
 
 def _framing(composition: str) -> str:
@@ -95,7 +110,7 @@ def compile_zimage(user_prompt: str, channel: str = "", purpose: str = "youtube_
              _sentence(f"Mood and look: {style}"),
              "Shot on a full-frame camera with a 50mm lens at f/2, natural light falloff, realistic color grading.",
              "Faces have natural skin texture, realistic eyes and hair, and natural proportions." if person else "",
-             "" if person else NO_PEOPLE,
+             NO_PEOPLE if not person and _explicitly_empty(user_prompt) else "",
              _negative_space(text_side, person) if purpose.startswith("youtube") or purpose.endswith("banner") else "",
              TEXTLESS_PROSE]
     positive = " ".join(part for part in parts if part)
@@ -131,7 +146,7 @@ def compile_flux2(user_prompt: str, channel: str = "", purpose: str = "youtube_t
              "Photographed with a full-frame camera and a 50mm lens, shallow depth of field, true-to-life color.",
              "Skin shows natural texture with realistic eyes and hair." if person else "",
              SHOPIFY_PRODUCT_RULE if any(r["role"] == "PRODUCT" for r in roles) else "",
-             "" if person or roles else NO_PEOPLE,
+             NO_PEOPLE if not person and not roles and _explicitly_empty(user_prompt) else "",
              _negative_space(text_side, person) if purpose.startswith("youtube") or purpose.endswith("banner") else "",
              FLUX_TEXTLESS]
     positive = " ".join(part for part in parts if part)

@@ -113,8 +113,10 @@ def _fake_models(tmp_path: Path, backend) -> None:
         path.write_bytes(b"x")
 
 
-def test_zimage_command_low_memory_flags(tmp_path):
+def test_zimage_command_low_memory_flags(tmp_path, monkeypatch):
+    monkeypatch.setenv("COVERMORPH_ASCII_WORKDIR", str(tmp_path / "ascii"))
     backend = ZImageCppBackend(tmp_path / "モデル 모델")
+    _fake_models(tmp_path, backend)
     command = backend.build_command(EngineJob(prompt="p", negative_prompt="n", seed=7), tmp_path / "o.png")
     assert "--offload-to-cpu" in command and "--diffusion-fa" in command
     assert command[command.index("--steps") + 1] == "8" and command[command.index("--cfg-scale") + 1] == "1.0"
@@ -182,10 +184,21 @@ def test_compilers_keep_original_prompt_and_engine_style():
     assert "left third" in z.positive and "no text" in z.positive
 
 
-def test_scenery_prompts_exclude_people():
+def test_scenery_prompts_exclude_people_only_when_asked():
     for engine in ("zimage_turbo", "flux2_klein_4b"):
-        compiled = compile_prompt(engine, "rainy night street", "Tokyo Chill", person=False)
+        compiled = compile_prompt(engine, "rainy night street, no people", "Tokyo Chill", person=False)
         assert NO_PEOPLE in compiled.positive and "main subject" not in compiled.positive
+        assert NO_PEOPLE in compile_prompt(engine, "도쿄 비 오는 밤 거리, 사람 없음", person=False).positive
+        # people detection can miss words; without an explicit request nothing removes people
+        assert NO_PEOPLE not in compile_prompt(engine, "rainy night street", person=False).positive
+
+
+def test_v2_compilers_keep_untranslated_cjk_words():
+    user = "비 오는 도쿄 거리의 젊은 여성 옆모습"
+    for engine in ("zimage_turbo", "flux2_klein_4b"):
+        positive = compile_prompt(engine, user, "Tokyo Chill", person=True).positive
+        assert user in positive and "Tokyo" in positive
+    assert "woman" in compile_prompt("realvisxl_v5", user, person=True).positive
     realvis = compile_prompt("realvisxl_v5", "rainy night street", "Tokyo Chill", person=False)
     assert "people positioned" not in realvis.positive
 
@@ -322,3 +335,16 @@ def test_bridge_generate_routes_to_v2_and_records_manifest(monkeypatch, tmp_path
         "protocol_version": 1, "request_id": "v2b", "action": "generate", "project_dir": str(project),
         "prompt": "x", "options": {"engine": "nope", "models_dir": str(tmp_path)}})
     assert not runtime.handle_request(legacy).ok
+
+
+def test_sdcpp_command_uses_ascii_model_paths(tmp_path, monkeypatch):
+    from covermorph import quality_engines as qe
+
+    monkeypatch.setenv("COVERMORPH_ASCII_WORKDIR", str(tmp_path / "ascii"))
+    monkeypatch.setattr(qe, "_short_path", lambda path: None)  # force the junction route
+    backend = ZImageCppBackend(tmp_path / "모델 モデル")
+    _fake_models(tmp_path, backend)
+    command = backend.build_command(EngineJob(prompt="p"), tmp_path / "o.png")
+    for flag in ("--diffusion-model", "--vae", "--llm"):
+        value = command[command.index(flag) + 1]
+        assert value.isascii() and Path(value).exists(), value

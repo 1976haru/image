@@ -459,6 +459,8 @@ def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: st
     image = best["image"]
     canvas = fit_16x9(image, final_size)
     record = best["manifest"]
+    for role in record.get("reference_roles") or []:  # the temp file is gone; say where the reference came from
+        role["path"] = "person crop of the current canvas"
     qa = best["qa"]
     quality_warnings = list(qa.get("problems") or []) + list(qa.get("warnings") or [])
     if people and quality_warnings:
@@ -595,8 +597,8 @@ def _edit(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
     project_dir = request.project_path
     paths = standard_output_paths(project_dir)
     options = request.options
-    source = Path(str(options.get("source_image") or paths["canvas_clean"])).expanduser()
-    if not source.is_absolute():
+    source = Path(str(options.get("source_image"))).expanduser() if options.get("source_image") else paths["canvas_clean"]
+    if options.get("source_image") and not source.is_absolute():
         source = project_dir / source
     if not source.is_file():
         raise _action_error("NO_SOURCE_CANVAS", f"No canvas to edit: {source}. Run generate first.")
@@ -654,7 +656,8 @@ def _edit(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
         located = located_people(subjects)
         reference_image = _reference_crop(before, located) if reference else None
         if reference:
-            warnings.append("reference_regenerate keeps people similar via IP-Adapter; exact pixels/poses are not guaranteed.")
+            warnings.append("reference_regenerate keeps people similar via a reference image (FLUX.2-klein, or "
+                            "IP-Adapter on the SDXL path); exact pixels/poses are not guaranteed.")
         request.channel = request.channel or str(manifest.get("channel") or "")
         rendered = _ai_render(request, prompt=prompt, text_side=text_side, preserve_people=True, final_size=final_size,
                               warnings=warnings, reference_image=reference_image,
