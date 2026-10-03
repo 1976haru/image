@@ -234,6 +234,14 @@ CoverMorph는 YouTube Dynamic Thumbnail Studio v0.6(`1976haru/youtubesum`)의 �
 
 메모리 프로필은 감지된 VRAM으로 정합니다. 14 GB 이상 `standard`, 8~14 GB `balanced`(VAE slicing+tiling), 8 GB 미만 `conservative`(model CPU offload, 1024x576 생성 후 확대). RTX 3060 12 GB에서 같은 seed로 측정하면 `balanced`가 `standard`보다 빠르고(26.5초 대 28.4초) 최대 메모리도 낮았으며 결과는 같았습니다. CUDA OOM이 나면 파이프라인을 해제하고 한 단계 낮은 프로필로 딱 한 번만 다시 시도합니다. 생성 시간, 최대 할당/예약 메모리, 프로필, 재시도 여부는 `project_manifest.json`의 `generation`에 기록됩니다.
 
+### AI 이미지 스튜디오 (YouTube · Shopify)
+
+EXE를 더블클릭하면 'AI 이미지 스튜디오' 창이 함께 열립니다(상단 초록 버튼으로 다시 열기). 모델 이름을 고를 필요 없이 목적(YouTube / Shopify 히어로·컬렉션·상품 라이프스타일·프로모션·모바일 / 사용자 지정), 품질(빠른 미리보기·일반·최고 품질), PC 사용(작업 중 PC 우선·균형·자리 비움)을 고르고 대기열에 넣으면 됩니다.
+
+- 레퍼런스는 역할(인물·상품·스타일·구도·배경)을 지정해 최대 4장, '상품 형태 보존'을 켜면 실제 상품 픽셀 합성 후보가 맨 앞에 옵니다(AI가 다시 그린 후보는 '형태 확인 필요' 표시).
+- 대기열은 앱을 다시 열어도 유지되고, 현재 작업 후 일시정지/재개, 자원 부족 시 'PC 사용 중 — 자원 대기'로 기다립니다. 작업마다 엔진 프로세스가 종료되어 메모리를 돌려줍니다.
+- 모델·출력 폴더는 '설정' 탭에서 저장합니다(환경변수 불필요). 자세한 내용과 RTX 3060 검증 결과: `docs/SHOPIFY_WORKFLOW.md`.
+
 ### Quality Engine V2 (Z-Image-Turbo / FLUX.2-klein)
 
 RTX 3060에서 같은 장면·시드로 비교한 결과(`docs/QUALITY_ENGINE_V2.md`)로 기본 엔진을 정했습니다.
