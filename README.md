@@ -234,6 +234,23 @@ CoverMorph는 YouTube Dynamic Thumbnail Studio v0.6(`1976haru/youtubesum`)의 �
 
 메모리 프로필은 감지된 VRAM으로 정합니다. 14 GB 이상 `standard`, 8~14 GB `balanced`(VAE slicing+tiling), 8 GB 미만 `conservative`(model CPU offload, 1024x576 생성 후 확대). RTX 3060 12 GB에서 같은 seed로 측정하면 `balanced`가 `standard`보다 빠르고(26.5초 대 28.4초) 최대 메모리도 낮았으며 결과는 같았습니다. CUDA OOM이 나면 파이프라인을 해제하고 한 단계 낮은 프로필로 딱 한 번만 다시 시도합니다. 생성 시간, 최대 할당/예약 메모리, 프로필, 재시도 여부는 `project_manifest.json`의 `generation`에 기록됩니다.
 
+### Quality Engine V2 (Z-Image-Turbo / FLUX.2-klein)
+
+RTX 3060에서 같은 장면·시드로 비교한 결과(`docs/QUALITY_ENGINE_V2.md`)로 기본 엔진을 정했습니다.
+
+| 역할 | 엔진 | 비고 |
+| --- | --- | --- |
+| 기본 텍스트→이미지 | Z-Image-Turbo Q6_K (Apache-2.0) | 1280x720 약 35초, GPU 피크 7.3 GiB |
+| 기본 참조/편집 | FLUX.2-klein-4B Q8_0 (Apache-2.0) | 참조 1장 약 27초, 인물/상품 유지 + 배경 변경 |
+| 대체(fallback) | RealVisXL V5 (기존 SDXL 경로) | V2 모델이 없거나 실패하면 자동 사용 |
+
+- 준비: `python scripts\prepare_quality_v2_models.py --models-dir <models>` (약 16 GB, SHA-256 검증, `--verify`로 재확인). 파일은 `<models>\quality_v2`에 들어가며 git에 넣지 않습니다.
+- 두 엔진은 stable-diffusion.cpp(`sd-cli.exe`, CUDA) 하위 프로세스로 실행되고 작업이 끝나면 프로세스가 종료되어 GPU/RAM을 즉시 반환합니다. 한 번에 한 모델만 메모리에 올립니다.
+- 브리지 옵션: `engine` = `auto`(기본, V2 설치 시 사용) | `zimage_turbo` | `flux2_klein_4b` | `legacy`, `quality_mode` = `preview`(FLUX.2 1장) | `balanced`(기본) | `best`(엔진 2개 순차), `candidates` 1~4(브리지 기본 1, 추가 후보는 `<project>\candidates\`), `memory_policy` = `interactive_low_memory` | `balanced_idle` | `night_best`.
+- `project_manifest.json`에 backend, model, quantization, model_license, commercial_use_flag, original_prompt, compiled_prompt, reference_roles, quality_mode, memory_profile, timing, peak_vram_mib, system_commit_before/after가 기록됩니다.
+- 작업 대기열(`covermorph/job_queue.py`): 저장(원자적 교체), 현재 작업 후 일시정지, 재개, 대기 작업 취소, 앱 재시작 후 복구, GPU/commit/RAM이 기준보다 낮으면 시작하지 않고 대기. 실제 GPU 검증: `python scripts\validate_quality_queue.py --models-dir <models> --output-dir validation_results\quality_queue`.
+- 비교 재현: `python scripts\benchmark_quality_v2.py --models-dir <models> --output-dir validation_results\quality_v2 --make-refs`.
+
 ### youtubesum 설정
 
 ```bat
