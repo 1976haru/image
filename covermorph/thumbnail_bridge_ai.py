@@ -63,7 +63,9 @@ SCENE_TERMS = {
     "두 사람": "two people", "二人": "two people", "커플": "couple", "カップル": "couple",
     "남자": "man", "男性": "man", "남성": "man", "여자": "woman", "女性": "woman", "여성": "woman",
     "젊은": "young", "若い": "young", "옆모습": "side profile", "横顔": "side profile",
-    "중년": "middle-aged", "中年": "middle-aged", "재즈": "jazz lounge", "ジャズ": "jazz lounge",
+    "중년": "middle-aged", "中年": "middle-aged", "부부": "married couple", "夫婦": "married couple",
+    "노부부": "elderly couple", "50대": "in their fifties", "50代": "in their fifties",
+    "60대": "in their sixties", "60代": "in their sixties", "재즈": "jazz lounge", "ジャズ": "jazz lounge",
 }
 _CJK = re.compile(r"[ᄀ-ᇿ぀-ヿ㄰-㆏㐀-鿿가-힯ｦ-ﾟ]")
 

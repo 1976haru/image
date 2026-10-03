@@ -147,7 +147,8 @@ def check_resources(policy: str, snapshot: ResourceSnapshot | None = None,
 
 
 # ------------------------------------------------------------------ job/result
-REFERENCE_ROLES = ("PERSON", "PRODUCT", "STYLE", "COMPOSITION", "BACKGROUND")
+# EDIT is internal: the image being edited (always reference 1 of a FLUX.2 edit).
+REFERENCE_ROLES = ("PERSON", "PRODUCT", "STYLE", "COMPOSITION", "BACKGROUND", "EDIT")
 
 
 @dataclass(slots=True)
@@ -439,7 +440,8 @@ class Flux2KleinCppBackend(SdCppBackend):
         if job.edit_image is None:
             raise EngineError("edit needs edit_image")
         # FLUX.2 edits are reference-conditioned: the image being edited is reference 1.
-        job.references = [Reference(job.edit_image, "BACKGROUND"), *job.references][: self.MAX_REFERENCES]
+        job.references = [Reference(job.edit_image, "EDIT"),
+                          *(r for r in job.references if r.role != "EDIT")][: self.MAX_REFERENCES]
         return self._run(job, cancel, progress)
 
 

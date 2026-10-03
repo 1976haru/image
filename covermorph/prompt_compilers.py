@@ -69,17 +69,22 @@ def _negative_space(text_side: str, person: bool = True) -> str:
 
 
 _NO_PEOPLE_WORDS = ("no people", "no person", "nobody", "no one", "without people", "empty of people", "unpeopled",
+                    "empty street", "deserted",
                     "사람 없", "사람없", "인물 없", "無人", "人がいない", "人のいない", "誰もいない")
 
 
 def _scene(user_prompt: str) -> tuple[str, list[str]]:
-    """Qwen3-based engines read Korean/Japanese natively: keep the user's words, add English terms as a hint.
+    """English scene text with no CJK script left in it.
 
-    (The SDXL vocabulary translator keeps only words it knows; using it alone dropped e.g. "젊은 여성 옆모습".)
+    Z-Image paints CJK prompt words into the image as lettering (measured), so callers translate first
+    (prompt_translate.translate_prompt); anything still in CJK here falls back to the scene vocabulary.
     """
+    from .prompt_translate import needs_translation
+
     translated, found, _ = translate_scene_terms(user_prompt)
-    if found and not user_prompt.isascii():
-        return f"{user_prompt.strip()} ({translated})", found
+    if needs_translation(user_prompt):
+        from .prompt_translate import _CJK
+        return " ".join(_CJK.sub(" ", translated).split()), found
     return user_prompt.strip() or translated, found
 
 
@@ -124,6 +129,7 @@ ROLE_INSTRUCTIONS = {
     "STYLE": "match the color palette, lighting and photographic style of image {i}",
     "COMPOSITION": "follow the subject placement and framing of image {i}",
     "BACKGROUND": "use the location and background of image {i}",
+    "EDIT": "image {i} is the photo being edited: keep its people exactly as they are, with the same faces, hair, clothes and poses",
 }
 
 
@@ -139,7 +145,7 @@ def compile_flux2(user_prompt: str, channel: str = "", purpose: str = "youtube_t
     if roles:
         reference_text = _sentence("; ".join(ROLE_INSTRUCTIONS[r["role"]].format(i=r["index"]) for r in roles))
     parts = [_sentence(edit_instruction) if edit_instruction else "",
-             _sentence(f"A {envelope}: {subject}"),
+             _sentence(f"A {envelope}: {subject}") if subject else _sentence(f"A {envelope}"),
              reference_text,
              _sentence(_framing(composition)),
              _sentence(f"The atmosphere is {style}"),

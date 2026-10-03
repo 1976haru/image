@@ -103,6 +103,17 @@ def run_quality_job(payload: dict[str, Any], cancel: Event | None = None,
     def available(engine: str) -> bool:
         return bool(backend_factory(engine, models_dir).status()["ready"])
 
+    # CJK -> English once per job (Z-Image would paint CJK words as lettering); the original is kept.
+    from .prompt_translate import translate_prompt
+    original_prompt = str(payload.get("original_prompt") or payload.get("prompt") or "")
+    translation = translate_prompt(str(payload.get("prompt") or ""), models_dir)
+    instruction = translate_prompt(str(payload.get("edit_instruction") or ""), models_dir)
+    if translation["error"] or instruction["error"]:
+        warnings_from_translation = [f"Prompt translation fell back to the scene vocabulary: "
+                                     f"{translation['error'] or instruction['error']}"]
+    else:
+        warnings_from_translation = []
+
     plan = plan_engines(mode, has_references=bool(references), edit=edit_image is not None, available=available)
     if payload.get("only_engine"):
         plan = [(str(payload["only_engine"]), plan[0][1] if plan else 1)]
@@ -113,17 +124,19 @@ def run_quality_job(payload: dict[str, Any], cancel: Event | None = None,
     final_size, work_size = _generation_size(purpose, memory_profile)
     yunet = models_dir / "face_detection" / YUNET_FILENAME
     candidates: list[dict[str, Any]] = []
-    warnings: list[str] = []
+    warnings: list[str] = list(warnings_from_translation)
     for engine_name, count in plan:
         ok, reasons = check_resources(memory_profile, resource_snapshot())
         if not ok:
             warnings.append(f"{engine_name} skipped: " + "; ".join(reasons))
             continue
         backend = backend_factory(engine_name, models_dir)
-        compiled = compile_prompt(engine_name, str(payload.get("prompt") or ""), str(payload.get("channel") or ""),
+        prompt_refs = [Reference(edit_image, "EDIT"), *references] if edit_image else references
+        compiled = compile_prompt(engine_name, translation["english"], str(payload.get("channel") or ""),
                                   purpose, text_side=str(payload.get("text_side") or "left"),
-                                  composition=composition, person=people > 0, references=references,
-                                  edit_instruction=str(payload.get("edit_instruction") or ""))
+                                  composition=composition, person=people > 0, references=prompt_refs,
+                                  edit_instruction=instruction["english"])
+        compiled.original_prompt = original_prompt
         warnings += [w for w in compiled.warnings if w not in warnings]
         try:
             for index in range(count):
@@ -154,6 +167,10 @@ def run_quality_job(payload: dict[str, Any], cancel: Event | None = None,
                     "manifest": {"backend": info.name, "model": info.model, "repository": info.repository,
                                  "quantization": info.quantization, "model_license": info.license_id,
                                  "commercial_use_flag": info.commercial_ok, "original_prompt": compiled.original_prompt,
+                                 "translated_prompt": translation["english"],
+                                 "translation_method": translation["method"],
+                                 "edit_instruction": str(payload.get("edit_instruction") or ""),
+                                 "translated_edit_instruction": instruction["english"],
                                  "compiled_prompt": compiled.positive, "negative_prompt": compiled.negative,
                                  "reference_roles": compiled.reference_roles, "quality_mode": mode,
                                  "memory_profile": memory_profile, "purpose": purpose, "seed": job.seed,

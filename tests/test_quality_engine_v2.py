@@ -155,7 +155,7 @@ def test_flux_stages_references_and_edit_image_first(tmp_path, monkeypatch):
     backend.edit(EngineJob(prompt="p", edit_image=edit, references=[Reference(person, "PERSON")]))
     refs = [captured["command"][i + 1] for i, a in enumerate(captured["command"]) if a == "-r"]
     assert len(refs) == 2 and all(r.isascii() and r.endswith(".png") for r in refs)
-    assert captured["roles"] == ["BACKGROUND", "PERSON"]
+    assert captured["roles"] == ["EDIT", "PERSON"]
     assert captured["colors"] == [(0, 0, 255), (255, 0, 0)]
 
 
@@ -193,14 +193,34 @@ def test_scenery_prompts_exclude_people_only_when_asked():
         assert NO_PEOPLE not in compile_prompt(engine, "rainy night street", person=False).positive
 
 
-def test_v2_compilers_keep_untranslated_cjk_words():
-    user = "비 오는 도쿄 거리의 젊은 여성 옆모습"
-    for engine in ("zimage_turbo", "flux2_klein_4b"):
-        positive = compile_prompt(engine, user, "Tokyo Chill", person=True).positive
-        assert user in positive and "Tokyo" in positive
-    assert "woman" in compile_prompt("realvisxl_v5", user, person=True).positive
-    realvis = compile_prompt("realvisxl_v5", "rainy night street", "Tokyo Chill", person=False)
-    assert "people positioned" not in realvis.positive
+def test_v2_compilers_never_pass_cjk_script():
+    """Z-Image paints CJK prompt words as lettering, so compiled prompts must be CJK-free."""
+    from covermorph.prompt_translate import needs_translation
+
+    user = "비 오는 도쿄 거리의 젊은 여성 옆모습 가나다"
+    for engine in ("zimage_turbo", "flux2_klein_4b", "realvisxl_v5"):
+        compiled = compile_prompt(engine, user, "Tokyo Chill", person=True)
+        assert not needs_translation(compiled.positive) and "Tokyo" in compiled.positive
+        assert compiled.original_prompt == user
+
+
+def test_translate_prompt_fallback_and_cache(tmp_path, monkeypatch):
+    from covermorph import prompt_translate as pt
+
+    english = pt.translate_prompt("rainy street", tmp_path)
+    assert english == {"english": "rainy street", "method": "none", "seconds": 0.0, "error": ""}
+    fallback = pt.translate_prompt("도쿄 비 오는 밤 알수없는말", tmp_path)  # translator not installed
+    assert fallback["method"] == "vocabulary" and "not installed" in fallback["error"]
+    assert "Tokyo" in fallback["english"] and not pt.needs_translation(fallback["english"])
+
+    monkeypatch.setattr(pt, "translator_ready", lambda models_dir: True)
+    monkeypatch.setattr(pt, "_translate_cached", lambda text, models_dir, threads, timeout: "A rainy Tokyo night")
+    assert pt.translate_prompt("도쿄 비 오는 밤", tmp_path)["english"] == "A rainy Tokyo night"
+
+    def broken(*args):
+        raise RuntimeError("translation failed")
+    monkeypatch.setattr(pt, "_translate_cached", broken)
+    assert pt.translate_prompt("도쿄 비 오는 밤", tmp_path)["method"] == "vocabulary"
 
 
 def test_flux_reference_roles_are_explicit(tmp_path):
@@ -348,3 +368,17 @@ def test_sdcpp_command_uses_ascii_model_paths(tmp_path, monkeypatch):
     for flag in ("--diffusion-model", "--vae", "--llm"):
         value = command[command.index(flag) + 1]
         assert value.isascii() and Path(value).exists(), value
+
+
+def test_run_quality_job_records_translation(tmp_path, fake_backends, monkeypatch):
+    from covermorph import prompt_translate as pt
+
+    monkeypatch.setattr(pt, "translator_ready", lambda models_dir: True)
+    monkeypatch.setattr(pt, "_translate_cached", lambda text, models_dir, threads, timeout: "A couple in their fifties")
+    result = qm.run_quality_job({"models_dir": str(tmp_path), "prompt": "50대 부부", "mode": "preview", "people": 2},
+                                backend_factory=fake_backends)
+    record = result["candidates"][0]["manifest"]
+    assert record["original_prompt"] == "50대 부부" and record["translated_prompt"] == "A couple in their fifties"
+    assert "in their fifties" in record["compiled_prompt"] and not pt.needs_translation(record["compiled_prompt"])
+    realvis = compile_prompt("realvisxl_v5", "rainy night street", "Tokyo Chill", person=False)
+    assert "people positioned" not in realvis.positive

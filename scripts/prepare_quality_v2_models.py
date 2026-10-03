@@ -22,6 +22,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from covermorph.prompt_translate import LLAMACPP_RELEASE  # noqa: E402
 from covermorph.quality_engines import SDCPP_RELEASE  # noqa: E402
 
 GH = f"https://github.com/leejet/stable-diffusion.cpp/releases/download/{SDCPP_RELEASE}"
@@ -32,6 +33,9 @@ FILES = [
      "217d6dead9abd3f827fc338268555cc179234e7e6330ef21ecb1c985e19d2dc7", "MIT (stable-diffusion.cpp)"),
     ("sdcpp", "sdcpp/cudart.zip", f"{GH}/cudart-sd-bin-win-cu12-x64.zip",
      "fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d", "NVIDIA CUDA runtime redistributable"),
+    ("llamacpp", "llamacpp/llama-cpu.zip",
+     f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMACPP_RELEASE}/llama-{LLAMACPP_RELEASE}-bin-win-cpu-x64.zip",
+     "f5cb0430a9dd2174f392fdad17ed5d6417e5542c47efc993fa4917287a738a76", "MIT (llama.cpp, CPU prompt translator)"),
     ("zimage", "zimage_turbo/z_image_turbo-Q6_K.gguf", f"{HF}/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q6_K.gguf",
      "319f627beac8059b7546f36a7b4d5097b7f4ee6a1fc37585d0f75ca1d12d01af", "Apache-2.0 (Tongyi-MAI/Z-Image-Turbo)"),
     ("flux2", "flux2_klein_4b/flux-2-klein-4b-Q8_0.gguf",

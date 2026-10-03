@@ -280,7 +280,8 @@ def _select_model(options: dict[str, Any], models_dir: Path, person: bool, warni
 
 def _ai_render(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, preserve_people: bool,
                final_size: tuple[int, int], warnings: list[str], reference_image=None,
-               reference_strength: float | None = None, people: int | None = None) -> dict[str, Any]:
+               reference_strength: float | None = None, people: int | None = None,
+               edit_canvas=None, edit_instruction: str = "") -> dict[str, Any]:
     """Generate with the selected model profile and (for people) QA + face detail; return canvas + records."""
     import time
 
@@ -314,7 +315,8 @@ def _ai_render(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, 
         try:
             return _ai_render_v2(request, prompt=prompt, text_side=text_side, preserve_people=preserve_people,
                                  final_size=final_size, warnings=warnings, reference_image=reference_image,
-                                 people=people, mode=v2_mode, started=started)
+                                 people=people, mode=v2_mode, started=started, edit_canvas=edit_canvas,
+                                 edit_instruction=edit_instruction)
         except Exception as exc:  # engine missing/failed: the proven SDXL path still answers the request
             from .quality_engines import EngineCancelled
             if isinstance(exc, EngineCancelled):
@@ -419,8 +421,12 @@ def _v2_mode(options: dict[str, Any], models_dir: Path, *, reference: bool, warn
 
 def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, preserve_people: bool,
                   final_size: tuple[int, int], warnings: list[str], reference_image, people: int, mode: str,
-                  started: float) -> dict[str, Any]:
-    """Generate with Quality Engine V2 (Z-Image-Turbo / FLUX.2-klein via stable-diffusion.cpp)."""
+                  started: float, edit_canvas=None, edit_instruction: str = "") -> dict[str, Any]:
+    """Generate with Quality Engine V2 (Z-Image-Turbo / FLUX.2-klein via stable-diffusion.cpp).
+
+    With ``edit_canvas`` (reference_regenerate) FLUX.2 edits the whole canvas from the instruction: measured
+    2026-10-04 it kept both people's faces/clothes/poses, where a person-crop reference turned one away.
+    """
     import tempfile
     import time
 
@@ -429,28 +435,47 @@ def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: st
     from .thumbnail_bridge_ai import build_prompt_plan
     from .thumbnail_bridge_assets import fit_16x9
 
+    from .person_quality import people_count
+    from .prompt_translate import translate_prompt
+
     options = request.options
     models_dir = resolve_models_dir(request)
-    composition = choose_composition(people, str(options.get("candidate") or "A"),
-                                     str(options.get("composition_profile") or "")) if people else ""
+    # V2 edits are driven by the instruction; otherwise translate the scene prompt once (Qwen3, CPU).
+    source_prompt = request.prompt if edit_canvas is not None else prompt
+    translation = translate_prompt(source_prompt, models_dir)
+    if translation["method"] != "none":
+        _log(f"translate ({translation['method']}, {translation['seconds']}s): {translation['english']}")
+    if preserve_people and edit_canvas is None and "people" not in options and translation["method"] != "none":
+        people = max(people, people_count(translation["english"]))  # the vocabulary misses many CJK words
+    # An edit keeps the canvas composition: framing words ("two people facing each other") would fight it,
+    # and the subject count from the canvas detector can be off (it found 2 for one woman, 2026-10-04).
+    composition = "" if edit_canvas is not None else choose_composition(
+        people, str(options.get("candidate") or "A"), str(options.get("composition_profile") or "")) if people else ""
     seed = _int_option(options, "seed", random.randint(1, 2**31 - 1), 0, 2**31 - 1)
     engine = str(options.get("engine") or "auto").casefold()
     # The bridge answers with one canvas, so it makes 1 candidate per engine unless asked for more.
     candidates = _int_option(options, "candidates", 1, 1, 4)
     with tempfile.TemporaryDirectory(prefix="covermorph_v2_") as tmp:
         references = []
-        if reference_image is not None:
+        edit_path = ""
+        if edit_canvas is not None:
+            edit_path = str(Path(tmp) / "canvas_to_edit.png")
+            edit_canvas.save(edit_path)
+        elif reference_image is not None:
             ref_path = Path(tmp) / "person_reference.png"
             reference_image.save(ref_path)
             references.append({"path": str(ref_path), "role": "PERSON"})
-        payload = {"models_dir": str(models_dir), "prompt": prompt, "channel": request.channel,
+        # An edit is driven by its instruction; the previous scene prompt would pull the old location back in.
+        payload = {"models_dir": str(models_dir), "prompt": translation["english"],
+                   "original_prompt": source_prompt, "channel": request.channel,
                    "purpose": "youtube_thumbnail_background", "mode": mode, "seed": seed, "people": people,
                    "composition": composition, "text_side": text_side, "references": references,
+                   "edit_image": edit_path, "edit_instruction": edit_instruction if edit_path else "",
                    "memory_profile": str(options.get("memory_policy") or ""),
                    "max_candidates_per_engine": candidates,
                    "only_engine": engine if engine in V2_ENGINES and not references else ""}
         _log(f"render v2: mode={mode} engine={engine} people={people} composition={composition or '-'} "
-             f"references={len(references)} seed={seed}")
+             f"references={len(references)} edit={bool(edit_path)} seed={seed}")
         result = run_quality_job(payload)
     if not result["candidates"]:
         raise RuntimeError("; ".join(result["warnings"]) or "no candidate was produced")
@@ -460,7 +485,7 @@ def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: st
     canvas = fit_16x9(image, final_size)
     record = best["manifest"]
     for role in record.get("reference_roles") or []:  # the temp file is gone; say where the reference came from
-        role["path"] = "person crop of the current canvas"
+        role["path"] = "current canvas" if role["role"] == "EDIT" else "person crop of the current canvas"
     qa = best["qa"]
     quality_warnings = list(qa.get("problems") or []) + list(qa.get("warnings") or [])
     if people and quality_warnings:
@@ -483,12 +508,14 @@ def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: st
                              "repository": record["repository"], "license": record["model_license"]},
         "quality_profile": mode, "quality_mode": mode, "person_quality": people > 0, "people": people,
         "composition_profile": composition, "face_detector": "yunet", "face_detail_applied": False,
-        "identity_backend": "none" if reference_image is None else
-                            f"{record['backend']} reference image (PERSON role; similarity, not identity-locked)",
+        "identity_backend": "none" if reference_image is None and edit_canvas is None else
+                            f"{record['backend']} " + ("full-canvas edit (people kept from the canvas)" if edit_canvas
+                            is not None else "reference image (PERSON role; similarity, not identity-locked)"),
         "quality_warnings": quality_warnings, "user_prompt": prompt, "model_id": record["backend"],
         "translated_terms": plan.translated_terms, "final_size": list(final_size),
         "resize": "center crop to 16:9 + Lanczos (no stretch)", "total_seconds": total,
         "generation_time_seconds": record["timing"]["engine_seconds"], "seed": record["seed"],
+        "translation_seconds": translation["seconds"],
         "candidates": extra, "engine_plan": [list(item) for item in result["plan"]],
         "mode_definition": QUALITY_MODES_V2[mode], **record,
     }
@@ -496,7 +523,7 @@ def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: st
                                                         "face_detail_applied", "identity_backend", "quality_warnings")}
     manifest_fields.update({key: record[key] for key in (
         "backend", "model", "quantization", "model_license", "commercial_use_flag", "original_prompt",
-        "compiled_prompt", "reference_roles", "quality_mode", "memory_profile", "timing", "peak_vram_mib",
+        "translated_prompt", "translation_method", "edit_instruction", "translated_edit_instruction", "compiled_prompt", "reference_roles", "quality_mode", "memory_profile", "timing", "peak_vram_mib",
         "system_commit_before_mib", "system_commit_after_mib")})
     return {"canvas": canvas, "raw": image, "generation": generation, "plan": plan, "people": people,
             "manifest_fields": manifest_fields}
@@ -662,7 +689,9 @@ def _edit(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
         rendered = _ai_render(request, prompt=prompt, text_side=text_side, preserve_people=True, final_size=final_size,
                               warnings=warnings, reference_image=reference_image,
                               reference_strength=_float_option(options, "reference_strength", DEFAULT_REFERENCE_STRENGTH, 0.0, 1.0),
-                              people=sum(1 for subject in located if subject.role in ("protagonist", "counterpart")) or None)
+                              people=sum(1 for subject in located if subject.role in ("protagonist", "counterpart")) or None,
+                              edit_canvas=before if reference else None,
+                              edit_instruction=request.edit_instruction if reference else "")
         image, after = rendered["raw"], rendered["canvas"]
         if plan.has_recompose_ops:
             fresh, _ = detect_subjects(after, text_side=text_side)
