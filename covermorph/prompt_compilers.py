@@ -1,0 +1,168 @@
+"""Engine-specific prompt compilers for Quality Engine V2.
+
+The user's prompt is never overwritten: every compile returns the original text, the channel
+envelope that was added and the engine-specific rewrite, so manifests can store all of them.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from .person_quality import COMPOSITION_PROFILES, PERSON_NEGATIVE_PARTS, PERSON_POSITIVE
+from .quality_engines import Reference
+from .thumbnail_bridge_ai import NEGATIVE_PROMPT, build_prompt_plan, channel_style, translate_scene_terms
+
+PURPOSES: dict[str, dict[str, Any]] = {
+    "youtube_thumbnail_background": {"size": (1280, 720), "envelope": "16:9 cinematic YouTube thumbnail photograph"},
+    "shopify_hero_banner": {"size": (1792, 768), "envelope": "wide e-commerce hero banner photograph, premium editorial look"},
+    "shopify_collection_banner": {"size": (1600, 640), "envelope": "wide collection banner photograph, clean premium styling"},
+    "shopify_product_lifestyle": {"size": (1280, 1280), "envelope": "square lifestyle product photograph, natural styling"},
+    "shopify_promo_tile": {"size": (1024, 1024), "envelope": "square promotional tile photograph, bold simple composition"},
+    "shopify_mobile_banner": {"size": (768, 1024), "envelope": "portrait mobile banner photograph, simple composition"},
+}
+# Engines need multiples of 16; purposes map to these generation sizes and are resized after.
+CANVAS_PRESETS = {name: spec["size"] for name, spec in PURPOSES.items()}
+
+TEXTLESS_PROSE = ("The image contains no text, letters, captions, logos, watermarks or readable signage.")
+FLUX_TEXTLESS = "Every surface is free of lettering and logos; any signs are blurred and unreadable."
+# Measured: without the viewing-angle/silhouette sentence FLUX.2-klein gave a single-handle mug two handles
+# on 3/3 seeds; with it 2/4 were exact. Deviations stay seed-dependent, so product jobs also get a warning.
+SHOPIFY_PRODUCT_RULE = ("Show the product from the same viewing angle as its reference, with an identical silhouette, "
+                        "the same number of parts and the same colors, materials and logo; "
+                        "do not add new claims, labels or packaging text.")
+PRODUCT_WARNING = ("Product reference: check shape/part count against the reference (FLUX.2-klein can duplicate "
+                   "parts such as handles on some seeds); keep 2+ candidates for product shots.")
+
+
+@dataclass(slots=True)
+class CompiledPrompt:
+    engine: str
+    original_prompt: str
+    channel: str
+    purpose: str
+    envelope: str
+    positive: str
+    negative: str = ""
+    reference_roles: list[dict[str, Any]] = field(default_factory=list)
+    translated_terms: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    prompt_parts: list[str] = field(default_factory=list)      # SDXL: fitted to CLIP at generation time
+    negative_parts: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+NO_PEOPLE = "The scene is empty of people; no person or figure appears anywhere."
+
+
+def _negative_space(text_side: str, person: bool = True) -> str:
+    side = (text_side or "left").lower()
+    if side in ("left", "right"):
+        other = "right" if side == "left" else "left"
+        focus = "main subject" if person else "visual focal point"
+        return (f"The {focus} sits in the {other} part of the frame, and the {side} third is calm, "
+                f"softly out-of-focus negative space suitable for a large title.")
+    if side in ("top", "bottom"):
+        return f"The {side} part of the frame is calm, uncluttered negative space suitable for a large title."
+    return "Leave a calm, uncluttered area of the frame for a large title."
+
+
+def _scene(user_prompt: str) -> tuple[str, list[str]]:
+    translated, found, _ = translate_scene_terms(user_prompt)
+    return translated or user_prompt, found
+
+
+def _framing(composition: str) -> str:
+    profile = COMPOSITION_PROFILES.get(composition or "")
+    return profile["framing"] if profile else ""
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    return "" if not text else text[0].upper() + text[1:] + ("" if text.endswith(".") else ".")
+
+
+def compile_zimage(user_prompt: str, channel: str = "", purpose: str = "youtube_thumbnail_background", *,
+                   text_side: str = "left", composition: str = "", person: bool = False) -> CompiledPrompt:
+    """Detailed natural-language prose, subject first, camera/light, explicit negative space."""
+    subject, found = _scene(user_prompt)
+    _, style = channel_style(channel)
+    envelope = PURPOSES[purpose]["envelope"]
+    parts = [_sentence(f"A {envelope} of {subject}" if not subject.lower().startswith(("a ", "an ", "the ")) else
+                       f"{subject}, as a {envelope}"),
+             _sentence(_framing(composition)),
+             _sentence(f"Mood and look: {style}"),
+             "Shot on a full-frame camera with a 50mm lens at f/2, natural light falloff, realistic color grading.",
+             "Faces have natural skin texture, realistic eyes and hair, and natural proportions." if person else "",
+             "" if person else NO_PEOPLE,
+             _negative_space(text_side, person) if purpose.startswith("youtube") or purpose.endswith("banner") else "",
+             TEXTLESS_PROSE]
+    positive = " ".join(part for part in parts if part)
+    return CompiledPrompt("zimage_turbo", user_prompt, channel, purpose, f"{envelope}; {style}", positive,
+                          negative="", translated_terms=found)
+
+
+ROLE_INSTRUCTIONS = {
+    "PERSON": "keep the same person from image {i}: same face, hairstyle and clothing",
+    "PRODUCT": "use the exact product from image {i}, preserving its shape, colors, materials and logo",
+    "STYLE": "match the color palette, lighting and photographic style of image {i}",
+    "COMPOSITION": "follow the subject placement and framing of image {i}",
+    "BACKGROUND": "use the location and background of image {i}",
+}
+
+
+def compile_flux2(user_prompt: str, channel: str = "", purpose: str = "youtube_thumbnail_background", *,
+                  text_side: str = "left", composition: str = "", person: bool = False,
+                  references: list[Reference] | None = None, edit_instruction: str = "") -> CompiledPrompt:
+    """Positive-only narrative: Subject + Action + Medium + Context + Lighting + Camera, refs by index."""
+    subject, found = _scene(user_prompt)
+    _, style = channel_style(channel)
+    envelope = PURPOSES[purpose]["envelope"]
+    roles = [{"index": i, "role": ref.role, "path": str(ref.path)} for i, ref in enumerate(references or [], 1)]
+    reference_text = ""
+    if roles:
+        reference_text = _sentence("; ".join(ROLE_INSTRUCTIONS[r["role"]].format(i=r["index"]) for r in roles))
+    parts = [_sentence(edit_instruction) if edit_instruction else "",
+             _sentence(f"A {envelope}: {subject}"),
+             reference_text,
+             _sentence(_framing(composition)),
+             _sentence(f"The atmosphere is {style}"),
+             "Photographed with a full-frame camera and a 50mm lens, shallow depth of field, true-to-life color.",
+             "Skin shows natural texture with realistic eyes and hair." if person else "",
+             SHOPIFY_PRODUCT_RULE if any(r["role"] == "PRODUCT" for r in roles) else "",
+             "" if person or roles else NO_PEOPLE,
+             _negative_space(text_side, person) if purpose.startswith("youtube") or purpose.endswith("banner") else "",
+             FLUX_TEXTLESS]
+    positive = " ".join(part for part in parts if part)
+    warnings = [PRODUCT_WARNING] if any(r["role"] == "PRODUCT" for r in roles) else []
+    return CompiledPrompt("flux2_klein_4b", user_prompt, channel, purpose, f"{envelope}; {style}", positive,
+                          reference_roles=roles, translated_terms=found, warnings=warnings)
+
+
+def compile_realvis(user_prompt: str, channel: str = "", purpose: str = "youtube_thumbnail_background", *,
+                    text_side: str = "left", composition: str = "", person: bool = False) -> CompiledPrompt:
+    """SDXL keyword prompt + negative: the tested person-quality path, unchanged."""
+    from .thumbnail_bridge_ai import fit_prompt
+    plan = build_prompt_plan(user_prompt, channel, text_side, person, person=person, framing=_framing(composition))
+    warnings: list[str] = []
+    positive = fit_prompt(plan.prompt_parts, None, warnings)
+    negative = ", ".join(PERSON_NEGATIVE_PARTS) if person else NEGATIVE_PROMPT
+    _, style = channel_style(channel)
+    return CompiledPrompt("realvisxl_v5", user_prompt, channel, purpose, f"{PERSON_POSITIVE if person else ''}; {style}",
+                          positive, negative, translated_terms=plan.translated_terms, warnings=warnings,
+                          prompt_parts=list(plan.prompt_parts),
+                          negative_parts=list(PERSON_NEGATIVE_PARTS) if person else [NEGATIVE_PROMPT])
+
+
+COMPILERS = {"zimage_turbo": compile_zimage, "flux2_klein_4b": compile_flux2, "realvisxl_v5": compile_realvis}
+
+
+def compile_prompt(engine: str, user_prompt: str, channel: str = "", purpose: str = "youtube_thumbnail_background",
+                   **kwargs: Any) -> CompiledPrompt:
+    if purpose not in PURPOSES:
+        raise ValueError(f"Unknown purpose {purpose!r}")
+    if engine != "flux2_klein_4b":
+        kwargs.pop("references", None)
+        kwargs.pop("edit_instruction", None)
+    return COMPILERS[engine](user_prompt, channel, purpose, **kwargs)
