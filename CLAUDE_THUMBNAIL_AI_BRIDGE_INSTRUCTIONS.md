@@ -10,6 +10,22 @@ The purpose of this milestone is to turn the existing starter bridge into a **re
 
 ---
 
+
+# 0. Important repository evidence — reuse the already validated RTX 3060 path
+
+Before implementing anything, inspect the existing repository history/code associated with these commits on main:
+
+- `6fadb90c45a298939bfa5ffa3bc8dd3943db0859` — Add local SDXL scene candidate generation
+- `1053724c51b620e5ef1cb2e01d2e53cc84a0af37` — Add SDXL IP-Adapter reference conditioning
+- `7e6fb65b78cab71997dbf58666b90d9754e41c83` — Add 3-B1 SDXL reference image conditioning
+- `33a74ecf19447d6f2a57b845da9b97907c215a89` — Validate 3-B1 IP-Adapter generation on RTX 3060
+- `05f42314439d86476832d626733828a162c7f0ea` — Fix RTX 3060 3-B1 reference generation validation
+
+This means the project already contains a proven local SDXL/IP-Adapter/RTX-3060 lineage. The bridge task is primarily to expose and adapt that existing generation path headlessly, not invent a new AI backend.
+
+Verify the current code still contains the validated behavior before changing it.
+
+
 # 1. Product workflow to complete
 
 The final user flow should be:
