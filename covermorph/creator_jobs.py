@@ -54,13 +54,13 @@ def _region_words(region: tuple[float, float, float, float]) -> str:
 def background_prompt(prompt: str, region: tuple[float, float, float, float]) -> str:
     """Scene prompt for a composite: the real product is pasted later, so the scene must not contain one.
 
-    Avoids the words product/photography/plate/empty-surface: they produced cameras and blank white boards.
+    Positive wording only (measured): "product photography background plate" produced cameras and white boards,
+    "nothing stands on the surface" still produced bottles; "a wide, clear stretch of bare surface" gave 6/6 bare tables.
     """
     scene = re.sub(r"\b(the|a|an|our|this)\s+product\s+(on|in|at|by|under|beside|next to)\b", r"\2", prompt,
                    flags=re.IGNORECASE)
     scene = re.sub(r"\b(the|a|an|our|this)\s+product\b", "", scene, flags=re.IGNORECASE).strip(" ,.")
-    return (f"{scene}. Nothing stands on the surface in the {_region_words(region)} part of the frame; that part "
-            f"of the surface is clear and in sharp focus")
+    return f"{scene}, with a wide, clear stretch of bare surface in the {_region_words(region)} part of the frame"
 
 
 def _job_dir(root: Path, payload: dict[str, Any]) -> Path:
@@ -213,7 +213,8 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
     mode = base["mode"]
     composites = 1 if mode == "preview" else 2
     stage("배경 생성 중", 0.15)
-    backgrounds = run_quality_job({**base, "prompt": background_prompt(prompt, region), "original_prompt": prompt,
+    backgrounds = run_quality_job({**base, "purpose": "background_scene",
+                                   "prompt": background_prompt(prompt, region), "original_prompt": prompt,
                                    "references": other_refs, "max_candidates_per_engine": composites}, cancel, note)
     warnings += backgrounds["warnings"]
     exact = []

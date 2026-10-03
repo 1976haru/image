@@ -21,6 +21,8 @@ PURPOSES: dict[str, dict[str, Any]] = {
     "shopify_product_lifestyle": {"size": (1280, 1280), "envelope": "lifestyle product photograph, natural styling"},
     "shopify_promo_tile": {"size": (1024, 1024), "envelope": "square photograph, bold simple composition"},
     "shopify_mobile_banner": {"size": (768, 1024), "envelope": "portrait photograph, simple composition"},
+    # Composite backgrounds: "product photograph" made Z-Image add a bottle on 6/6 seeds; this gave 6/6 bare tables.
+    "background_scene": {"size": (1280, 720), "envelope": "photograph of the setting"},
 }
 # Engines need multiples of 16; purposes map to these generation sizes and are resized after.
 CANVAS_PRESETS = {name: spec["size"] for name, spec in PURPOSES.items()}
@@ -58,13 +60,13 @@ class CompiledPrompt:
 NO_PEOPLE = "The scene is empty of people; no person or figure appears anywhere."
 CAMERA_PROSE = "Shot on a full-frame camera with a 50mm lens at f/2, natural light falloff, realistic color grading."
 FLUX_CAMERA_PROSE = "Photographed with a full-frame camera and a 50mm lens, shallow depth of field, true-to-life color."
-NO_PRODUCT = ("No product, camera, gadget, device, bottle or packaging is featured; the setting itself is the "
-              "subject.")
+# Positive wording only: listing nouns ("no camera, bottle...") made Z-Image draw exactly those (2026-10-04).
+NO_PRODUCT = "The surfaces are bare and uncluttered; the setting itself is the subject."
 
 
 def _no_product(purpose: str, user_prompt: str, roles: list[dict[str, Any]] | None = None) -> str:
     """Store scenes without a product reference or product wording must not get an invented hero product."""
-    if not purpose.startswith("shopify"):
+    if not purpose.startswith("shopify") and purpose != "background_scene":
         return ""
     if any(r["role"] in ("PRODUCT", "EDIT") for r in roles or []) or "product" in user_prompt.casefold():
         return ""

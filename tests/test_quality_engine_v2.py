@@ -404,6 +404,8 @@ def test_store_scenes_do_not_invent_a_product():
 
     hero = compile_prompt("zimage_turbo", "an editorial lifestyle scene", "", "shopify_hero_banner")
     assert NO_PRODUCT in hero.positive and "e-commerce" not in hero.positive
+    for noun in ("camera", "bottle", "gadget"):
+        assert noun not in hero.positive.casefold()
     with_product = compile_prompt("zimage_turbo", "the product on a table", "", "shopify_hero_banner")
     assert NO_PRODUCT not in with_product.positive
     youtube = compile_prompt("zimage_turbo", "rainy street", "Tokyo Chill")

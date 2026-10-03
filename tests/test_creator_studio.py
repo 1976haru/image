@@ -98,7 +98,7 @@ def test_safe_name_keeps_unicode():
 def test_background_prompt_removes_the_product():
     text = cj.background_prompt("the product on dark polished stone", (0.5, 0.3, 0.45, 0.6))
     assert text.startswith("on dark polished stone") and "product" not in text.casefold()
-    assert "lower right" in text and "Nothing stands on the surface" in text
+    assert "lower right" in text and "clear stretch of bare surface" in text
     for word in ("photograph", "plate", "camera"):
         assert word not in text.casefold()
 
@@ -194,7 +194,8 @@ def test_product_preserve_puts_exact_composites_first(tmp_path, fake_run):
     assert all("AI가 다시 그린 상품" in c["warnings"][0] for c in regenerated)
     assert max(c["score"] for c in regenerated) < min(c["score"] for c in result["candidates"][:2])
     background_call = fake_run.calls[0]
-    assert background_call["references"] == [] and "Nothing stands" in background_call["prompt"]
+    assert background_call["references"] == [] and "bare surface" in background_call["prompt"]
+    assert background_call["purpose"] == "background_scene"
     assert background_call["canvas"] == [1600, 1200]
     roles = [r["role"] for r in json.loads(Path(result["job_dir"], "job.json").read_text(encoding="utf-8"))["references"]]
     assert roles == ["PRODUCT"]
