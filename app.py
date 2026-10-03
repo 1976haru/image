@@ -23,9 +23,11 @@ def _run_gui() -> int:
 
 
 def main() -> int:
-    if "--thumbnail-bridge-json" in sys.argv[1:]:
+    # Headless bridge: --thumbnail-bridge-json (contract), or youtubesum's --image-bridge / --action forms.
+    argv = sys.argv[1:]
+    if "--thumbnail-bridge-json" in argv or "--image-bridge" in argv or "--action" in argv:
         from covermorph.thumbnail_bridge_runtime import run_bridge_cli
-        return run_bridge_cli()
+        return run_bridge_cli(argv=argv)
     return _run_gui()
 
 

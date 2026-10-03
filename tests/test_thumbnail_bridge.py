@@ -71,9 +71,13 @@ class ThumbnailBridgeRuntimeTests(unittest.TestCase):
             self.assertTrue(payload["project_dir_writable"])
 
     def test_generate_is_not_falsely_reported_as_real_ai(self):
+        from unittest.mock import patch
+        from covermorph import thumbnail_bridge_runtime
         from covermorph.thumbnail_bridge_runtime import handle_request
         import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
+        missing = {"status": "model_missing", "reference_status": "model_missing", "model": {"failure_reason": "missing"}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+                thumbnail_bridge_runtime, "_environment", lambda request: (missing, Path(tmp), "none")):
             req = ThumbnailBridgeRequest.from_dict({
                 "protocol_version": 1,
                 "request_id": "gen-1",
@@ -83,4 +87,5 @@ class ThumbnailBridgeRuntimeTests(unittest.TestCase):
             })
             response = handle_request(req)
             self.assertFalse(response.ok)
-            self.assertEqual(response.error_code, "ACTION_NOT_IMPLEMENTED")
+            self.assertEqual(response.error_code, "MODEL_NOT_READY")
+            self.assertFalse((Path(tmp) / "canvas_clean.png").exists())

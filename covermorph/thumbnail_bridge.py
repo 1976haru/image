@@ -84,6 +84,7 @@ class ThumbnailBridgeResponse:
     warnings: list[str] = field(default_factory=list)
     message: str = ""
     error_code: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -98,6 +99,8 @@ class ThumbnailBridgeResponse:
         }
         if self.error_code:
             payload["error_code"] = self.error_code
+        if self.details:
+            payload["details"] = self.details
         return payload
 
 
