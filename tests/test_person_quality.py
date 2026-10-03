@@ -49,7 +49,7 @@ def test_person_prompt_keeps_subject_framing_quality_and_negatives():
     plan = build_prompt_plan("young couple by a cafe window", "OLD POP LOUNGE", "left", True, person=True,
                              framing=pq.COMPOSITION_PROFILES["COUPLE_MEDIUM"]["framing"])
     joined = ", ".join(plan.prompt_parts)
-    assert plan.prompt_parts[0].startswith("young couple") and "both faces clearly visible" in joined
+    assert plan.prompt_parts[0].startswith("young couple") and "exactly two people" in joined
     assert "natural skin texture" in joined and "textless photograph" in joined
     for bad in ("waxy skin", "extra fingers", "asymmetrical eyes", "watermark", "duplicate person"):
         assert bad in plan.negative_prompt
@@ -151,7 +151,7 @@ def test_fast_mode_is_single_pass(monkeypatch):
 def test_face_detail_rejects_softer_or_drifted_refinements(monkeypatch):
     crop = _textured((400, 400))
     ok, reason = pq._same_face(crop, crop.filter(ImageFilter.GaussianBlur(3)), None)
-    assert not ok and "softer" in reason
+    assert not ok and ("softer" in reason or "identity" in reason)
     calls = iter([[_face((0.3, 0.3, 0.4, 0.4))], [_face((0.5, 0.5, 0.4, 0.4))]])
     monkeypatch.setattr(pq, "detect_faces_yunet", lambda image, model, min_score=0.5: next(calls))
     ok, reason = pq._same_face(crop, crop.copy(), Path("y"))
@@ -233,3 +233,16 @@ def test_status_reports_person_quality_readiness(monkeypatch, tmp_path):
     assert payload["model_profiles"]["photoreal_sdxl"]["license"] == "openrail++"
     assert payload["face_detector"]["ready"] is False and payload["identity_backend"]["ready"] is False
     assert set(payload["quality_modes"]) == {"fast", "quality"}
+
+
+def test_identity_guard_rejects_changed_face_structure():
+    base = _textured((300, 300), seed=3).filter(ImageFilter.GaussianBlur(4))
+    assert pq.structural_similarity(base, base.filter(ImageFilter.UnsharpMask(2, 80, 0))) > pq.IDENTITY_SIMILARITY_FLOOR
+    other = _textured((300, 300), seed=4).filter(ImageFilter.GaussianBlur(4))
+    ok, reason = pq._same_face(base, other, None)
+    assert not ok and "identity" in reason
+
+
+def test_face_detail_is_opt_in_and_strength_capped():
+    assert pq.QUALITY_MODES["quality"]["face_detail"] is False
+    assert pq.MAX_FACE_DETAIL_STRENGTH <= 0.4

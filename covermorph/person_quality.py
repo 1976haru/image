@@ -52,7 +52,9 @@ IDENTITY_BACKEND_NOTE = ("InstantID is not enabled: its face encoder (insightfac
 # Quality modes: FAST = one pass; QUALITY = more steps + face detail + QA regenerate-once.
 QUALITY_MODES: dict[str, dict[str, Any]] = {
     "fast": {"steps": 22, "face_detail": False, "qa_retry": False},
-    "quality": {"steps": 30, "face_detail": True, "qa_retry": True},
+    # Face detail is opt-in: on RealVisXL output it gave no visible gain at identity-safe strengths (<=0.35)
+    # and changed the person at 0.55 (measured 2026-10-03), so QUALITY does not run it unless asked.
+    "quality": {"steps": 30, "face_detail": False, "qa_retry": True},
 }
 
 
@@ -123,14 +125,19 @@ def detect_faces_yunet(image: Image.Image, model_path: Path, min_score: float = 
 
 # ------------------------------------------------------------------ technical face metrics
 def face_sharpness(image: Image.Image, box: tuple[float, float, float, float]) -> float:
-    """Variance of the Laplacian on the face crop normalized to 256 px (higher = more detail)."""
+    """Variance of the Laplacian on the face crop downscaled (never upscaled) to 128 px wide.
+
+    Upscaling small crops deflated the old metric; measured on real outputs, soft SDXL-base faces score
+    ~70-95 and sharp photoreal faces ~120-880 once crops are only ever reduced.
+    """
     width, height = image.size
     x, y, w, h = box
     crop = image.crop((int(x * width), int(y * height), int((x + w) * width), int((y + h) * height)))
     if crop.width < 8 or crop.height < 8:
         return 0.0
-    gray = np.asarray(crop.convert("L").resize((256, round(256 * crop.height / crop.width) or 1), Image.Resampling.LANCZOS),
-                      dtype=np.float32)
+    target = min(128, crop.width)
+    gray = np.asarray(crop.convert("L").resize((target, max(1, round(target * crop.height / crop.width))),
+                                                Image.Resampling.LANCZOS), dtype=np.float32)
     return float(cv2.Laplacian(gray, cv2.CV_32F).var())
 
 
@@ -141,32 +148,37 @@ def exposure_stats(image: Image.Image) -> dict[str, float]:
 
 # ------------------------------------------------------------------ composition / prompts
 COMPOSITION_PROFILES: dict[str, dict[str, Any]] = {
-    "SOLO_CLOSE": {"people": 1, "min_face_height": 0.18, "max_face_height": 0.50,
-                   "framing": "medium close-up from the chest up, face in sharp focus, open space beside the subject"},
-    "SOLO_MEDIUM": {"people": 1, "min_face_height": 0.12, "max_face_height": 0.35,
-                    "framing": "medium shot from the waist up, face clearly visible and in sharp focus"},
-    "COUPLE_MEDIUM": {"people": 2, "min_face_height": 0.10, "max_face_height": 0.30,
-                      "framing": "medium shot of two people from the waist up, both faces clearly visible and in focus"},
-    "COUPLE_EMOTIONAL": {"people": 2, "min_face_height": 0.14, "max_face_height": 0.40,
-                         "framing": "intimate medium close-up of two people, both faces large and clearly visible"},
+    # Face height = YuNet forehead-to-chin box / frame height. Measured on RealVisXL: detail words alone push
+    # it to 0.45-0.7 (no room for typography), so framing words ask for visible surroundings explicitly.
+    "SOLO_CLOSE": {"people": 1, "min_face_height": 0.16, "max_face_height": 0.40,
+                   "framing": "waist-up shot, head and shoulders with the background visible, subject off-center"},
+    "SOLO_MEDIUM": {"people": 1, "min_face_height": 0.10, "max_face_height": 0.30,
+                    "framing": "medium-wide shot, upper body and surroundings visible, subject off-center"},
+    "COUPLE_MEDIUM": {"people": 2, "min_face_height": 0.09, "max_face_height": 0.28,
+                      "framing": "medium-wide shot of exactly two people, upper bodies and surroundings visible"},
+    "COUPLE_EMOTIONAL": {"people": 2, "min_face_height": 0.12, "max_face_height": 0.35,
+                         "framing": "medium shot of exactly two people facing each other, upper bodies visible"},
     "SCENERY_WITH_PERSON": {"people": 1, "min_face_height": 0.0, "max_face_height": 0.15,
                             "framing": "wide cinematic shot, a small person in the scene"},
 }
-PERSON_POSITIVE = ("cinematic photograph, natural skin texture, detailed eyes, realistic hair, natural facial "
-                   "proportions, subtle expression, realistic lighting, high-end editorial photography")
+PERSON_POSITIVE = ("cinematic film photograph, natural skin texture, realistic hair, natural facial proportions, "
+                   "subtle expression, realistic lighting")
 # Ordered by priority: fit_prompt keeps as many as the 77-token CLIP limit allows.
 PERSON_NEGATIVE_PARTS = [
     "text, watermark, logo, letters, signage",
     "deformed face, asymmetrical eyes, malformed hands, extra fingers, fused fingers",
     "plastic skin, waxy skin, over-smoothed face, doll-like face, blurry face, low-detail face",
-    "duplicate person, extra person, cartoon, 3d render, cgi",
-    "caption, subtitle, banner, lowres, jpeg artifacts, oversaturated",
+    "duplicate person, extra person, third person, twins, clone",
+    "extreme close-up, cartoon, 3d render, cgi, lowres, oversaturated",
 ]
 FACE_DETAIL_PROMPT = ("close-up photo of the same person's face, detailed natural skin texture with pores, "
                       "detailed eyes and eyelashes, realistic hair strands, natural lips, soft natural light")
-# Faces taller than max_face_height are already rendered at high resolution; refining them only softens.
+# Measured on RealVisXL at 1344x768: faces taller than ~30% of the frame are already fully detailed and
+# every refinement strength only smooths them, so the pass targets 5-30% faces.
 FACE_DETAIL_DEFAULTS = {"strength": 0.35, "steps": 24, "guidance_scale": 4.0, "expand": 2.0, "max_faces": 2,
-                        "min_face_height": 0.06, "max_face_height": 0.42, "work_long_side": 1024}
+                        "min_face_height": 0.05, "max_face_height": 0.30, "work_long_side": 768}
+MAX_FACE_DETAIL_STRENGTH = 0.40
+IDENTITY_SIMILARITY_FLOOR = 0.985  # low-pass structure; same face >=0.99, different person 0.948 measured
 _PEOPLE_TWO = ("two people", "two ", "couple", "pair", " and a ", " and an ", "lovers", "both")
 _PEOPLE_ONE = ("man", "woman", "person", "girl", "boy", "lady", "gentleman", "portrait", "he ", "she ")
 
@@ -193,12 +205,14 @@ def choose_composition(people: int, candidate: str = "A", requested: str = "") -
 
 
 # ------------------------------------------------------------------ QA gate
-SHARPNESS_FLOOR = 60.0
+SHARPNESS_FLOOR = 110.0
+MIN_SHARPNESS_FACE_PX = 64  # below this the Laplacian is noise; the face-size check covers tiny faces
 
 
 def face_metrics(image: Image.Image, faces: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"box": [round(v, 4) for v in face["box"]], "confidence": round(face["confidence"], 3),
-             "height": round(face["box"][3], 4), "sharpness": round(face_sharpness(image, face["box"]), 1)}
+             "height": round(face["box"][3], 4), "width_px": round(face["box"][2] * image.width),
+             "sharpness": round(face_sharpness(image, face["box"]), 1)}
             for face in faces]
 
 
@@ -218,7 +232,8 @@ def quality_check(image: Image.Image, faces: list[dict[str, Any]], expected_peop
         problems.append(f"face smaller than {min_face_height:.0%} of frame height")
     if main and any(face["height"] > max_face_height for face in main):
         warnings.append(f"face taller than {max_face_height:.0%} of frame height; little room for typography")
-    if main and min(face["sharpness"] for face in main) < SHARPNESS_FLOOR:
+    measurable = [face for face in main if face["width_px"] >= MIN_SHARPNESS_FACE_PX]
+    if measurable and min(face["sharpness"] for face in measurable) < SHARPNESS_FLOOR:
         problems.append("main face is soft/low-detail")
     exposure = exposure_stats(image)
     if exposure["mean"] < 0.06 or exposure["mean"] > 0.94 or exposure["clipped_dark"] > 0.35 or exposure["clipped_bright"] > 0.2:
@@ -256,10 +271,24 @@ def _blend_mask(size: tuple[int, int]) -> Image.Image:
     return mask.filter(ImageFilter.GaussianBlur(max(4, min(size) // 10)))
 
 
+def structural_similarity(original: Image.Image, refined: Image.Image, size: int = 48) -> float:
+    """Correlation of the blurred inner face region: tracks features (identity), ignores added micro-texture."""
+    def prepare(image: Image.Image) -> np.ndarray:
+        width, height = image.size
+        inner = image.convert("L").crop((int(width * 0.2), int(height * 0.2), int(width * 0.8), int(height * 0.8)))
+        array = np.asarray(inner.filter(ImageFilter.GaussianBlur(max(1, width // 150))).resize((size, size)), dtype=np.float64)
+        return (array - array.mean()) / (array.std() + 1e-6)
+
+    return float((prepare(original) * prepare(refined)).mean())
+
+
 def _same_face(original: Image.Image, refined: Image.Image, model_path: Path | None) -> tuple[bool, str]:
-    """Reject refinements that move/lose the face or end up softer than the original."""
+    """Reject refinements that change the person, move/lose the face, or end up softer than the original."""
     if refined.size != original.size:
         return False, "size changed"
+    similarity = structural_similarity(original, refined)
+    if similarity < IDENTITY_SIMILARITY_FLOOR:
+        return False, f"face structure changed (similarity {similarity:.3f}); possible identity change"
     if face_sharpness(refined, (0, 0, 1, 1)) < face_sharpness(original, (0, 0, 1, 1)) * 0.9:
         return False, "refined crop is softer"
     if model_path is None:
@@ -294,9 +323,11 @@ def refine_faces(engine: Any, image: Image.Image, faces: list[dict[str, Any]], *
     from diffusers import StableDiffusionXLImg2ImgPipeline
 
     options = {**FACE_DETAIL_DEFAULTS, **(settings or {})}
+    options["strength"] = min(float(options["strength"]), MAX_FACE_DETAIL_STRENGTH)
     started = time.perf_counter()
     info: dict[str, Any] = {"settings": options, "faces": [], "applied": False}
     if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # release the text-to-image activations before the img2img pass
         torch.cuda.reset_peak_memory_stats()
     img2img = StableDiffusionXLImg2ImgPipeline(**engine.pipeline.components)
     if (getattr(engine, "memory_profile", None) or {}).get("cpu_offload"):
@@ -327,6 +358,8 @@ def refine_faces(engine: Any, image: Image.Image, faces: list[dict[str, Any]], *
             record["reason"] = f"refinement failed: {type(exc).__name__}"
             continue
         refined = refined_work.resize(crop.size, Image.Resampling.LANCZOS)
+        if options.get("keep_candidates"):  # validation/debug only: inspect rejected refinements too
+            record["_candidate"], record["_original"] = refined, crop
         ok, reason = _same_face(crop, refined, model_path)
         record["reason"] = reason
         record["sharpness_before"] = round(face_sharpness(crop, (0, 0, 1, 1)), 1)
