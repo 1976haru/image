@@ -240,8 +240,10 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
         regenerated += [(c, "harmonized") for c in harmonized["candidates"][:1]]
     if mode == "best" and not cancel.is_set():
         stage("상품 참조 생성 중 (FLUX.2)", 0.75)
+        # FLUX.2 only: the BEST reference plan would also load RealVis here, whose candidate is not used and
+        # whose in-process CUDA context (~150 MiB) stays until the app exits.
         generated = run_quality_job({**base, "prompt": prompt, "references": product_refs + other_refs,
-                                     "max_candidates_per_engine": 2}, cancel, note)
+                                     "only_engine": "flux2_klein_4b", "max_candidates_per_engine": 2}, cancel, note)
         warnings += generated["warnings"]
         regenerated += [(c, "regenerated") for c in generated["candidates"] if c["manifest"]["backend"] == "flux2_klein_4b"]
     checks = [(candidate, kind, check_product(cutout, candidate["image"])) for candidate, kind in regenerated]

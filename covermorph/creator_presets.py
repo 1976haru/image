@@ -105,13 +105,15 @@ BUILTIN_PROMPT_PRESETS: dict[str, PromptPreset] = {p.key: p for p in [
     PromptPreset("sh_clean_studio", "Shopify · 깔끔한 스튜디오", "shopify_product_lifestyle",
                  "the product on a clean seamless studio backdrop with soft even light and a gentle shadow"),
     PromptPreset("sh_editorial", "Shopify · 에디토리얼 라이프스타일", "shopify_hero",
-                 "an editorial lifestyle scene with refined styling, natural materials and soft directional light"),
+                 "an airy editorial living space with linen textiles, ceramic vases, light oak furniture and soft "
+                 "directional light"),
     PromptPreset("sh_daylight", "Shopify · 부드러운 자연광", "shopify_collection",
                  "a bright home interior with soft morning daylight, linen textures and green plants"),
     PromptPreset("sh_luxury", "Shopify · 럭셔리 상품", "shopify_product_lifestyle",
                  "the product on dark polished stone with dramatic rim light and elegant reflections"),
     PromptPreset("sh_seasonal", "Shopify · 시즌 프로모션", "shopify_promo_tile",
-                 "a festive seasonal setting with warm lights and tasteful decorations, uncluttered center"),
+                 "a festive wooden tabletop with warm string lights and tasteful seasonal decorations softly blurred "
+                 "in the background"),
 ]}
 
 
