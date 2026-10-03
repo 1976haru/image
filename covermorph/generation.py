@@ -233,9 +233,13 @@ class GenerationConfig:
     ip_adapter_id: str = DEFAULT_IP_ADAPTER
     ip_adapter_revision: str | None = DEFAULT_IP_ADAPTER_REVISION
     ip_adapter_weight: str = DEFAULT_IP_ADAPTER_WEIGHT
+    # Optional explicit (width, height); low-VRAM bridge profiles generate smaller and resize afterwards.
+    working_size: tuple[int, int] | None = None
 
     @property
     def size(self) -> tuple[int, int]:
+        if self.working_size is not None:
+            return (int(self.working_size[0]), int(self.working_size[1]))
         try:
             return GENERATION_SIZES[self.output_ratio]
         except KeyError as exc:
@@ -262,7 +266,8 @@ class GenerationResult:
     run_id: str = ""
 
 
-def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_MODEL) -> dict[str, Any]:
+def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_MODEL, models_dir: Path | None = None) -> dict[str, Any]:
+    models_dir = models_dir if models_dir is not None else app_root / "models"
     result: dict[str, Any] = {
         "status": "package_missing",
         "torch": None,
@@ -305,7 +310,7 @@ def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_M
         result["transformers"] = transformers.__version__
     except (ImportError, AttributeError):
         pass
-    result["model_paths"] = [str(path) for path in (app_root / "models").glob("*")] if (app_root / "models").is_dir() else []
+    result["model_paths"] = [str(path) for path in models_dir.glob("*")] if models_dir.is_dir() else []
     model_path = Path(model_id)
     if not model_path.is_absolute():
         candidates = [model_path, app_root / model_path]
@@ -315,7 +320,7 @@ def detect_generation_environment(app_root: Path, model_id: str = DEFAULT_SDXL_M
     result["model_prepared"] = result["model"]["ready"]
     # Keep the original marker-level field for clients that used it before strict inspection.
     result["model_ready"] = model_path.is_dir() and (model_path / "model_index.json").is_file()
-    result["ip_adapter"] = inspect_ip_adapter(app_root / "models" / "ip_adapter")
+    result["ip_adapter"] = inspect_ip_adapter(models_dir / "ip_adapter")
     result["ip_adapter_ready"] = result["ip_adapter"]["ready"]
     packages_ready = all(result[name] for name in ("diffusers", "transformers", "accelerate", "safetensors"))
     result["status"] = (
@@ -353,6 +358,20 @@ class SDXLTextToImageEngine:
         self.adapter_signature: tuple[str, str, str, str] | None = None
         self.last_reference_applied = False
         self.last_generation_metrics: dict[str, Any] = {}
+        # Optional VRAM profile: {"vae_slicing": bool, "vae_tiling": bool, "cpu_offload": bool}.
+        self.memory_profile: dict[str, Any] = {}
+
+    def _apply_memory_profile(self) -> None:
+        profile = self.memory_profile or {}
+        vae = getattr(self.pipeline, "vae", None)
+        if profile.get("vae_slicing") and hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
+        if profile.get("vae_tiling") and hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+        if profile.get("cpu_offload") and hasattr(self.pipeline, "enable_model_cpu_offload"):
+            self.pipeline.enable_model_cpu_offload()
+        else:
+            self.pipeline.to("cuda")
 
     def load(self, progress: Callable[[dict[str, Any]], None] | None = None) -> None:
         try:
@@ -370,7 +389,7 @@ class SDXLTextToImageEngine:
         try:
             self.pipeline = StableDiffusionXLPipeline.from_pretrained(self.model_id, **kwargs)
             self.pipeline.enable_attention_slicing()
-            self.pipeline.to("cuda")
+            self._apply_memory_profile()
             self.loaded_revision = getattr(self.pipeline, "_commit_hash", None) or self.revision or "model-default"
         except Exception as exc:
             self.pipeline = None
@@ -455,7 +474,9 @@ class SDXLTextToImageEngine:
                 # registering it does not migrate the encoder automatically.
                 # Move the complete pipeline again to keep image embeddings and
                 # IP-Adapter weights on the same device during inference.
-                if hasattr(self.pipeline, "to"):
+                if (self.memory_profile or {}).get("cpu_offload") and hasattr(self.pipeline, "enable_model_cpu_offload"):
+                    self.pipeline.enable_model_cpu_offload()
+                elif hasattr(self.pipeline, "to"):
                     self.pipeline.to("cuda")
                 kwargs["image_encoder_folder"] = None
             else:
