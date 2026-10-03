@@ -53,6 +53,10 @@ Folders: `validation_results/quality_v2/<scene>/` — `<engine>_full.png`, `_fac
 | rf10 composition reference | — | palette + right placement, not the small-figure scale | copied layout most literally, subject unclear |
 | ed11 edit: keep woman, change background | — | same woman, snowy night, title space | not supported |
 
+Edit path: `reference_regenerate` on V2 edits the **whole canvas** with FLUX.2 (image 1 = the photo being
+edited) driven by the translated instruction. A person-crop reference turned one of two people away; the
+full-canvas edit kept both faces, clothes and pose (`validation_results/exe_v2/`).
+
 Bridge end-to-end (`validation_results/bridge_v2/`): Korean prompt "비 오는 도쿄 거리의 젊은 여성 옆모습"
 → Z-Image canvas (35 s, 7.0 GiB) → edit "keep the people, change the background to a snowy night street"
 → FLUX.2 kept the same woman (hair, coat, bag) in a snowy street (27 s).
@@ -79,6 +83,28 @@ fake signage and ignored "no people" in this comparison.
 The bridge (`--action generate/edit`) answers with one canvas: `engine=auto` (default) uses V2 when
 installed, 1 candidate (`candidates` 1–4 to change; extras saved to `<project>/candidates/`),
 `quality_mode` preview|balanced|best (old `quality_profile` fast→preview, quality→balanced).
+
+## Korean/Japanese prompts
+
+Z-Image-Turbo paints CJK prompt words into the picture as lettering. Same prompt "가을 공원 벤치에 앉은 50대 부부",
+seeds 777-779 (`validation_results/cjk_text_test/`):
+
+| Prompt given to Z-Image | Lettering in image |
+|---|---|
+| original Korean | 2/3 |
+| Korean + "these words must never be written" | 3/3 |
+| English | 0/3 |
+| Qwen3 translation (shipped path) | 0/3 |
+
+So V2 never passes CJK script to an engine. `covermorph/prompt_translate.py` translates prompts and edit
+instructions with the same Qwen3-4B GGUF through llama.cpp's CPU `llama-completion.exe` (b11381, ~9 s, no GPU,
+process exits). Literal-translation instruction + 3 few-shot examples: 10/10 test prompts correct (ages as
+"in their fifties", snow vs rain, edit instructions kept as instructions). If the translator is missing or
+fails, the scene vocabulary is used and the response warns. Manifests keep `original_prompt`,
+`translated_prompt`, `translation_method` and `compiled_prompt`.
+
+Note: prompts without a nationality produce people of unspecified ethnicity (the OLD POP couple came out
+Western); the system never infers one. Write it in the prompt (e.g. "일본인 부부") when it matters.
 
 ## Low-memory policy
 

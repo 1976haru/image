@@ -249,6 +249,7 @@ RTX 3060에서 같은 장면·시드로 비교한 결과(`docs/QUALITY_ENGINE_V2
 - 브리지 옵션: `engine` = `auto`(기본, V2 설치 시 사용) | `zimage_turbo` | `flux2_klein_4b` | `legacy`, `quality_mode` = `preview`(FLUX.2 1장) | `balanced`(기본) | `best`(엔진 2개 순차), `candidates` 1~4(브리지 기본 1, 추가 후보는 `<project>\candidates\`), `memory_policy` = `interactive_low_memory` | `balanced_idle` | `night_best`.
 - `project_manifest.json`에 backend, model, quantization, model_license, commercial_use_flag, original_prompt, compiled_prompt, reference_roles, quality_mode, memory_profile, timing, peak_vram_mib, system_commit_before/after가 기록됩니다.
 - 작업 대기열(`covermorph/job_queue.py`): 저장(원자적 교체), 현재 작업 후 일시정지, 재개, 대기 작업 취소, 앱 재시작 후 복구, GPU/commit/RAM이 기준보다 낮으면 시작하지 않고 대기. 실제 GPU 검증: `python scripts\validate_quality_queue.py --models-dir <models> --output-dir validation_results\quality_queue`.
+- 한국어/일본어 프롬프트와 편집 지시는 같은 Qwen3-4B로 영어 번역 후 사용합니다(llama.cpp CPU, 약 9초, GPU 미사용). Z-Image가 한글/일본어 단어를 이미지에 글자로 그리는 문제(원문 2/3, 번역 0/3)를 막기 위한 것이며, 원문·번역·최종 프롬프트가 manifest에 남습니다.
 - 비교 재현: `python scripts\benchmark_quality_v2.py --models-dir <models> --output-dir validation_results\quality_v2 --make-refs`.
 
 ### youtubesum 설정
