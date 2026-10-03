@@ -360,6 +360,9 @@ class SDXLTextToImageEngine:
         self.last_generation_metrics: dict[str, Any] = {}
         # Optional VRAM profile: {"vae_slicing": bool, "vae_tiling": bool, "cpu_offload": bool}.
         self.memory_profile: dict[str, Any] = {}
+        # Optional checkpoint variant (e.g. "fp16") and scheduler override ("dpmpp_2m_karras").
+        self.variant: str | None = None
+        self.scheduler_name: str = "default"
 
     def _apply_memory_profile(self) -> None:
         profile = self.memory_profile or {}
@@ -386,8 +389,15 @@ class SDXLTextToImageEngine:
         kwargs: dict[str, Any] = {"torch_dtype": torch.float16, "use_safetensors": True, "local_files_only": self.local_files_only}
         if self.revision:
             kwargs["revision"] = self.revision
+        if self.variant:
+            kwargs["variant"] = self.variant
         try:
             self.pipeline = StableDiffusionXLPipeline.from_pretrained(self.model_id, **kwargs)
+            if self.scheduler_name == "dpmpp_2m_karras":
+                from diffusers import DPMSolverMultistepScheduler
+
+                self.pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
+                    self.pipeline.scheduler.config, use_karras_sigmas=True)
             self.pipeline.enable_attention_slicing()
             self._apply_memory_profile()
             self.loaded_revision = getattr(self.pipeline, "_commit_hash", None) or self.revision or "model-default"
