@@ -93,9 +93,9 @@ def _project_writable(project_dir: Path) -> bool:
         return False
 
 
-def _capabilities(env: dict[str, Any], writable: bool) -> dict[str, Any]:
-    generate_ready = env.get("status") == "ready"
-    reference_ready = env.get("reference_status") == "ready"
+def _capabilities(env: dict[str, Any], writable: bool, v2_ready: bool = False) -> dict[str, Any]:
+    generate_ready = env.get("status") == "ready" or v2_ready
+    reference_ready = env.get("reference_status") == "ready" or v2_ready
     levels = ["recompose"] + (["regenerate"] if generate_ready else []) + (["reference_regenerate"] if reference_ready else [])
     return {
         "status": True,
@@ -131,9 +131,34 @@ def _status_payload(request: ThumbnailBridgeRequest) -> dict[str, Any]:
             "final_size": list(FINAL_SIZE),
             "oom_policy": "one deterministic retry with the next lower-memory profile",
         },
-        "capabilities": _capabilities(env, writable),
+        "capabilities": _capabilities(env, writable, v2_ready=any(_v2_ready(models_dir).values())),
         "person_quality": _person_quality_status(models_dir),
+        "quality_engine_v2": _v2_status(models_dir),
     }
+
+
+V2_ENGINES = ("zimage_turbo", "flux2_klein_4b")
+LEGACY_ENGINE_CHOICES = ("legacy", "sdxl", "realvisxl_v5")
+
+
+def _v2_ready(models_dir: Path) -> dict[str, bool]:
+    from .quality_engines import make_backend
+
+    return {name: bool(make_backend(name, models_dir).status()["ready"]) for name in V2_ENGINES}
+
+
+def _v2_status(models_dir: Path) -> dict[str, Any]:
+    from .quality_engines import MEMORY_POLICIES, make_backend
+    from .quality_modes import (DEFAULT_REFERENCE_ENGINE, DEFAULT_T2I_ENGINE, FALLBACK_ENGINE, MODE_MEMORY,
+                                QUALITY_MODES_V2)
+
+    return {"engines": {name: make_backend(name, models_dir).status() for name in (*V2_ENGINES, FALLBACK_ENGINE)},
+            "defaults": {"t2i": DEFAULT_T2I_ENGINE, "reference_edit": DEFAULT_REFERENCE_ENGINE,
+                         "fallback": FALLBACK_ENGINE},
+            "quality_modes": QUALITY_MODES_V2, "mode_memory_profile": MODE_MEMORY,
+            "memory_policies": MEMORY_POLICIES,
+            "options": {"engine": ["auto", *V2_ENGINES, *LEGACY_ENGINE_CHOICES],
+                        "quality_mode": list(QUALITY_MODES_V2), "candidates": "1-4 per engine (bridge default 1)"}}
 
 
 def _person_quality_status(models_dir: Path) -> dict[str, Any]:
@@ -284,6 +309,17 @@ def _ai_render(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, 
     translated = translate_scene_terms(prompt)[0]
     if people is None:
         people = _int_option(options, "people", people_count(prompt, translated), 0, 6) if preserve_people else 0
+    v2_mode = _v2_mode(options, models_dir, reference=reference_image is not None, warnings=warnings)
+    if v2_mode:
+        try:
+            return _ai_render_v2(request, prompt=prompt, text_side=text_side, preserve_people=preserve_people,
+                                 final_size=final_size, warnings=warnings, reference_image=reference_image,
+                                 people=people, mode=v2_mode, started=started)
+        except Exception as exc:  # engine missing/failed: the proven SDXL path still answers the request
+            from .quality_engines import EngineCancelled
+            if isinstance(exc, EngineCancelled):
+                raise
+            warnings.append(f"Quality Engine V2 failed ({str(exc).splitlines()[0]}); used the SDXL fallback.")
     person = bool(options["person_quality"]) if isinstance(options.get("person_quality"), bool) else people > 0
     mode = str(options.get("quality_profile") or ("quality" if person else "fast")).casefold()
     if mode not in QUALITY_MODES:
@@ -351,6 +387,115 @@ def _ai_render(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, 
     }
     manifest_fields = {key: generation[key] for key in ("generation_model", "quality_profile", "face_detector",
                                                         "face_detail_applied", "identity_backend", "quality_warnings")}
+    return {"canvas": canvas, "raw": image, "generation": generation, "plan": plan, "people": people,
+            "manifest_fields": manifest_fields}
+
+
+def _v2_mode(options: dict[str, Any], models_dir: Path, *, reference: bool, warnings: list[str]) -> str:
+    """Quality mode to run on the V2 engines, or "" for the legacy SDXL path."""
+    from .quality_modes import QUALITY_MODES_V2, plan_engines
+
+    engine = str(options.get("engine") or "auto").casefold()
+    if engine in LEGACY_ENGINE_CHOICES or options.get("model_id") or options.get("model_profile"):
+        return ""
+    if engine not in ("auto", *V2_ENGINES):
+        raise _action_error("INVALID_REQUEST", f"engine must be one of auto, {', '.join(V2_ENGINES)}, "
+                            f"{', '.join(LEGACY_ENGINE_CHOICES)}.")
+    mode = str(options.get("quality_mode") or "").casefold()
+    if not mode:  # legacy quality_profile names map onto the V2 modes
+        mode = {"fast": "preview", "quality": "balanced"}.get(str(options.get("quality_profile") or "").casefold(),
+                                                              "balanced")
+    if mode not in QUALITY_MODES_V2:
+        raise _action_error("INVALID_REQUEST", f"quality_mode must be one of {', '.join(QUALITY_MODES_V2)}.")
+    ready = _v2_ready(models_dir)
+    if engine in V2_ENGINES and not ready[engine]:
+        warnings.append(f"Engine '{engine}' is not installed; used the SDXL path.")
+        return ""
+    if engine == "zimage_turbo" and reference:
+        warnings.append("Z-Image-Turbo cannot take a reference image; used FLUX.2-klein for this reference edit.")
+    plan = plan_engines(mode, has_references=reference, available=lambda name: ready.get(name, False))
+    return mode if plan else ""
+
+
+def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, preserve_people: bool,
+                  final_size: tuple[int, int], warnings: list[str], reference_image, people: int, mode: str,
+                  started: float) -> dict[str, Any]:
+    """Generate with Quality Engine V2 (Z-Image-Turbo / FLUX.2-klein via stable-diffusion.cpp)."""
+    import tempfile
+    import time
+
+    from .person_quality import choose_composition
+    from .quality_modes import QUALITY_MODES_V2, run_quality_job
+    from .thumbnail_bridge_ai import build_prompt_plan
+    from .thumbnail_bridge_assets import fit_16x9
+
+    options = request.options
+    models_dir = resolve_models_dir(request)
+    composition = choose_composition(people, str(options.get("candidate") or "A"),
+                                     str(options.get("composition_profile") or "")) if people else ""
+    seed = _int_option(options, "seed", random.randint(1, 2**31 - 1), 0, 2**31 - 1)
+    engine = str(options.get("engine") or "auto").casefold()
+    # The bridge answers with one canvas, so it makes 1 candidate per engine unless asked for more.
+    candidates = _int_option(options, "candidates", 1, 1, 4)
+    with tempfile.TemporaryDirectory(prefix="covermorph_v2_") as tmp:
+        references = []
+        if reference_image is not None:
+            ref_path = Path(tmp) / "person_reference.png"
+            reference_image.save(ref_path)
+            references.append({"path": str(ref_path), "role": "PERSON"})
+        payload = {"models_dir": str(models_dir), "prompt": prompt, "channel": request.channel,
+                   "purpose": "youtube_thumbnail_background", "mode": mode, "seed": seed, "people": people,
+                   "composition": composition, "text_side": text_side, "references": references,
+                   "memory_profile": str(options.get("memory_policy") or ""),
+                   "max_candidates_per_engine": candidates,
+                   "only_engine": engine if engine in V2_ENGINES and not references else ""}
+        _log(f"render v2: mode={mode} engine={engine} people={people} composition={composition or '-'} "
+             f"references={len(references)} seed={seed}")
+        result = run_quality_job(payload)
+    if not result["candidates"]:
+        raise RuntimeError("; ".join(result["warnings"]) or "no candidate was produced")
+    warnings.extend(result["warnings"])
+    best = result["candidates"][0]
+    image = best["image"]
+    canvas = fit_16x9(image, final_size)
+    record = best["manifest"]
+    qa = best["qa"]
+    quality_warnings = list(qa.get("problems") or []) + list(qa.get("warnings") or [])
+    if people and quality_warnings:
+        warnings.append("Person quality check: " + "; ".join(quality_warnings))
+    extra = []
+    if len(result["candidates"]) > 1:
+        folder = request.project_path / "candidates"
+        folder.mkdir(parents=True, exist_ok=True)
+        for index, candidate in enumerate(result["candidates"], 1):
+            path = folder / f"candidate_{index:02d}_{candidate['manifest']['backend']}_{candidate['manifest']['seed']}.png"
+            candidate["image"].save(path)
+            extra.append({"path": str(path), "score": candidate["score"], **{k: candidate["manifest"][k] for k in
+                          ("backend", "seed", "timing", "peak_vram_mib")}})
+    plan = build_prompt_plan(prompt, request.channel, text_side, preserve_people, person=people > 0)
+    total = round(time.perf_counter() - started, 3)
+    generation = {
+        "backend": f"Quality Engine V2: {record['model']} ({record['quantization']}, stable-diffusion.cpp)"
+                   if record["backend"] != "realvisxl_v5" else "Quality Engine V2: RealVisXL V5.0 (Diffusers)",
+        "generation_model": {"profile": record["backend"], "path": str(models_dir / "quality_v2"),
+                             "repository": record["repository"], "license": record["model_license"]},
+        "quality_profile": mode, "quality_mode": mode, "person_quality": people > 0, "people": people,
+        "composition_profile": composition, "face_detector": "yunet", "face_detail_applied": False,
+        "identity_backend": "none" if reference_image is None else
+                            f"{record['backend']} reference image (PERSON role; similarity, not identity-locked)",
+        "quality_warnings": quality_warnings, "user_prompt": prompt, "model_id": record["backend"],
+        "translated_terms": plan.translated_terms, "final_size": list(final_size),
+        "resize": "center crop to 16:9 + Lanczos (no stretch)", "total_seconds": total,
+        "generation_time_seconds": record["timing"]["engine_seconds"], "seed": record["seed"],
+        "candidates": extra, "engine_plan": [list(item) for item in result["plan"]],
+        "mode_definition": QUALITY_MODES_V2[mode], **record,
+    }
+    manifest_fields = {key: generation[key] for key in ("generation_model", "quality_profile", "face_detector",
+                                                        "face_detail_applied", "identity_backend", "quality_warnings")}
+    manifest_fields.update({key: record[key] for key in (
+        "backend", "model", "quantization", "model_license", "commercial_use_flag", "original_prompt",
+        "compiled_prompt", "reference_roles", "quality_mode", "memory_profile", "timing", "peak_vram_mib",
+        "system_commit_before_mib", "system_commit_after_mib")})
     return {"canvas": canvas, "raw": image, "generation": generation, "plan": plan, "people": people,
             "manifest_fields": manifest_fields}
 
