@@ -874,6 +874,13 @@ class StudioWindow(ctk.CTkToplevel):
 _studio: StudioWindow | None = None
 
 
+def app_root_dir() -> Path:
+    import sys
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
 def open_studio(master: Any, app_root: Path) -> StudioWindow:
     global _studio
     if _studio is None or not _studio.winfo_exists():
@@ -887,3 +894,78 @@ def open_studio(master: Any, app_root: Path) -> StudioWindow:
 def shutdown_studio() -> None:
     if _studio is not None:
         _studio.shutdown()
+
+
+def run_selftest(app_root: Path, out_dir: Path, timeout: float = 900.0) -> int:
+    """Packaged-app acceptance: open the real studio, fill the form, enqueue like the button, wait, screenshot.
+
+        CoverMorphStudio.exe --studio-selftest <out_dir>
+    Uses only config/creator_settings.json for paths (no environment variables).
+    """
+    from PIL import ImageGrab
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ctk.set_appearance_mode("dark")
+    root = ctk.CTk()
+    root.withdraw()
+    studio = StudioWindow(root, app_root)
+    studio.geometry("1500x930+20+20")
+    report: dict[str, Any] = {"models_dir": str(resolve_models_dir(studio.app_root, studio.settings)),
+                              "env_models_dir": os.environ.get("COVERMORPH_MODELS_DIR", "")}
+    started = time.time()
+
+    def shot(name: str) -> None:
+        studio.update()
+        studio.lift()
+        studio.attributes("-topmost", True)
+        studio.update()
+        x, y = studio.winfo_rootx(), studio.winfo_rooty()
+        ImageGrab.grab((x, y, x + studio.winfo_width(), y + studio.winfo_height())).save(out_dir / f"{name}.png")
+
+    def begin() -> None:
+        studio._set_purpose_key("youtube_thumbnail")
+        studio.preset_var.set(studio.prompt_presets["tc_solo_woman"].label)
+        studio._apply_preset()
+        studio.quality_var.set("빠른 미리보기")
+        studio.count_var.set("1")
+        studio._update_engine_note()
+        shot("01_create")
+        before = len(studio.queue.jobs)
+        studio._enqueue(True)
+        report["job_id"] = studio.queue.jobs[before].id if len(studio.queue.jobs) > before else ""
+        root.after(1000, wait)
+
+    def wait() -> None:
+        job = studio.queue.get(report.get("job_id", ""))
+        if job is not None and job.state == RUNNING and "queue_shot" not in report:
+            studio._refresh_queue()
+            shot("02_queue_running")
+            report["queue_shot"] = True
+        if job is not None and job.state in (DONE, FAILED, CANCELLED):
+            report.update(state=job.state, error=job.error, seconds=round(time.time() - started, 1),
+                          result_dir=(job.result or {}).get("job_dir"))
+            studio._refresh_queue()
+            shot("03_queue_done")
+            if job.state == DONE:
+                studio._show_review(job.id)
+                shot("04_review")
+            studio.tabs.set("설정")
+            studio._check_engines()
+            shot("05_settings")
+            finish()
+            return
+        if time.time() - started > timeout:
+            report.update(state="timeout")
+            finish()
+            return
+        root.after(1000, wait)
+
+    def finish() -> None:
+        (out_dir / "selftest.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        studio.shutdown()
+        root.after(500, root.destroy)
+
+    root.after(1500, begin)
+    root.mainloop()
+    return 0 if report.get("state") == DONE else 1

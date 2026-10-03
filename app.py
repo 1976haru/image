@@ -25,6 +25,9 @@ def _run_gui() -> int:
 def main() -> int:
     # Headless bridge: --thumbnail-bridge-json (contract), or youtubesum's --image-bridge / --action forms.
     argv = sys.argv[1:]
+    if argv[:1] == ["--studio-selftest"]:  # packaged-app acceptance run of the AI 이미지 스튜디오
+        from covermorph.creator_gui import app_root_dir, run_selftest
+        return run_selftest(app_root_dir(), argv[1] if len(argv) > 1 else "studio_selftest")
     if argv[:1] == ["--ocr-worker"]:  # short-lived OCR process for the product logo check
         from covermorph.ocr_worker import main as ocr_main
         return ocr_main(argv[1:])
