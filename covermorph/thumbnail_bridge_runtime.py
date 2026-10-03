@@ -319,6 +319,7 @@ def _edit(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
         detect_subjects,
         fit_16x9,
         flag_missing_faces,
+        located_people,
         merge_subjects,
         read_json,
         subjects_from_known,
@@ -369,6 +370,11 @@ def _edit(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
     edit_record: dict[str, Any] = {"at": utc_now(), "instruction": request.edit_instruction, "level": plan.level,
                                    "recognized": plan.recognized}
     notes: list[str] = []
+    if plan.level == "reference_regenerate" and not located_people(subjects):
+        raise _action_error("UNSUPPORTED_EDIT", "reference_regenerate needs the people in the current canvas, but none "
+                            "could be located (no face detected). Use a regenerate edit or mark the people first.", details)
+    if plan.level == "recompose" and subjects and not located_people(subjects):
+        warnings.append("People could not be located; the protected area is a composition-based guess.")
     if plan.level == "recompose":
         after, subjects, notes = apply_recompose(before, plan, subjects)
         source_size = final_size
@@ -551,6 +557,9 @@ def _stdout_reserved() -> Iterator[int | None]:
             pass
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    elif hasattr(sys.stderr, "reconfigure"):
+        # Frozen/windowed builds default to the ANSI code page; callers decode logs as UTF-8.
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     saved_fd: int | None = None
     try:
         saved_fd = os.dup(1)

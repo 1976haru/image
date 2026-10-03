@@ -157,9 +157,11 @@ def test_invalid_request_is_json_and_nonzero(capfd):
 def test_subprocess_stdout_is_json_only_for_unicode_path(project):
     request = {"protocol_version": 1, "request_id": "sub-1", "action": "edit", "project_dir": str(project),
                "edit_instruction": "왼쪽 문구 공간을 넓혀줘"}
-    done = subprocess.run([sys.executable, str(REPO / "app.py"), "--thumbnail-bridge-json"], cwd=REPO,
+    env = {key: value for key, value in os.environ.items() if key not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+    done = subprocess.run([sys.executable, str(REPO / "app.py"), "--thumbnail-bridge-json"], cwd=REPO, env=env,
                           input=json.dumps(request, ensure_ascii=False).encode("utf-8"), capture_output=True, timeout=300)
     payload = json.loads(done.stdout.decode("utf-8"))
+    assert project.name in done.stderr.decode("utf-8")  # logs are UTF-8 even on a cp949 console
     assert done.returncode != 0
     assert payload["error_code"] == "NO_SOURCE_CANVAS" and payload["project_dir"] == str(project)
 
@@ -279,6 +281,23 @@ def test_oom_never_loops():
     assert FakeEngine.calls == ["standard", "balanced"]
 
 
+def test_bottom_edge_face_hits_are_ignored(monkeypatch):
+    from covermorph import thumbnail_bridge_assets as assets
+
+    class Cascade:
+        def empty(self):
+            return False
+
+        def detectMultiScale(self, pixels, **kwargs):
+            height, width = pixels.shape
+            return [(int(width * 0.5), int(height * 0.88), int(width * 0.06), int(height * 0.1)),
+                    (int(width * 0.2), int(height * 0.2), int(width * 0.1), int(height * 0.18))]
+
+    monkeypatch.setattr(assets, "_face_cascade", lambda name="": Cascade())
+    faces = assets.detect_faces(Image.new("RGB", (1280, 720)))
+    assert faces and all(face[1] + face[3] / 2 <= 0.85 for face in faces)
+
+
 def test_memory_profile_thresholds():
     assert select_memory_profile(24 * 1024**3) == "standard"
     assert select_memory_profile(12 * 1024**3) == "balanced"
@@ -349,8 +368,20 @@ def test_recompose_moves_subject_and_widens_left_space(fake_ai, project):
     assert any(region["name"].startswith("left") for region in regions)
 
 
+def test_reference_regenerate_refuses_when_people_not_located(fake_ai, project):
+    assert runtime.handle_request(_request(project)).ok  # fake scene has no detectable face -> fallback box
+    before = _snapshot(project)
+    response = runtime.handle_request(_request(project, "edit", edit_instruction="두 사람은 그대로 두고 도쿄 야경으로 바꿔줘"))
+    assert not response.ok and response.error_code == "UNSUPPORTED_EDIT"
+    assert _snapshot(project) == before
+
+
 def test_reference_regenerate_uses_ip_adapter_reference(fake_ai, project):
     assert runtime.handle_request(_request(project)).ok
+    boxes = standard_output_paths(project)["subject_boxes"]
+    data = json.loads(boxes.read_text(encoding="utf-8"))
+    data["subjects"][0].update(source="user", face={"x": 0.7, "y": 0.25, "w": 0.1, "h": 0.18})
+    boxes.write_text(json.dumps(data), encoding="utf-8")
     response = runtime.handle_request(_request(project, "edit", edit_instruction="두 사람은 그대로 두고 도쿄 야경으로 바꿔줘"))
     assert response.ok, response.message
     generation = response.details["generation"]

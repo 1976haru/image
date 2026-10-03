@@ -150,6 +150,8 @@ def detect_faces(image: Image.Image) -> list[Box]:
         for x, y, w, h in hits:
             x = small.width - x - w if mirrored else x
             found.append((float(x) / small.width, float(y) / small.height, float(w) / small.width, float(h) / small.height))
+    # A face centered in the bottom 15% would put its body almost entirely off-frame: almost always a false hit.
+    found = [box for box in found if box[1] + box[3] / 2 <= 0.85]
     unique: list[Box] = []
     for box in sorted(found, key=lambda item: item[2] * item[3], reverse=True):
         if all(_iou(box, kept) < 0.3 and overlap_fraction(box, kept) < 0.6 for kept in unique):
@@ -199,7 +201,7 @@ def subjects_from_known(records: Any) -> list[Subject]:
         role = str(record.get("role") or "other")
         subjects.append(Subject(role if role in ("protagonist", "counterpart", "other") else "other",
                                 str(record.get("kind") or "person"), box, float(record.get("confidence") or 0.5),
-                                "project_known", face_box))
+                                str(record.get("source") or "project_known"), face_box))
     return subjects
 
 
@@ -218,6 +220,11 @@ def detect_subjects(image: Image.Image, *, text_side: str = "left", protagonist_
     x = {"right": 0.56, "left": 0.08, "center": 0.32}[subject_side]
     notes.append("No face detected; subject box is a conservative composition fallback")
     return [Subject("protagonist", "person", (x, 0.12, 0.36, 0.80), 0.3, "composition_fallback")], notes
+
+
+def located_people(subjects: list[Subject]) -> list[Subject]:
+    """Subjects whose position came from real evidence, not the composition fallback guess."""
+    return [subject for subject in subjects if subject.face is not None or subject.source != "composition_fallback"]
 
 
 def merge_subjects(known: list[Subject], fresh: list[Subject]) -> list[Subject]:
