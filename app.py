@@ -25,6 +25,9 @@ def _run_gui() -> int:
 def main() -> int:
     # Headless bridge: --thumbnail-bridge-json (contract), or youtubesum's --image-bridge / --action forms.
     argv = sys.argv[1:]
+    if argv[:1] == ["--ocr-worker"]:  # short-lived OCR process for the product logo check
+        from covermorph.ocr_worker import main as ocr_main
+        return ocr_main(argv[1:])
     if "--thumbnail-bridge-json" in argv or "--image-bridge" in argv or "--action" in argv:
         from covermorph.thumbnail_bridge_runtime import run_bridge_cli
         return run_bridge_cli(argv=argv)

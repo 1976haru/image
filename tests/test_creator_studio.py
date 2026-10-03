@@ -97,8 +97,10 @@ def test_safe_name_keeps_unicode():
 
 def test_background_prompt_removes_the_product():
     text = cj.background_prompt("the product on dark polished stone", (0.5, 0.3, 0.45, 0.6))
-    assert "the product on" not in text and "an empty spot on dark polished stone" in text
-    assert "lower right" in text and "not in the picture" in text
+    assert text.startswith("on dark polished stone") and "product" not in text.casefold()
+    assert "lower right" in text and "Nothing stands on the surface" in text
+    for word in ("photograph", "plate", "camera"):
+        assert word not in text.casefold()
 
 
 # ------------------------------------------------------------------ product cutout / composite
@@ -159,7 +161,7 @@ class FakeRun:
 def fake_run(monkeypatch):
     run = FakeRun()
     monkeypatch.setattr(cj, "run_quality_job", run)
-    monkeypatch.setattr(cj, "ocr_reader", lambda: None)
+    monkeypatch.setattr(cj, "apply_ocr", lambda cutout, items, workdir: False)
     return run
 
 
@@ -192,7 +194,7 @@ def test_product_preserve_puts_exact_composites_first(tmp_path, fake_run):
     assert all("AI가 다시 그린 상품" in c["warnings"][0] for c in regenerated)
     assert max(c["score"] for c in regenerated) < min(c["score"] for c in result["candidates"][:2])
     background_call = fake_run.calls[0]
-    assert background_call["references"] == [] and "not in the picture" in background_call["prompt"]
+    assert background_call["references"] == [] and "Nothing stands" in background_call["prompt"]
     assert background_call["canvas"] == [1600, 1200]
     roles = [r["role"] for r in json.loads(Path(result["job_dir"], "job.json").read_text(encoding="utf-8"))["references"]]
     assert roles == ["PRODUCT"]

@@ -385,3 +385,37 @@ def test_run_quality_job_records_translation(tmp_path, fake_backends, monkeypatc
     assert "in their fifties" in record["compiled_prompt"] and not pt.needs_translation(record["compiled_prompt"])
     realvis = compile_prompt("realvisxl_v5", "rainy night street", "Tokyo Chill", person=False)
     assert "people positioned" not in realvis.positive
+
+
+
+def test_translation_safety_net_restores_nationality_and_age():
+    from covermorph.prompt_translate import restore_kept_terms
+
+    english, added = restore_kept_terms("가을 공원 벤치에 앉은 50대 일본인 부부",
+                                        "A couple in their fifties sitting on a bench in an autumn park")
+    assert added == ["Japanese"] and english.endswith("Japanese people")
+    english, added = restore_kept_terms("50대 부부", "A couple in their 50s")
+    assert added == []
+    assert restore_kept_terms("rainy street", "rainy street") == ("rainy street", [])
+
+
+def test_store_scenes_do_not_invent_a_product():
+    from covermorph.prompt_compilers import NO_PRODUCT
+
+    hero = compile_prompt("zimage_turbo", "an editorial lifestyle scene", "", "shopify_hero_banner")
+    assert NO_PRODUCT in hero.positive and "e-commerce" not in hero.positive
+    with_product = compile_prompt("zimage_turbo", "the product on a table", "", "shopify_hero_banner")
+    assert NO_PRODUCT not in with_product.positive
+    youtube = compile_prompt("zimage_turbo", "rainy street", "Tokyo Chill")
+    assert NO_PRODUCT not in youtube.positive
+    refs = [Reference(Path("p.png"), "PRODUCT")]
+    assert NO_PRODUCT not in compile_prompt("flux2_klein_4b", "on a table", "", "shopify_promo_tile", references=refs).positive
+
+
+
+def test_scenes_without_people_have_no_camera_words():
+    for engine in ("zimage_turbo", "flux2_klein_4b"):
+        scenery = compile_prompt(engine, "a bright living room", "", "shopify_hero_banner").positive
+        assert "camera with" not in scenery and "50mm" not in scenery
+        person = compile_prompt(engine, "a young woman", "Tokyo Chill", person=True).positive
+        assert "50mm" in person   # the tested person-quality wording is unchanged

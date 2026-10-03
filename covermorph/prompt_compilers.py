@@ -14,11 +14,13 @@ from .thumbnail_bridge_ai import NEGATIVE_PROMPT, build_prompt_plan, channel_sty
 
 PURPOSES: dict[str, dict[str, Any]] = {
     "youtube_thumbnail_background": {"size": (1280, 720), "envelope": "16:9 cinematic YouTube thumbnail photograph"},
-    "shopify_hero_banner": {"size": (1792, 768), "envelope": "wide e-commerce hero banner photograph, premium editorial look"},
-    "shopify_collection_banner": {"size": (1600, 640), "envelope": "wide collection banner photograph, clean premium styling"},
-    "shopify_product_lifestyle": {"size": (1280, 1280), "envelope": "square lifestyle product photograph, natural styling"},
-    "shopify_promo_tile": {"size": (1024, 1024), "envelope": "square promotional tile photograph, bold simple composition"},
-    "shopify_mobile_banner": {"size": (768, 1024), "envelope": "portrait mobile banner photograph, simple composition"},
+    # Neutral wording: "e-commerce/banner/promotional" made Z-Image invent a product (a camera) in product-less
+    # store scenes (2026-10-04). Product jobs say what the product is through the prompt or a PRODUCT reference.
+    "shopify_hero_banner": {"size": (1792, 768), "envelope": "wide editorial lifestyle photograph, premium look"},
+    "shopify_collection_banner": {"size": (1600, 640), "envelope": "wide lifestyle photograph, clean premium styling"},
+    "shopify_product_lifestyle": {"size": (1280, 1280), "envelope": "lifestyle product photograph, natural styling"},
+    "shopify_promo_tile": {"size": (1024, 1024), "envelope": "square photograph, bold simple composition"},
+    "shopify_mobile_banner": {"size": (768, 1024), "envelope": "portrait photograph, simple composition"},
 }
 # Engines need multiples of 16; purposes map to these generation sizes and are resized after.
 CANVAS_PRESETS = {name: spec["size"] for name, spec in PURPOSES.items()}
@@ -54,6 +56,19 @@ class CompiledPrompt:
 
 
 NO_PEOPLE = "The scene is empty of people; no person or figure appears anywhere."
+CAMERA_PROSE = "Shot on a full-frame camera with a 50mm lens at f/2, natural light falloff, realistic color grading."
+FLUX_CAMERA_PROSE = "Photographed with a full-frame camera and a 50mm lens, shallow depth of field, true-to-life color."
+NO_PRODUCT = ("No product, camera, gadget, device, bottle or packaging is featured; the setting itself is the "
+              "subject.")
+
+
+def _no_product(purpose: str, user_prompt: str, roles: list[dict[str, Any]] | None = None) -> str:
+    """Store scenes without a product reference or product wording must not get an invented hero product."""
+    if not purpose.startswith("shopify"):
+        return ""
+    if any(r["role"] in ("PRODUCT", "EDIT") for r in roles or []) or "product" in user_prompt.casefold():
+        return ""
+    return NO_PRODUCT
 
 
 def _negative_space(text_side: str, person: bool = True) -> str:
@@ -113,9 +128,11 @@ def compile_zimage(user_prompt: str, channel: str = "", purpose: str = "youtube_
                        f"{subject}, as a {envelope}"),
              _sentence(_framing(composition)),
              _sentence(f"Mood and look: {style}"),
-             "Shot on a full-frame camera with a 50mm lens at f/2, natural light falloff, realistic color grading.",
+             # Without people, the camera/lens words made Z-Image draw a camera into store scenes (2026-10-04).
+             CAMERA_PROSE if person else "Shallow depth of field, natural light falloff, realistic color grading.",
              "Faces have natural skin texture, realistic eyes and hair, and natural proportions." if person else "",
              NO_PEOPLE if not person and _explicitly_empty(user_prompt) else "",
+             _no_product(purpose, user_prompt),
              _negative_space(text_side, person) if purpose.startswith("youtube") or purpose.endswith("banner") else "",
              TEXTLESS_PROSE]
     positive = " ".join(part for part in parts if part)
@@ -153,10 +170,11 @@ def compile_flux2(user_prompt: str, channel: str = "", purpose: str = "youtube_t
              reference_text,
              _sentence(_framing(composition)),
              _sentence(f"The atmosphere is {style}"),
-             "Photographed with a full-frame camera and a 50mm lens, shallow depth of field, true-to-life color.",
+             FLUX_CAMERA_PROSE if person else "Shallow depth of field and true-to-life color.",
              "Skin shows natural texture with realistic eyes and hair." if person else "",
              SHOPIFY_PRODUCT_RULE if any(r["role"] == "PRODUCT" for r in roles) else "",
              NO_PEOPLE if not person and not roles and _explicitly_empty(user_prompt) else "",
+             _no_product(purpose, user_prompt, roles),
              _negative_space(text_side, person) if purpose.startswith("youtube") or purpose.endswith("banner") else "",
              FLUX_TEXTLESS]
     positive = " ".join(part for part in parts if part)

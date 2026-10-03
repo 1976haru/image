@@ -26,14 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .creator_presets import BUILTIN_PROMPT_PRESETS, Purpose, apply_appearance_hint, load_presets
 from .person_quality import YUNET_FILENAME, detect_faces_yunet
-from .product_checks import (
-    check_product,
-    composite_check,
-    composite_product,
-    extract_product,
-    ocr_reader,
-    product_crop,
-)
+from .product_checks import apply_ocr, check_product, composite_check, composite_product, extract_product
 from .quality_engines import EngineCancelled, resource_snapshot
 from .quality_modes import run_quality_job
 
@@ -59,17 +52,21 @@ def _region_words(region: tuple[float, float, float, float]) -> str:
 
 
 def background_prompt(prompt: str, region: tuple[float, float, float, float]) -> str:
-    """Scene prompt for a composite: the product is pasted later, so the plate must not contain one."""
-    scene = re.sub(r"\b(the|a|an|our|this)\s+product\b", "an empty spot", prompt, flags=re.IGNORECASE)
-    return (f"{scene}. Product photography background plate: the surface in the {_region_words(region)} part "
-            f"of the frame is empty, flat and in sharp focus, ready for a product to stand on; the product itself "
-            f"is not in the picture")
+    """Scene prompt for a composite: the real product is pasted later, so the scene must not contain one.
+
+    Avoids the words product/photography/plate/empty-surface: they produced cameras and blank white boards.
+    """
+    scene = re.sub(r"\b(the|a|an|our|this)\s+product\s+(on|in|at|by|under|beside|next to)\b", r"\2", prompt,
+                   flags=re.IGNORECASE)
+    scene = re.sub(r"\b(the|a|an|our|this)\s+product\b", "", scene, flags=re.IGNORECASE).strip(" ,.")
+    return (f"{scene}. Nothing stands on the surface in the {_region_words(region)} part of the frame; that part "
+            f"of the surface is clear and in sharp focus")
 
 
 def _job_dir(root: Path, payload: dict[str, Any]) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     title = payload.get("title") or payload.get("prompt") or payload.get("edit_instruction") or ""
-    folder = Path(root) / f"{stamp}_{payload.get('purpose', 'image')}_{safe_name(title, 24)}"
+    folder = Path(root).resolve() / f"{stamp}_{payload.get('purpose', 'image')}_{safe_name(title, 24)}"
     index = 1
     while folder.exists():
         index += 1
@@ -231,7 +228,6 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
         records.append(_save_candidate(job_dir, len(records) + 1, image, meta, purpose, yunet, people, box))
     if mode == "preview" or cancel.is_set():
         return records, warnings
-    ocr = ocr_reader()
     regenerated = []
     if exact:  # lighting harmonization of the best composite (FLUX.2 redraws it: checked like any regeneration)
         stage("합성 조명 보정 중 (FLUX.2)", 0.55)
@@ -247,8 +243,12 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
                                      "max_candidates_per_engine": 2}, cancel, note)
         warnings += generated["warnings"]
         regenerated += [(c, "regenerated") for c in generated["candidates"] if c["manifest"]["backend"] == "flux2_klein_4b"]
-    for candidate, kind in regenerated:
-        check = check_product(cutout, candidate["image"], ocr)
+    checks = [(candidate, kind, check_product(cutout, candidate["image"])) for candidate, kind in regenerated]
+    if checks:
+        stage("상품 글자/로고 확인 중", 0.95)
+        if not apply_ocr(cutout, [(c["image"], check) for c, _, check in checks], job_dir / "refs" / "ocr"):
+            warnings.append("상품 글자/로고 OCR 검사를 건너뛰었습니다(EasyOCR 모델 없음 또는 실패).")
+    for candidate, kind, check in checks:
         meta = _meta_from(candidate, kind)
         meta["product_check"] = check.to_dict()
         meta["warnings"] = check.warnings + meta["warnings"]

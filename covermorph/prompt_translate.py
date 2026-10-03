@@ -21,7 +21,8 @@ LLAMACPP_RELEASE = "b11381"
 _CJK = re.compile(r"[ᄀ-ᇿ぀-ヿ㄰-㆏㐀-鿿가-힯ｦ-ﾟ]")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SYSTEM = ("You translate image-generation prompts into English. Translate literally and completely: keep every "
-          "person, age, pose, view (for example side profile), clothing, place, time, weather and mood word. "
+          "person, nationality, age, pose, view (for example side profile), clothing, place, time, weather and mood "
+          "word. "
           "Write ages in words, for example 'in their fifties' (never '50s', which reads as a decade). "
           "Do not add, summarize or explain anything. English text stays as it is. Output only the English prompt.")
 
@@ -30,10 +31,40 @@ SYSTEM = ("You translate image-generation prompts into English. Translate litera
 FEW_SHOT = (
     ("눈 오는 밤 버스 정류장에 서 있는 40대 남성", "A man in his forties standing at a bus stop on a snowy night"),
     ("雨の日のカフェの窓辺に座る60代の女性", "A woman in her sixties sitting by a café window on a rainy day"),
+    ("공원 벤치에 앉은 30대 일본인 여성", "A Japanese woman in her thirties sitting on a park bench"),
     # edit instructions stay instructions (without this one, a mixed-language edit was replaced by example 2)
     ("keep the people, 배경을 해 질 녘 바닷가로 바꿔줘",
      "keep the people, change the background to a beach at sunset"),
 )
+
+
+# Safety net for words that change who is in the picture: the 4B model once dropped "일본인" (Japanese).
+# If the source has one of these and the translation lacks the English word, it is appended.
+KEEP_TERMS = {
+    "일본인": "Japanese", "日本人": "Japanese", "한국인": "Korean", "韓国人": "Korean", "중국인": "Chinese",
+    "中国人": "Chinese", "서양인": "Western", "西洋人": "Western", "백인": "white", "흑인": "Black",
+    "10대": "teenage", "20대": "in their twenties", "30대": "in their thirties", "40대": "in their forties",
+    "50대": "in their fifties", "60대": "in their sixties", "70대": "in their seventies",
+    "20代": "in their twenties", "30代": "in their thirties", "40代": "in their forties", "50代": "in their fifties",
+    "60代": "in their sixties", "70代": "in their seventies",
+}
+_AGE_WORDS = {"twenties": "20", "thirties": "30", "forties": "40", "fifties": "50", "sixties": "60", "seventies": "70"}
+
+
+def restore_kept_terms(source: str, english: str) -> tuple[str, list[str]]:
+    added = []
+    for term, word in KEEP_TERMS.items():
+        if term not in source:
+            continue
+        key = word.split()[-1].casefold()
+        variants = {word.casefold(), key, *(f"{n}s" for k, n in _AGE_WORDS.items() if k == key),
+                    *(f"{n}-" for k, n in _AGE_WORDS.items() if k == key)}
+        if not any(v in english.casefold() for v in variants) and word not in added:
+            added.append(word)
+    if added:
+        english = english.rstrip(". ") + ", " + ", ".join(
+            w if w.startswith("in their") else f"{w} people" for w in added)
+    return english, added
 
 
 def needs_translation(text: str) -> bool:
@@ -83,8 +114,9 @@ def translate_prompt(text: str, models_dir: Path, *, threads: int = 8, timeout: 
     if translator_ready(models_dir):
         try:
             english = _translate_cached(text, str(Path(models_dir)), threads, timeout)
+            english, restored = restore_kept_terms(text, english)
             return {"english": english, "method": "qwen3-4b llama.cpp", "seconds": round(time.perf_counter() - started, 2),
-                    "error": ""}
+                    "error": "", "restored_terms": restored}
         except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
             error = str(exc)
     else:

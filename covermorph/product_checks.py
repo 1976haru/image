@@ -12,6 +12,8 @@ never ranked above an exact composite.
 """
 from __future__ import annotations
 
+import json
+
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -169,7 +171,7 @@ def locate_by_color(cutout: Image.Image, candidate: Image.Image) -> tuple[np.nda
     return (labels == index).astype(np.uint8), box
 
 
-def check_product(cutout: Image.Image, candidate: Image.Image, ocr: Any | None = None) -> ProductCheck:
+def check_product(cutout: Image.Image, candidate: Image.Image) -> ProductCheck:
     """Checks for a regenerated product. Always carries REGENERATED_WARNING; adds color/text warnings."""
     mask, box = locate_by_color(cutout, candidate)
     check = ProductCheck(mask is not None, box=box, warnings=[REGENERATED_WARNING])
@@ -182,15 +184,6 @@ def check_product(cutout: Image.Image, candidate: Image.Image, ocr: Any | None =
                                                    - _median_lab(ref, ref_mask))), 2)
     if check.color_drift > COLOR_DRIFT_CEILING:
         check.warnings.append(f"상품 색상이 참조와 다릅니다(ΔE {check.color_drift:.1f})")
-    if ocr is not None:
-        check.text_reference = ocr_text(ocr, ref)
-        if check.text_reference:
-            x, y, w, h = box
-            crop = np.array(candidate.convert("RGB").crop((int(x * candidate.width), int(y * candidate.height),
-                                                            int((x + w) * candidate.width), int((y + h) * candidate.height))))
-            check.text_candidate = ocr_text(ocr, crop)
-            if _norm(check.text_reference) != _norm(check.text_candidate):
-                check.warnings.append(f"상품 글자/로고가 다릅니다: '{check.text_reference}' → '{check.text_candidate or '없음'}'")
     return check
 
 
@@ -203,24 +196,49 @@ def _norm(text: str) -> str:
     return "".join(ch for ch in text.casefold() if ch.isalnum())
 
 
-def ocr_reader() -> Any | None:
-    """EasyOCR on CPU, only when its weights are already installed (never downloads)."""
-    model_dir = Path.home() / ".EasyOCR" / "model"
-    if not (model_dir / "craft_mlt_25k.pth").exists() or not (model_dir / "english_g2.pth").exists():
+def ocr_texts(paths: list[Path], timeout: float = 240.0) -> list[str] | None:
+    """OCR in a separate process (memory returns when it exits). None when unavailable or failing."""
+    import subprocess
+    import sys
+
+    from .ocr_worker import weights_installed
+    if not paths or not weights_installed():
         return None
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--ocr-worker", *map(str, paths)]
+    else:
+        command = [sys.executable, "-m", "covermorph.ocr_worker", *map(str, paths)]
     try:
-        import easyocr
-        return easyocr.Reader(["en"], gpu=False, download_enabled=False, verbose=False)
-    except Exception:
+        done = subprocess.run(command, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                              cwd=str(Path(__file__).resolve().parents[1]),
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        texts = json.loads(done.stdout.decode("utf-8", errors="replace").strip().splitlines()[-1])
+        return texts if isinstance(texts, list) and len(texts) == len(paths) else None
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
 
 
-def ocr_text(reader: Any, rgb: np.ndarray) -> str:
-    try:
-        results = reader.readtext(rgb)
-    except Exception:
-        return ""
-    return " ".join(text for _, text, confidence in results if confidence >= 0.5 and len(text.strip()) >= 2)
+def apply_ocr(cutout: Image.Image, items: list[tuple[Image.Image, ProductCheck]], workdir: Path) -> bool:
+    """Compare legible product text/logo between the reference and each candidate (one OCR process)."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    paths = [workdir / "ocr_ref.png"]
+    cutout.convert("RGB").save(paths[0])
+    located = [(image, check) for image, check in items if check.box]
+    for index, (image, check) in enumerate(located):
+        x, y, w, h = check.box
+        path = workdir / f"ocr_{index}.png"
+        image.crop((int(x * image.width), int(y * image.height), int((x + w) * image.width),
+                    int((y + h) * image.height))).save(path)
+        paths.append(path)
+    texts = ocr_texts(paths)
+    if texts is None:
+        return False
+    reference = texts[0]
+    for (image, check), text in zip(located, texts[1:]):
+        check.text_reference, check.text_candidate = reference, text
+        if reference and _norm(reference) != _norm(text):
+            check.warnings.append(f"상품 글자/로고가 다릅니다: '{reference}' → '{text or '없음'}'")
+    return True
 
 
 def product_crop(candidate: Image.Image, check: ProductCheck, size: int = 320) -> Image.Image | None:
