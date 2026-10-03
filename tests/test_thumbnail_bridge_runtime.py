@@ -16,8 +16,8 @@ from covermorph import thumbnail_bridge_runtime as runtime
 from covermorph.generation import GenerationError
 from covermorph.thumbnail_bridge import ThumbnailBridgeRequest, standard_output_paths
 from covermorph.thumbnail_bridge_ai import (
-    BridgeActionError,
     MEMORY_PROFILES,
+    BridgeActionError,
     build_prompt_plan,
     generate_with_memory_fallback,
     parse_edit_instruction,
@@ -86,8 +86,8 @@ def reset_fake_engine():
 
 @pytest.fixture
 def fake_ai(monkeypatch):
-    monkeypatch.setattr(runtime, "_environment", lambda request: (dict(READY_ENV), Path("models"), "fake-sdxl"))
-    monkeypatch.setattr(runtime, "_engine_factory", lambda model_id: FakeEngine)
+    monkeypatch.setattr(runtime, "_environment", lambda request, model_id=None: (dict(READY_ENV), Path("models"), "fake-sdxl"))
+    monkeypatch.setattr(runtime, "_engine_factory", lambda *args, **kwargs: FakeEngine)
     return FakeEngine
 
 
@@ -186,7 +186,7 @@ def test_youtubesum_json_stdin_form_maps_to_contract():
 
 # ------------------------------------------------------------------ status
 def test_status_structure(monkeypatch, project):
-    monkeypatch.setattr(runtime, "_environment", lambda request: (dict(READY_ENV), Path("models"), "fake-sdxl"))
+    monkeypatch.setattr(runtime, "_environment", lambda request, model_id=None: (dict(READY_ENV), Path("models"), "fake-sdxl"))
     response = runtime.handle_request(_request(project, "status"))
     payload = response.outputs["status"]
     assert response.ok and payload["project_dir_writable"]
@@ -196,7 +196,7 @@ def test_status_structure(monkeypatch, project):
 
 
 def test_status_reports_only_recompose_when_model_missing(monkeypatch, project):
-    monkeypatch.setattr(runtime, "_environment", lambda request: (dict(MISSING_ENV), Path("models"), "fake-sdxl"))
+    monkeypatch.setattr(runtime, "_environment", lambda request, model_id=None: (dict(MISSING_ENV), Path("models"), "fake-sdxl"))
     payload = runtime.handle_request(_request(project, "status")).outputs["status"]
     assert payload["capabilities"]["edit"] == ["recompose"] and payload["capabilities"]["generate"] is False
 
@@ -245,7 +245,7 @@ def test_generate_rejects_non_16x9(fake_ai, project):
 
 
 def test_generate_model_not_ready_is_structured_and_writes_nothing(monkeypatch, project):
-    monkeypatch.setattr(runtime, "_environment", lambda request: (dict(MISSING_ENV), Path("models"), "fake-sdxl"))
+    monkeypatch.setattr(runtime, "_environment", lambda request, model_id=None: (dict(MISSING_ENV), Path("models"), "fake-sdxl"))
     response = runtime.handle_request(_request(project))
     assert not response.ok and response.error_code == "MODEL_NOT_READY"
     assert not standard_output_paths(project)["canvas_clean"].exists()
@@ -293,6 +293,7 @@ def test_bottom_edge_face_hits_are_ignored(monkeypatch):
             return [(int(width * 0.5), int(height * 0.88), int(width * 0.06), int(height * 0.1)),
                     (int(width * 0.2), int(height * 0.2), int(width * 0.1), int(height * 0.18))]
 
+    monkeypatch.setattr(assets, "_FACE_MODEL", None)  # exercise the Haar path
     monkeypatch.setattr(assets, "_face_cascade", lambda name="": Cascade())
     faces = assets.detect_faces(Image.new("RGB", (1280, 720)))
     assert faces and all(face[1] + face[3] / 2 <= 0.85 for face in faces)
@@ -333,7 +334,7 @@ def test_unsupported_edits_are_refused(fake_ai, project, instruction):
 
 def test_regenerate_edit_is_unsupported_without_model(monkeypatch, fake_ai, project):
     assert runtime.handle_request(_request(project)).ok
-    monkeypatch.setattr(runtime, "_environment", lambda request: (dict(MISSING_ENV), Path("models"), "fake-sdxl"))
+    monkeypatch.setattr(runtime, "_environment", lambda request, model_id=None: (dict(MISSING_ENV), Path("models"), "fake-sdxl"))
     response = runtime.handle_request(_request(project, "edit", edit_instruction="도쿄 야경으로 배경을 바꿔줘"))
     assert not response.ok and response.error_code == "UNSUPPORTED_EDIT"
 

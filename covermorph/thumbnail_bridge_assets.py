@@ -130,7 +130,34 @@ def _iou(a: Box, b: Box) -> float:
     return inter / union if union > 0 else 0.0
 
 
+_FACE_MODEL: Path | None = None
+
+
+def configure_face_detector(yunet_model: Path | None) -> str:
+    """Use OpenCV YuNet when its model file is available; otherwise the Haar cascades."""
+    global _FACE_MODEL
+    _FACE_MODEL = yunet_model if yunet_model is not None and yunet_model.is_file() else None
+    return face_detector_name()
+
+
+def face_detector_name() -> str:
+    return "yunet_2023mar" if _FACE_MODEL is not None else "haar_frontal_profile"
+
+
 def detect_faces(image: Image.Image) -> list[Box]:
+    """Normalized face boxes, largest first: YuNet when configured, else Haar frontal + profile."""
+    if _FACE_MODEL is not None:
+        from .person_quality import detect_faces_yunet
+
+        try:
+            faces = [face["box"] for face in detect_faces_yunet(image, _FACE_MODEL)]
+            return [box for box in faces if box[1] + box[3] / 2 <= 0.85]
+        except Exception:
+            pass
+    return _detect_faces_haar(image)
+
+
+def _detect_faces_haar(image: Image.Image) -> list[Box]:
     """Normalized frontal + profile (both directions) face boxes, deduplicated, largest first."""
     width, height = image.size
     scale = min(1.0, 960 / max(width, height))
@@ -401,7 +428,8 @@ def flag_missing_faces(analysis: CanvasAnalysis, expected_people: int) -> str:
 
 def build_sidecars(analysis: CanvasAnalysis, *, request: Any, final_size: tuple[int, int], source_size: tuple[int, int],
                    scene_type: str, generation: dict[str, Any] | None = None,
-                   history: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+                   history: list[dict[str, Any]] | None = None,
+                   extra_manifest: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     width, height = final_size
     subjects = [subject.to_dict(index) for index, subject in enumerate(analysis.subjects)]
     by_role = {subject.role: subject for subject in analysis.subjects}
@@ -438,6 +466,7 @@ def build_sidecars(analysis: CanvasAnalysis, *, request: Any, final_size: tuple[
         "request_id": request.request_id,
         "last_action": request.action,
     }
+    manifest.update(extra_manifest or {})
     if generation is not None:
         manifest["generation"] = generation
     if history:

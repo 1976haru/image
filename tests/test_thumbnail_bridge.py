@@ -1,5 +1,5 @@
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from covermorph.thumbnail_bridge import (
     ThumbnailBridgeError,
@@ -54,8 +54,9 @@ if __name__ == "__main__":
 
 class ThumbnailBridgeRuntimeTests(unittest.TestCase):
     def test_status_handler_reports_structured_capabilities(self):
-        from covermorph.thumbnail_bridge_runtime import handle_request
         import tempfile
+
+        from covermorph.thumbnail_bridge_runtime import handle_request
         with tempfile.TemporaryDirectory(prefix="브리지 상태 ") as tmp:
             req = ThumbnailBridgeRequest.from_dict({
                 "protocol_version": 1,
@@ -71,13 +72,14 @@ class ThumbnailBridgeRuntimeTests(unittest.TestCase):
             self.assertTrue(payload["project_dir_writable"])
 
     def test_generate_is_not_falsely_reported_as_real_ai(self):
+        import tempfile
         from unittest.mock import patch
+
         from covermorph import thumbnail_bridge_runtime
         from covermorph.thumbnail_bridge_runtime import handle_request
-        import tempfile
         missing = {"status": "model_missing", "reference_status": "model_missing", "model": {"failure_reason": "missing"}}
         with tempfile.TemporaryDirectory() as tmp, patch.object(
-                thumbnail_bridge_runtime, "_environment", lambda request: (missing, Path(tmp), "none")):
+                thumbnail_bridge_runtime, "_environment", lambda request, model_id=None: (missing, Path(tmp), "none")):
             req = ThumbnailBridgeRequest.from_dict({
                 "protocol_version": 1,
                 "request_id": "gen-1",

@@ -17,7 +17,7 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 
-from .generation import GENERATION_SIZES, GenerationConfig, GenerationError, SDXLTextToImageEngine
+from .generation import GENERATION_SIZES, GenerationConfig, SDXLTextToImageEngine
 from .thumbnail_bridge_assets import Subject, shift_subjects
 
 GIB = 1024 ** 3
@@ -181,16 +181,27 @@ class PromptPlan:
     scene_type: str
     translated_terms: list[str]
     untranslated_text: bool
+    # Negative prompt in priority order; fitted to the text-encoder limit at generation time.
+    negative_parts: list[str] = field(default_factory=list)
 
 
 def build_prompt_plan(user_prompt: str, channel: str, text_side: str, preserve_people: bool,
-                      extra_terms: list[str] | None = None) -> PromptPlan:
+                      extra_terms: list[str] | None = None, *, person: bool = False, framing: str = "") -> PromptPlan:
+    from .person_quality import PERSON_NEGATIVE_PARTS, PERSON_POSITIVE
+
     scene_type, style = channel_style(channel)
     translated, found, untranslated = translate_scene_terms(user_prompt)
     subject = ", ".join(part for part in [translated, *(extra_terms or [])] if part) or "quiet cinematic city scene"
-    parts = [subject, "textless photograph", composition_hint(text_side, preserve_people), style,
-             "16:9 cinematic still, high detail, natural skin"]
-    return PromptPlan(parts, NEGATIVE_PROMPT, scene_type, found, untranslated)
+    if person:
+        # People first: framing and photographic face quality outrank channel styling in the 77-token budget.
+        parts = [subject, framing, "textless photograph", PERSON_POSITIVE, composition_hint(text_side, True), style]
+        negative_parts = list(PERSON_NEGATIVE_PARTS)
+    else:
+        parts = [subject, "textless photograph", composition_hint(text_side, preserve_people), style,
+                 "16:9 cinematic still, high detail, natural skin"]
+        negative_parts = [NEGATIVE_PROMPT]
+    return PromptPlan([part for part in parts if part], ", ".join(negative_parts), scene_type, found, untranslated,
+                      negative_parts)
 
 
 # ------------------------------------------------------------------ generation with one OOM retry
@@ -200,8 +211,14 @@ EngineFactory = Callable[[str], SDXLTextToImageEngine]
 def generate_with_memory_fallback(engine_factory: EngineFactory, profile: str, plan: PromptPlan,
                                   config_kwargs: dict[str, Any], seed: int, warnings: list[str],
                                   reference_image: Image.Image | None = None,
-                                  cancel_event: Event | None = None) -> tuple[Image.Image, dict[str, Any]]:
-    """Run generate_one; on CUDA OOM free the pipeline and retry exactly once one profile lower."""
+                                  cancel_event: Event | None = None,
+                                  after_generate: Callable[..., tuple[Image.Image, dict[str, Any]]] | None = None,
+                                  ) -> tuple[Image.Image, dict[str, Any]]:
+    """Run generate_one; on CUDA OOM free the pipeline and retry exactly once one profile lower.
+
+    ``after_generate(engine, image, config, prompt, negative)`` runs with the pipeline still loaded
+    (person QA / face-detail pass) and must handle its own failures by returning the input image.
+    """
     cancel_event = cancel_event or Event()
     attempts: list[dict[str, Any]] = []
     current: str | None = profile
@@ -214,14 +231,22 @@ def generate_with_memory_fallback(engine_factory: EngineFactory, profile: str, p
             log(f"loading SDXL (profile={current}, working size={config.size[0]}x{config.size[1]})")
             engine.load(lambda event: log(f"{event}"))
             prompt = fit_prompt(plan.prompt_parts, getattr(engine.pipeline, "tokenizer", None), warnings)
-            negative = fit_prompt([plan.negative_prompt], getattr(engine.pipeline, "tokenizer", None), [])
+            negative = fit_prompt(plan.negative_parts or [plan.negative_prompt], getattr(engine.pipeline, "tokenizer", None), [])
             log(f"generating seed={seed} steps={config.steps} guidance={config.guidance_scale}")
             image = engine.generate_one(prompt, negative, config, seed, cancel_event,
                                         progress=_step_logger(config.steps), reference_image=reference_image)
             metrics = dict(engine.last_generation_metrics)
+            person_info: dict[str, Any] = {}
+            if after_generate is not None:
+                image, person_info = after_generate(engine, image, config, prompt, negative)
+            peaks = [metrics.get("peak_memory_allocated"), (person_info.get("face_detail") or {}).get("peak_memory_allocated")]
+            reserved = [metrics.get("peak_memory_reserved"), (person_info.get("face_detail") or {}).get("peak_memory_reserved")]
             attempts.append({"profile": current, "ok": True, "seconds": round(time.perf_counter() - started, 3)})
             return image, {
                 **metrics,
+                "person_pass": person_info,
+                "peak_memory_allocated_overall": max((value for value in peaks if value), default=None),
+                "peak_memory_reserved_overall": max((value for value in reserved if value), default=None),
                 # Only the real CoverMorph SDXL engine counts as a real AI run (tests inject fakes).
                 "real_ai": type(engine) is SDXLTextToImageEngine,
                 "engine": type(engine).__name__,
