@@ -50,3 +50,37 @@ class ThumbnailBridgeContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThumbnailBridgeRuntimeTests(unittest.TestCase):
+    def test_status_handler_reports_structured_capabilities(self):
+        from covermorph.thumbnail_bridge_runtime import handle_request
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="브리지 상태 ") as tmp:
+            req = ThumbnailBridgeRequest.from_dict({
+                "protocol_version": 1,
+                "request_id": "status-1",
+                "action": "status",
+                "project_dir": tmp,
+            })
+            response = handle_request(req)
+            self.assertTrue(response.ok)
+            self.assertIn("status", response.outputs)
+            payload = response.outputs["status"]
+            self.assertTrue(payload["capabilities"]["headless"])
+            self.assertTrue(payload["project_dir_writable"])
+
+    def test_generate_is_not_falsely_reported_as_real_ai(self):
+        from covermorph.thumbnail_bridge_runtime import handle_request
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            req = ThumbnailBridgeRequest.from_dict({
+                "protocol_version": 1,
+                "request_id": "gen-1",
+                "action": "generate",
+                "project_dir": tmp,
+                "prompt": "textless scene",
+            })
+            response = handle_request(req)
+            self.assertFalse(response.ok)
+            self.assertEqual(response.error_code, "ACTION_NOT_IMPLEMENTED")
