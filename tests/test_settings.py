@@ -84,16 +84,14 @@ def test_open_folder_uses_windows_startfile(monkeypatch, tmp_path: Path) -> None
 def test_corrupt_settings_json_recovers_defaults(tmp_path: Path) -> None:
     config = tmp_path / "config"
     config.mkdir()
-    path = config / "settings.json"
-    path.write_text("{broken json", encoding="utf-8")
+    (config / "settings.json").write_text("{broken json", encoding="utf-8")  # old build's corrupt file: skipped
 
     loaded = load_settings(tmp_path)
-    repaired = json.loads(path.read_text(encoding="utf-8"))
 
     assert loaded["output_square"] is True
-    assert repaired["thumbnail_resolution"] == "1920x1080"
-    assert repaired["extension_mode"] == "ai_natural"
-    assert repaired["protect_core"] is True
+    assert loaded["thumbnail_resolution"] == "1920x1080"
+    assert loaded["extension_mode"] == "ai_natural"
+    assert loaded["protect_core"] is True
 
 
 def test_default_output_dir_uses_source_folder() -> None:

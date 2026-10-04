@@ -209,6 +209,7 @@ class CoverMorphApp(_CoverMorphWindow):
         self.refresh_ai_status()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         write_log(self.root_dir, f"CoverMorph Studio v{__version__} started")
+        self.after(600, self.open_studio)  # the AI studio is the main daily workflow: open it on start
 
     def group(self, parent: Any, title: str, *, highlight: bool = False) -> ctk.CTkFrame:
         frame = ctk.CTkFrame(
@@ -357,6 +358,9 @@ class CoverMorphApp(_CoverMorphWindow):
         quick = ctk.CTkFrame(bar, fg_color="transparent")
         quick.grid(row=2, column=0, columnspan=5, sticky="ew", padx=12, pady=(0, 8))
         ctk.CTkLabel(quick, text="빠른 시작:", anchor="w").pack(side="left", padx=(0, 8))
+        self.quick_studio_button = ctk.CTkButton(quick, text="AI 이미지 스튜디오 (YouTube · Shopify)", command=self.open_studio,
+                                                 width=250, fg_color="#16a34a", hover_color="#15803d")
+        self.quick_studio_button.pack(side="left", padx=3)
         self.quick_add_image_button = ctk.CTkButton(quick, text="이미지 추가 (변환)", command=self.open_files, width=145)
         self.quick_add_image_button.pack(side="left", padx=3)
         self.quick_json_button = ctk.CTkButton(quick, text="가사/곡 JSON 불러오기", command=self.import_workflow_json, width=165)
@@ -1850,13 +1854,29 @@ class CoverMorphApp(_CoverMorphWindow):
         self.status.configure(text=f"프로젝트 저장 완료\n{self.project.project_file}")
         return True
 
+    def open_studio(self) -> None:
+        from .creator_gui import open_studio
+
+        try:
+            open_studio(self, self.root_dir)
+        except Exception as exc:
+            write_exception(self.root_dir, "STUDIO", exc)
+            messagebox.showerror("AI 이미지 스튜디오", f"스튜디오를 열지 못했습니다.\n{exc}")
+
     def on_close(self) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
             if not messagebox.askyesno("작업 중", "현재 작업이 실행 중입니다. 종료할까요?"):
                 return
             self.cancel_event.set()
+        from . import creator_gui
+        studio = creator_gui._studio
+        if studio is not None and studio.runner.runner.current is not None:
+            if not messagebox.askyesno("AI 이미지 스튜디오", "이미지를 만드는 중입니다. 종료하면 이 작업은 다음 실행 때 "
+                                       "처음부터 다시 진행됩니다. 종료할까요?"):
+                return
         if not self.confirm_discard_project_changes():
             return
+        creator_gui.shutdown_studio()
         self.destroy()
 
     def candidate_working_path(self, candidate: CandidateRecord | None) -> Path | None:

@@ -43,7 +43,9 @@ class OutputDirectoryError(ValueError):
 
 
 def settings_path(app_root: Path) -> Path:
-    return app_root / "config" / "settings.json"
+    """Per-user settings file (survives EXE rebuilds); the old <app>/config/settings.json is migrated once."""
+    from .app_paths import settings_file
+    return settings_file()
 
 
 def normalize_settings(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -63,14 +65,10 @@ def normalize_settings(data: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def load_settings(app_root: Path) -> dict[str, Any]:
-    path = settings_path(app_root)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        settings = DEFAULT_SETTINGS.copy()
-        save_settings(app_root, settings)
-        return settings
+    from . import app_paths
 
+    app_paths.migrate_from_app_folder(Path(app_root))
+    data = app_paths.section("main_app")
     settings = normalize_settings(data)
     if settings != data:
         save_settings(app_root, settings)
@@ -78,10 +76,9 @@ def load_settings(app_root: Path) -> dict[str, Any]:
 
 
 def save_settings(app_root: Path, settings: dict[str, Any]) -> None:
-    normalized = normalize_settings(settings)
-    path = settings_path(app_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+    from . import app_paths
+
+    app_paths.update_section("main_app", normalize_settings(settings), replace=True)
 
 
 def default_output_dir_for_source(source: Path) -> Path:

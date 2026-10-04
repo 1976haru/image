@@ -202,7 +202,83 @@ Windows에서 `RUN_TESTS.bat`을 더블클릭하면 다음 검사를 실행합�
 BUILD_EXE.bat
 ```
 
-PyInstaller onedir 형태로 `dist\CoverMorphStudio_v0.5.4` 폴더가 생성됩니다. `customtkinter`, `tkinterdnd2`, 프리셋, `hub_manifest.json`, `tools` 안내 파일은 포함하지만, SDXL/LaMa 같은 대용량 선택형 AI 모델은 EXE에 강제로 포함하지 않습니다. EXE에서 Real-ESRGAN을 쓰려면 EXE 폴더 옆에 `tools` 폴더를 만들고 실행 파일과 모델을 넣으세요.
+PyInstaller onedir 형태로 `dist\CoverMorphStudio` 폴더(`CoverMorphStudio.exe`)가 생성됩니다. SDXL 브리지용 torch/diffusers/transformers도 함께 포함되어 폴더가 큽니다. `customtkinter`, `tkinterdnd2`, 프리셋, `hub_manifest.json`, `tools` 안내 파일은 포함하지만, SDXL/LaMa 같은 대용량 선택형 AI 모델은 EXE에 강제로 포함하지 않습니다. EXE에서 Real-ESRGAN을 쓰려면 EXE 폴더 옆에 `tools` 폴더를 만들고 실행 파일과 모델을 넣으세요.
+
+## 썸네일 브리지 (YouTube Dynamic Thumbnail Studio 연동)
+
+CoverMorph는 YouTube Dynamic Thumbnail Studio v0.6(`1976haru/youtubesum`)의 배경 생성/편집 백엔드로 headless 실행할 수 있습니다. 계약 문서는 `THUMBNAIL_BRIDGE_CONTRACT.md`입니다. 인수 없이 더블클릭하면 기존 GUI가 그대로 열립니다.
+
+| 호출 형태 | 입력 | 용도 |
+| --- | --- | --- |
+| `CoverMorphStudio.exe --thumbnail-bridge-json` | stdin: 계약 v1 JSON 1개 | 계약 기본 형태 |
+| `CoverMorphStudio.exe --image-bridge` | stdin: youtubesum `json-stdin` 요청 | youtubesum `IMAGE_BRIDGE_MODE=json-stdin` |
+| `CoverMorphStudio.exe --action generate --project-dir ... --options-json ...` | 명령줄 인수 | youtubesum 기본 `IMAGE_BRIDGE_MODE=cli` |
+
+세 형태 모두 stdout에는 JSON 응답 1개만 쓰고(라이브러리 출력은 파일 디스크립터 수준에서 stderr로 돌립니다), `ok=false`이면 종료 코드 2를 반환합니다. 진행 로그는 stderr와 `logs\`에 남습니다.
+
+- `status`: GPU 이름, VRAM 바이트, torch/diffusers/transformers/accelerate/safetensors 버전, SDXL·IP-Adapter 준비 상태, 선택된 메모리 프로필, 사용 가능한 편집 단계, 프로젝트 폴더 쓰기 가능 여부. 다운로드는 하지 않습니다.
+- `generate`: 기존 `SDXLTextToImageEngine`으로 글자 없는 16:9 배경을 1344x768로 생성하고, 중앙 16:9 크롭 + Lanczos로 1280x720 `canvas_clean.png`를 만듭니다(늘리지 않음). 제목/부제는 프롬프트에 넣지 않으며 text/logo/watermark/signage를 negative prompt로 억제합니다. `preview_reference.png`는 원본 생성 해상도 이미지입니다.
+- `edit`: 지시문(한/일/영)을 세 단계로 분류합니다.
+  - `recompose` (로컬, 모델 불필요): 인물 좌우 이동, 지정한 쪽 문구 공간 단순화(예: `왼쪽 40%`), 인물을 보호한 채 배경 어둡게/밝게.
+  - `regenerate`: 이전 프롬프트 + 지시문의 장면어로 SDXL 새 배경. 인물은 유지되지 않습니다.
+  - `reference_regenerate`: 현재 캔버스의 인물을 IP-Adapter Plus 참조로 넣어 새 배경 생성. 인물은 비슷하게 유지되지만 픽셀/포즈가 그대로 보존되지는 않습니다.
+  - 물체 추가/삭제, 표정·옷·머리 변경, 글자/로고 넣기, 인식되지 않는 지시는 `UNSUPPORTED_EDIT`로 거절하고 기존 파일을 바꾸지 않습니다. 요청한 단계의 모델이 준비되지 않은 경우도 `UNSUPPORTED_EDIT`입니다.
+
+출력: `canvas_clean.png`, `preview_reference.png`, `subject_boxes.json`, `safe_zones.json`, `palette.json`, `composition.json`, `project_manifest.json`. 좌표는 0..1 정규화 값입니다. 인물 역할(protagonist/counterpart/other)은 크기·위치·요청 의도로 정하며 성별을 추정하지 않습니다. youtubesum은 `safe_zones`를 "글자를 피해야 할 영역"으로 읽기 때문에 `avoid` 키에는 얼굴/인물 영역만 넣고, 글자 추천 영역은 `preferred_text_regions`에만 씁니다. `palette.json`의 `fill_color`/`stroke_color`/`highlight_color`와 `composition.json`의 `positions`는 youtubesum이 바로 읽는 키입니다.
+
+모든 결과는 프로젝트 폴더 안의 staging 폴더에 먼저 쓰고 검증한 뒤 교체합니다. 교체 중 하나라도 실패하면 이전 파일을 모두 되돌리고, 생성/편집 실패 시 이전 결과는 그대로 남습니다.
+
+### 모델 위치와 GPU 메모리
+
+모델은 EXE에 포함하지 않습니다. `<EXE 폴더>\models\sdxl_base_1.0`, `models\ip_adapter`를 쓰거나 `COVERMORPH_MODELS_DIR`(또는 요청 `options.models_dir`)로 지정하세요. 브리지는 오프라인(`HF_HUB_OFFLINE=1`, `local_files_only`)으로만 모델을 읽습니다.
+
+메모리 프로필은 감지된 VRAM으로 정합니다. 14 GB 이상 `standard`, 8~14 GB `balanced`(VAE slicing+tiling), 8 GB 미만 `conservative`(model CPU offload, 1024x576 생성 후 확대). RTX 3060 12 GB에서 같은 seed로 측정하면 `balanced`가 `standard`보다 빠르고(26.5초 대 28.4초) 최대 메모리도 낮았으며 결과는 같았습니다. CUDA OOM이 나면 파이프라인을 해제하고 한 단계 낮은 프로필로 딱 한 번만 다시 시도합니다. 생성 시간, 최대 할당/예약 메모리, 프로필, 재시도 여부는 `project_manifest.json`의 `generation`에 기록됩니다.
+
+### v1.0.0-rc1 — 설치와 설정 유지
+
+- 압축을 풀고 `CoverMorphStudio.exe`를 더블클릭하면 첫 실행 설정 마법사가 열립니다(모델 폴더 한 번 지정 → 용도 → 품질 → PC 사용 방식). 자세한 순서: `QUICKSTART_KO.txt`.
+- 설정·대기열·로그는 `%LOCALAPPDATA%\CoverMorphStudio`에 저장되어 EXE를 새로 빌드하거나 새 버전으로 바꿔도 유지됩니다. 기본 출력 폴더는 `문서\CoverMorphStudio`입니다.
+- Shopify 상품: '상품 처리'에서 원본 그대로 합성(권장) / 자연광 보정 합성 / AI 재구성을 고릅니다. 처음 한 번 상품 마스크를 확인·수정하고, 결과에서 '상품 위치·크기 조정'으로 AI 없이 다시 배치할 수 있습니다.
+- 문제가 생기면 설정 탭의 '진단 정보 복사'(프롬프트·이미지 미포함). 릴리스 검증 결과: `docs/V1_RELEASE_VALIDATION.md`. 릴리스 빌드: `python scripts\build_release.py`.
+
+### AI 이미지 스튜디오 (YouTube · Shopify)
+
+EXE를 더블클릭하면 'AI 이미지 스튜디오' 창이 함께 열립니다(상단 초록 버튼으로 다시 열기). 모델 이름을 고를 필요 없이 목적(YouTube / Shopify 히어로·컬렉션·상품 라이프스타일·프로모션·모바일 / 사용자 지정), 품질(빠른 미리보기·일반·최고 품질), PC 사용(작업 중 PC 우선·균형·자리 비움)을 고르고 대기열에 넣으면 됩니다.
+
+- 레퍼런스는 역할(인물·상품·스타일·구도·배경)을 지정해 최대 4장, '상품 형태 보존'을 켜면 실제 상품 픽셀 합성 후보가 맨 앞에 옵니다(AI가 다시 그린 후보는 '형태 확인 필요' 표시).
+- 대기열은 앱을 다시 열어도 유지되고, 현재 작업 후 일시정지/재개, 자원 부족 시 'PC 사용 중 — 자원 대기'로 기다립니다. 작업마다 엔진 프로세스가 종료되어 메모리를 돌려줍니다.
+- 모델·출력 폴더는 '설정' 탭에서 저장합니다(환경변수 불필요). 자세한 내용과 RTX 3060 검증 결과: `docs/SHOPIFY_WORKFLOW.md`.
+
+### Quality Engine V2 (Z-Image-Turbo / FLUX.2-klein)
+
+RTX 3060에서 같은 장면·시드로 비교한 결과(`docs/QUALITY_ENGINE_V2.md`)로 기본 엔진을 정했습니다.
+
+| 역할 | 엔진 | 비고 |
+| --- | --- | --- |
+| 기본 텍스트→이미지 | Z-Image-Turbo Q6_K (Apache-2.0) | 1280x720 약 35초, GPU 피크 7.3 GiB |
+| 기본 참조/편집 | FLUX.2-klein-4B Q8_0 (Apache-2.0) | 참조 1장 약 27초, 인물/상품 유지 + 배경 변경 |
+| 대체(fallback) | RealVisXL V5 (기존 SDXL 경로) | V2 모델이 없거나 실패하면 자동 사용 |
+
+- 준비: `python scripts\prepare_quality_v2_models.py --models-dir <models>` (약 16 GB, SHA-256 검증, `--verify`로 재확인). 파일은 `<models>\quality_v2`에 들어가며 git에 넣지 않습니다.
+- 두 엔진은 stable-diffusion.cpp(`sd-cli.exe`, CUDA) 하위 프로세스로 실행되고 작업이 끝나면 프로세스가 종료되어 GPU/RAM을 즉시 반환합니다. 한 번에 한 모델만 메모리에 올립니다.
+- 브리지 옵션: `engine` = `auto`(기본, V2 설치 시 사용) | `zimage_turbo` | `flux2_klein_4b` | `legacy`, `quality_mode` = `preview`(FLUX.2 1장) | `balanced`(기본) | `best`(엔진 2개 순차), `candidates` 1~4(브리지 기본 1, 추가 후보는 `<project>\candidates\`), `memory_policy` = `interactive_low_memory` | `balanced_idle` | `night_best`.
+- `project_manifest.json`에 backend, model, quantization, model_license, commercial_use_flag, original_prompt, compiled_prompt, reference_roles, quality_mode, memory_profile, timing, peak_vram_mib, system_commit_before/after가 기록됩니다.
+- 작업 대기열(`covermorph/job_queue.py`): 저장(원자적 교체), 현재 작업 후 일시정지, 재개, 대기 작업 취소, 앱 재시작 후 복구, GPU/commit/RAM이 기준보다 낮으면 시작하지 않고 대기. 실제 GPU 검증: `python scripts\validate_quality_queue.py --models-dir <models> --output-dir validation_results\quality_queue`.
+- 한국어/일본어 프롬프트와 편집 지시는 같은 Qwen3-4B로 영어 번역 후 사용합니다(llama.cpp CPU, 약 9초, GPU 미사용). Z-Image가 한글/일본어 단어를 이미지에 글자로 그리는 문제(원문 2/3, 번역 0/3)를 막기 위한 것이며, 원문·번역·최종 프롬프트가 manifest에 남습니다.
+- 비교 재현: `python scripts\benchmark_quality_v2.py --models-dir <models> --output-dir validation_results\quality_v2 --make-refs`.
+
+### youtubesum 설정
+
+```bat
+set IMAGE_PROGRAM_EXE=D:\...\dist\CoverMorphStudio\CoverMorphStudio.exe
+set COVERMORPH_MODELS_DIR=D:\...\models
+set IMAGE_BRIDGE_MODE=cli
+set IMAGE_BRIDGE_TIMEOUT=900
+```
+
+### 브리지 테스트
+
+`pytest tests\test_thumbnail_bridge_runtime.py`는 가짜 엔진으로 동작하며(manifest에 `real_ai: false`) 모델을 다운로드하지 않습니다. 실제 GPU 생성은 `set COVERMORPH_REAL_AI=1`과 `COVERMORPH_MODELS_DIR`을 지정한 뒤 `pytest -m optional_ai`로, 패키지 EXE 확인은 `set COVERMORPH_BRIDGE_EXE=<exe 경로>`로 실행합니다.
 
 ## Playlist Studio Hub 연결
 

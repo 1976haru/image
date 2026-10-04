@@ -1,0 +1,914 @@
+"""Headless runtime for the CoverMorph <-> thumbnail editor bridge.
+
+Invocation forms (all produce exactly one JSON response on stdout):
+
+* ``--thumbnail-bridge-json``  contract v1 request on stdin
+* ``--image-bridge``           youtubesum ``IMAGE_BRIDGE_MODE=json-stdin`` request on stdin
+* ``--action ... --project-dir ...``  youtubesum default ``IMAGE_BRIDGE_MODE=cli`` argv form
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import sys
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+from .thumbnail_bridge import (
+    ThumbnailBridgeError,
+    ThumbnailBridgeRequest,
+    ThumbnailBridgeResponse,
+    read_request_json,
+    standard_output_paths,
+    write_response_json,
+)
+
+BRIDGE_FLAGS = ("--thumbnail-bridge-json", "--image-bridge")
+FINAL_SIZE = (1280, 720)
+DEFAULT_STEPS = 28
+DEFAULT_GUIDANCE = 7.0
+# Strength selected in the RTX 3060 3-B1 quality revalidation for 16:9 person references.
+DEFAULT_REFERENCE_STRENGTH = 0.35
+EDIT_LEVEL_DESCRIPTIONS = {
+    "recompose": "Local geometry edit: move subjects left/right, clear/simplify a text side, darken/brighten "
+                 "the background with people protected. No AI model required.",
+    "regenerate": "New SDXL background from the previous prompt plus the instruction's scene terms. "
+                  "People are not preserved.",
+    "reference_regenerate": "New SDXL background with IP-Adapter person reference taken from the current canvas. "
+                            "Preserves people approximately (similarity), not pixel-exactly.",
+}
+
+
+def bridge_requested(argv: list[str]) -> bool:
+    return any(flag in argv for flag in BRIDGE_FLAGS) or "--action" in argv
+
+
+def _app_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+def _log(message: str) -> None:
+    print(f"[thumbnail-bridge] {message}", file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ environment / models
+def resolve_models_dir(request: ThumbnailBridgeRequest) -> Path:
+    """options.models_dir > COVERMORPH_MODELS_DIR > folder saved in the app's AI 이미지 스튜디오 settings."""
+    from .creator_settings import load_creator_settings
+
+    configured = str(request.options.get("models_dir") or os.environ.get("COVERMORPH_MODELS_DIR")
+                     or load_creator_settings(_app_root()).get("models_dir") or "")
+    return Path(configured).expanduser() if configured else _app_root() / "models"
+
+
+def resolve_model_id(request: ThumbnailBridgeRequest, models_dir: Path) -> str:
+    from .generation import DEFAULT_SDXL_MODEL
+
+    explicit = str(request.options.get("model_id") or "")
+    if explicit:
+        return explicit
+    local = models_dir / "sdxl_base_1.0"
+    return str(local) if local.is_dir() else DEFAULT_SDXL_MODEL
+
+
+def _environment(request: ThumbnailBridgeRequest, model_id: str | None = None) -> tuple[dict[str, Any], Path, str]:
+    from .generation import detect_generation_environment
+
+    models_dir = resolve_models_dir(request)
+    model_id = model_id or resolve_model_id(request, models_dir)
+    env = detect_generation_environment(_app_root(), model_id=model_id, models_dir=models_dir)
+    return env, models_dir, model_id
+
+
+def _project_writable(project_dir: Path) -> bool:
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        probe = project_dir / ".thumbnail_bridge_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _capabilities(env: dict[str, Any], writable: bool, v2_ready: bool = False) -> dict[str, Any]:
+    generate_ready = env.get("status") == "ready" or v2_ready
+    reference_ready = env.get("reference_status") == "ready" or v2_ready
+    levels = ["recompose"] + (["regenerate"] if generate_ready else []) + (["reference_regenerate"] if reference_ready else [])
+    return {
+        "status": True,
+        "generate": generate_ready and writable,
+        "edit": levels,
+        "edit_levels": {level: {"available": level in levels, "description": EDIT_LEVEL_DESCRIPTIONS[level]}
+                        for level in EDIT_LEVEL_DESCRIPTIONS},
+        "unsupported_edits": ["adding/removing objects", "changing a person's appearance, expression or clothes",
+                              "baking text/logos into the canvas", "pixel-exact background replacement behind people"],
+        "headless": True,
+        "atomic_output": True,
+        "invocation": ["--thumbnail-bridge-json", "--image-bridge (youtubesum json-stdin)",
+                       "--action/--project-dir (youtubesum cli)"],
+    }
+
+
+def _status_payload(request: ThumbnailBridgeRequest) -> dict[str, Any]:
+    from .thumbnail_bridge_ai import MEMORY_PROFILES, select_memory_profile
+
+    env, models_dir, model_id = _environment(request)
+    writable = _project_writable(request.project_path)
+    profile = select_memory_profile(env.get("vram_bytes"), str(request.options.get("memory_profile") or ""))
+    return {
+        "bridge_protocol_version": 1,
+        "project_dir_writable": writable,
+        "environment": env,
+        "models_dir": str(models_dir),
+        "model_id": model_id,
+        "runtime_profile": {
+            "memory_profile": profile,
+            "settings": {key: value for key, value in MEMORY_PROFILES[profile].items() if key != "working_size"},
+            "generation_working_size": list(MEMORY_PROFILES[profile]["working_size"]),
+            "final_size": list(FINAL_SIZE),
+            "oom_policy": "one deterministic retry with the next lower-memory profile",
+        },
+        "capabilities": _capabilities(env, writable, v2_ready=any(_v2_ready(models_dir).values())),
+        "person_quality": _person_quality_status(models_dir),
+        "quality_engine_v2": _v2_status(models_dir),
+    }
+
+
+V2_ENGINES = ("zimage_turbo", "flux2_klein_4b")
+LEGACY_ENGINE_CHOICES = ("legacy", "sdxl", "realvisxl_v5")
+
+
+def _v2_ready(models_dir: Path) -> dict[str, bool]:
+    from .quality_engines import make_backend
+
+    return {name: bool(make_backend(name, models_dir).status()["ready"]) for name in V2_ENGINES}
+
+
+def _v2_status(models_dir: Path) -> dict[str, Any]:
+    from .quality_engines import MEMORY_POLICIES, make_backend
+    from .quality_modes import (DEFAULT_REFERENCE_ENGINE, DEFAULT_T2I_ENGINE, FALLBACK_ENGINE, MODE_MEMORY,
+                                QUALITY_MODES_V2)
+
+    return {"engines": {name: make_backend(name, models_dir).status() for name in (*V2_ENGINES, FALLBACK_ENGINE)},
+            "defaults": {"t2i": DEFAULT_T2I_ENGINE, "reference_edit": DEFAULT_REFERENCE_ENGINE,
+                         "fallback": FALLBACK_ENGINE},
+            "quality_modes": QUALITY_MODES_V2, "mode_memory_profile": MODE_MEMORY,
+            "memory_policies": MEMORY_POLICIES,
+            "options": {"engine": ["auto", *V2_ENGINES, *LEGACY_ENGINE_CHOICES],
+                        "quality_mode": list(QUALITY_MODES_V2), "candidates": "1-4 per engine (bridge default 1)"}}
+
+
+def _person_quality_status(models_dir: Path) -> dict[str, Any]:
+    from .person_quality import (
+        COMPOSITION_PROFILES,
+        IDENTITY_BACKEND_NOTE,
+        QUALITY_MODES,
+        inspect_yunet,
+        model_profile_status,
+    )
+
+    return {
+        "model_profiles": model_profile_status(models_dir),
+        "face_detector": inspect_yunet(models_dir),
+        "identity_backend": {"ready": False, "candidate": "InstantX/InstantID", "reason": IDENTITY_BACKEND_NOTE},
+        "quality_modes": QUALITY_MODES,
+        "composition_profiles": sorted(COMPOSITION_PROFILES),
+    }
+
+
+def _require_generation_ready(env: dict[str, Any], *, reference: bool = False) -> None:
+    from .thumbnail_bridge_ai import BridgeActionError
+
+    status = env.get("status")
+    if status == "gpu_unavailable":
+        raise BridgeActionError("GPU_UNAVAILABLE", "CUDA GPU is unavailable; SDXL generation is disabled on CPU.")
+    if status == "package_missing":
+        raise BridgeActionError("PACKAGE_MISSING", "SDXL Python packages are not installed.")
+    if status != "ready":
+        reason = (env.get("model") or {}).get("failure_reason") or status
+        raise BridgeActionError("MODEL_NOT_READY", f"SDXL model is not prepared: {reason}")
+    if reference and env.get("reference_status") != "ready":
+        reason = (env.get("ip_adapter") or {}).get("failure_reason") or env.get("reference_status")
+        raise BridgeActionError("MODEL_NOT_READY", f"IP-Adapter reference model is not prepared: {reason}")
+
+
+def _engine_factory(model_id: str, variant: str | None = None, scheduler: str = "default"):
+    from .generation import SDXLTextToImageEngine
+    from .thumbnail_bridge_ai import MEMORY_PROFILES
+
+    def make(profile: str) -> SDXLTextToImageEngine:
+        engine = SDXLTextToImageEngine(model_id=model_id, local_files_only=True)
+        engine.memory_profile = {key: value for key, value in MEMORY_PROFILES[profile].items() if key != "working_size"}
+        engine.variant = variant
+        engine.scheduler_name = scheduler
+        return engine
+
+    return make
+
+
+# ------------------------------------------------------------------ option helpers
+def _canvas_options(request: ThumbnailBridgeRequest, warnings: list[str]) -> tuple[tuple[int, int], str, bool]:
+    from .thumbnail_bridge_ai import BridgeActionError
+
+    options = request.options
+    ratio = str(options.get("ratio") or "16:9")
+    if ratio != "16:9":
+        raise BridgeActionError("UNSUPPORTED_OPTION", f"Only 16:9 thumbnails are supported (got {ratio}).")
+    try:
+        width, height = int(options.get("width") or FINAL_SIZE[0]), int(options.get("height") or FINAL_SIZE[1])
+    except (TypeError, ValueError) as exc:
+        raise BridgeActionError("INVALID_REQUEST", "width/height must be integers.") from exc
+    if width * 9 != height * 16 or not 640 <= width <= 3840:
+        raise BridgeActionError("UNSUPPORTED_OPTION", f"{width}x{height} is not a supported 16:9 size.")
+    if options.get("textless") is False:
+        warnings.append("textless=false ignored: the bridge always produces a textless canvas.")
+    side = str(options.get("prefer_text_space") or "left").casefold()
+    side = side if side in ("left", "right", "top", "bottom", "auto", "none") else "left"
+    preserve_people = options.get("preserve_people", True) is not False
+    return (width, height), side, preserve_people
+
+
+def _int_option(options: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(options.get(key) or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_option(options: dict[str, Any], key: str, default: float, low: float, high: float) -> float:
+    try:
+        value = options.get(key)
+        return max(low, min(high, float(default if value in (None, "") else value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _commit(project_dir: Path, canvas, sidecars, preview) -> list[str]:
+    from .thumbnail_bridge_assets import commit_outputs, stage_outputs
+
+    staging = stage_outputs(project_dir, canvas, sidecars, preview)
+    return commit_outputs(project_dir, staging)
+
+
+def _outputs_map(written: list[str]) -> dict[str, str]:
+    names = {path.name: key for key, path in standard_output_paths(Path(".")).items()}
+    return {names[name]: name for name in written if name in names}
+
+
+# ------------------------------------------------------------------ generate
+def _select_model(options: dict[str, Any], models_dir: Path, person: bool, warnings: list[str]) -> tuple[str, str, dict[str, Any]]:
+    """Return (profile name, model path/id, profile settings). People default to the photoreal profile."""
+    from .person_quality import MODEL_PROFILES, model_profile_status
+
+    if options.get("model_id"):
+        return "custom", str(options["model_id"]), {"variant": options.get("model_variant") or None,
+                                                     "scheduler": "default", "guidance_scale": DEFAULT_GUIDANCE,
+                                                     "license": "unknown (caller supplied)"}
+    requested = str(options.get("model_profile") or "")
+    name = requested if requested in MODEL_PROFILES else ("photoreal_sdxl" if person else "sdxl_base")
+    status = model_profile_status(models_dir)
+    if not status[name]["ready"] and name != "sdxl_base":
+        warnings.append(f"Model profile '{name}' is not prepared ({status[name]['failure_reason']}); "
+                        "fell back to SDXL base 1.0. Run scripts/prepare_person_quality_models.py.")
+        name = "sdxl_base"
+    profile = MODEL_PROFILES[name]
+    return name, str(models_dir / profile["folder"]), profile
+
+
+def _ai_render(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, preserve_people: bool,
+               final_size: tuple[int, int], warnings: list[str], reference_image=None,
+               reference_strength: float | None = None, people: int | None = None,
+               edit_canvas=None, edit_instruction: str = "") -> dict[str, Any]:
+    """Generate with the selected model profile and (for people) QA + face detail; return canvas + records."""
+    import time
+
+    from .generation import DEFAULT_IP_ADAPTER_REVISION
+    from .person_quality import (
+        COMPOSITION_PROFILES,
+        IDENTITY_BACKEND_NOTE,
+        QUALITY_MODES,
+        choose_composition,
+        finish_image,
+        inspect_yunet,
+        people_count,
+        run_person_pass,
+    )
+    from .thumbnail_bridge_ai import (
+        build_prompt_plan,
+        generate_with_memory_fallback,
+        select_memory_profile,
+        translate_scene_terms,
+    )
+    from .thumbnail_bridge_assets import configure_face_detector, fit_16x9
+
+    started = time.perf_counter()
+    options = request.options
+    models_dir = resolve_models_dir(request)
+    translated = translate_scene_terms(prompt)[0]
+    if people is None:
+        people = _int_option(options, "people", people_count(prompt, translated), 0, 6) if preserve_people else 0
+    v2_mode = _v2_mode(options, models_dir, reference=reference_image is not None, warnings=warnings)
+    if v2_mode:
+        try:
+            return _ai_render_v2(request, prompt=prompt, text_side=text_side, preserve_people=preserve_people,
+                                 final_size=final_size, warnings=warnings, reference_image=reference_image,
+                                 people=people, mode=v2_mode, started=started, edit_canvas=edit_canvas,
+                                 edit_instruction=edit_instruction)
+        except Exception as exc:  # engine missing/failed: the proven SDXL path still answers the request
+            from .quality_engines import EngineCancelled
+            if isinstance(exc, EngineCancelled):
+                raise
+            warnings.append(f"Quality Engine V2 failed ({str(exc).splitlines()[0]}); used the SDXL fallback.")
+    person = bool(options["person_quality"]) if isinstance(options.get("person_quality"), bool) else people > 0
+    mode = str(options.get("quality_profile") or ("quality" if person else "fast")).casefold()
+    if mode not in QUALITY_MODES:
+        raise _action_error("INVALID_REQUEST", f"quality_profile must be one of {', '.join(QUALITY_MODES)}.")
+    profile_name, model_id, model_profile = _select_model(options, models_dir, person, warnings)
+    env, _, _ = _environment(request, model_id=model_id)
+    _require_generation_ready(env, reference=reference_image is not None)
+    yunet = inspect_yunet(models_dir)
+    detector = configure_face_detector(Path(yunet["path"]) if yunet["ready"] else None)
+    composition = choose_composition(people, str(options.get("candidate") or "A"),
+                                     str(options.get("composition_profile") or "")) if person else ""
+    plan = build_prompt_plan(prompt, request.channel, text_side, preserve_people, person=person,
+                             framing=COMPOSITION_PROFILES.get(composition, {}).get("framing", ""))
+    if plan.untranslated_text:
+        warnings.append("Part of the non-English prompt has no translation; SDXL understands English prompts best.")
+    identity_mode = str(options.get("identity_mode") or "off")
+    if identity_mode == "instantid":
+        warnings.append(IDENTITY_BACKEND_NOTE + " Using the generic IP-Adapter reference path instead."
+                        if reference_image is not None else IDENTITY_BACKEND_NOTE)
+    memory = select_memory_profile(env.get("vram_bytes"), str(options.get("memory_profile") or ""))
+    seed = _int_option(options, "seed", random.randint(1, 2**31 - 1), 0, 2**31 - 1)
+    steps = _int_option(options, "steps", QUALITY_MODES[mode]["steps"] if person else DEFAULT_STEPS, 8, 60)
+    guidance = _float_option(options, "guidance_scale", float(model_profile.get("guidance_scale") or DEFAULT_GUIDANCE), 1.0, 15.0)
+    face_detail = options.get("face_detail") if isinstance(options.get("face_detail"), bool) else None
+    config = {"model_id": model_id, "steps": steps, "guidance_scale": guidance, "local_files_only": True, "seed": seed}
+    if reference_image is not None:
+        config.update({"reference_mode": "person", "ip_adapter_id": str(models_dir / "ip_adapter"),
+                       "ip_adapter_revision": DEFAULT_IP_ADAPTER_REVISION,
+                       "reference_strength": DEFAULT_REFERENCE_STRENGTH if reference_strength is None else reference_strength})
+
+    def after(engine, image, cfg, fitted_prompt, negative):
+        return run_person_pass(engine, image, config=cfg, mode=mode, prompt=fitted_prompt, negative_prompt=negative,
+                               seed=seed, expected_people=people, composition=composition,
+                               model_path=Path(yunet["path"]) if yunet["ready"] else None, face_detail=face_detail,
+                               reference_image=reference_image)
+
+    _log(f"render: model={profile_name} mode={mode} composition={composition or '-'} people={people} "
+         f"GPU={env.get('gpu')} VRAM={env.get('vram_bytes')} memory={memory}")
+    image, metrics = generate_with_memory_fallback(
+        _engine_factory(model_id, model_profile.get("variant"), str(model_profile.get("scheduler") or "default")),
+        memory, plan, config, seed, warnings, reference_image=reference_image, after_generate=after if person else None)
+    canvas = fit_16x9(image, final_size)
+    if mode == "quality":
+        canvas = finish_image(canvas)
+    person_pass = metrics.get("person_pass") or {}
+    qa = person_pass.get("qa") or {}
+    quality_warnings = list(qa.get("problems") or []) + list(qa.get("warnings") or [])
+    if person and quality_warnings:
+        warnings.append("Person quality check: " + "; ".join(quality_warnings))
+    total = round(time.perf_counter() - started, 3)
+    generation = {
+        "backend": "CoverMorph SDXLTextToImageEngine" + (" + IP-Adapter Plus SDXL" if reference_image is not None else ""),
+        "generation_model": {"profile": profile_name, "path": model_id,
+                             **{key: model_profile.get(key) for key in ("repository", "revision", "license", "model_card")}},
+        "quality_profile": mode, "person_quality": person, "people": people, "composition_profile": composition,
+        "scheduler": model_profile.get("scheduler"), "face_detector": detector,
+        "face_detail_applied": bool(person_pass.get("face_detail_applied")),
+        "identity_backend": "none" if reference_image is None else "ip_adapter_plus_sdxl (generic, not identity-locked)",
+        "quality_warnings": quality_warnings,
+        "gpu": env.get("gpu"), "vram_bytes": env.get("vram_bytes"), "torch": env.get("torch"),
+        "diffusers": env.get("diffusers"), "model_id": model_id, "user_prompt": prompt,
+        "translated_terms": plan.translated_terms, "final_size": list(final_size),
+        "resize": "center crop to 16:9 + Lanczos (no stretch)" + (" + restrained finish" if mode == "quality" else ""),
+        "total_seconds": total, **metrics,
+    }
+    manifest_fields = {key: generation[key] for key in ("generation_model", "quality_profile", "face_detector",
+                                                        "face_detail_applied", "identity_backend", "quality_warnings")}
+    return {"canvas": canvas, "raw": image, "generation": generation, "plan": plan, "people": people,
+            "manifest_fields": manifest_fields}
+
+
+def _v2_mode(options: dict[str, Any], models_dir: Path, *, reference: bool, warnings: list[str]) -> str:
+    """Quality mode to run on the V2 engines, or "" for the legacy SDXL path."""
+    from .quality_modes import QUALITY_MODES_V2, plan_engines
+
+    engine = str(options.get("engine") or "auto").casefold()
+    if engine in LEGACY_ENGINE_CHOICES or options.get("model_id") or options.get("model_profile"):
+        return ""
+    if engine not in ("auto", *V2_ENGINES):
+        raise _action_error("INVALID_REQUEST", f"engine must be one of auto, {', '.join(V2_ENGINES)}, "
+                            f"{', '.join(LEGACY_ENGINE_CHOICES)}.")
+    mode = str(options.get("quality_mode") or "").casefold()
+    if not mode:  # legacy quality_profile names map onto the V2 modes
+        mode = {"fast": "preview", "quality": "balanced"}.get(str(options.get("quality_profile") or "").casefold(),
+                                                              "balanced")
+    if mode not in QUALITY_MODES_V2:
+        raise _action_error("INVALID_REQUEST", f"quality_mode must be one of {', '.join(QUALITY_MODES_V2)}.")
+    ready = _v2_ready(models_dir)
+    if engine in V2_ENGINES and not ready[engine]:
+        warnings.append(f"Engine '{engine}' is not installed; used the SDXL path.")
+        return ""
+    if engine == "zimage_turbo" and reference:
+        warnings.append("Z-Image-Turbo cannot take a reference image; used FLUX.2-klein for this reference edit.")
+    plan = plan_engines(mode, has_references=reference, available=lambda name: ready.get(name, False))
+    return mode if plan else ""
+
+
+def _ai_render_v2(request: ThumbnailBridgeRequest, *, prompt: str, text_side: str, preserve_people: bool,
+                  final_size: tuple[int, int], warnings: list[str], reference_image, people: int, mode: str,
+                  started: float, edit_canvas=None, edit_instruction: str = "") -> dict[str, Any]:
+    """Generate with Quality Engine V2 (Z-Image-Turbo / FLUX.2-klein via stable-diffusion.cpp).
+
+    With ``edit_canvas`` (reference_regenerate) FLUX.2 edits the whole canvas from the instruction: measured
+    2026-10-04 it kept both people's faces/clothes/poses, where a person-crop reference turned one away.
+    """
+    import tempfile
+    import time
+
+    from .person_quality import choose_composition
+    from .quality_modes import QUALITY_MODES_V2, run_quality_job
+    from .thumbnail_bridge_ai import build_prompt_plan
+    from .thumbnail_bridge_assets import fit_16x9
+
+    from .person_quality import people_count
+    from .prompt_translate import translate_prompt
+
+    options = request.options
+    models_dir = resolve_models_dir(request)
+    # V2 edits are driven by the instruction; otherwise translate the scene prompt once (Qwen3, CPU).
+    source_prompt = request.prompt if edit_canvas is not None else prompt
+    translation = translate_prompt(source_prompt, models_dir)
+    if translation["method"] != "none":
+        _log(f"translate ({translation['method']}, {translation['seconds']}s): {translation['english']}")
+    if preserve_people and edit_canvas is None and "people" not in options and translation["method"] != "none":
+        people = max(people, people_count(translation["english"]))  # the vocabulary misses many CJK words
+    # An edit keeps the canvas composition: framing words ("two people facing each other") would fight it,
+    # and the subject count from the canvas detector can be off (it found 2 for one woman, 2026-10-04).
+    composition = "" if edit_canvas is not None else choose_composition(
+        people, str(options.get("candidate") or "A"), str(options.get("composition_profile") or "")) if people else ""
+    seed = _int_option(options, "seed", random.randint(1, 2**31 - 1), 0, 2**31 - 1)
+    engine = str(options.get("engine") or "auto").casefold()
+    # The bridge answers with one canvas, so it makes 1 candidate per engine unless asked for more.
+    candidates = _int_option(options, "candidates", 1, 1, 4)
+    with tempfile.TemporaryDirectory(prefix="covermorph_v2_") as tmp:
+        references = []
+        edit_path = ""
+        if edit_canvas is not None:
+            edit_path = str(Path(tmp) / "canvas_to_edit.png")
+            edit_canvas.save(edit_path)
+        elif reference_image is not None:
+            ref_path = Path(tmp) / "person_reference.png"
+            reference_image.save(ref_path)
+            references.append({"path": str(ref_path), "role": "PERSON"})
+        # An edit is driven by its instruction; the previous scene prompt would pull the old location back in.
+        payload = {"models_dir": str(models_dir), "prompt": translation["english"],
+                   "original_prompt": source_prompt, "channel": request.channel,
+                   "purpose": "youtube_thumbnail_background", "mode": mode, "seed": seed, "people": people,
+                   "composition": composition, "text_side": text_side, "references": references,
+                   "edit_image": edit_path, "edit_instruction": edit_instruction if edit_path else "",
+                   "memory_profile": str(options.get("memory_policy") or ""),
+                   "max_candidates_per_engine": candidates,
+                   "only_engine": engine if engine in V2_ENGINES and not references else ""}
+        _log(f"render v2: mode={mode} engine={engine} people={people} composition={composition or '-'} "
+             f"references={len(references)} edit={bool(edit_path)} seed={seed}")
+        result = run_quality_job(payload)
+    if not result["candidates"]:
+        raise RuntimeError("; ".join(result["warnings"]) or "no candidate was produced")
+    warnings.extend(result["warnings"])
+    best = result["candidates"][0]
+    image = best["image"]
+    canvas = fit_16x9(image, final_size)
+    record = best["manifest"]
+    for role in record.get("reference_roles") or []:  # the temp file is gone; say where the reference came from
+        role["path"] = "current canvas" if role["role"] == "EDIT" else "person crop of the current canvas"
+    qa = best["qa"]
+    quality_warnings = list(qa.get("problems") or []) + list(qa.get("warnings") or [])
+    if people and quality_warnings:
+        warnings.append("Person quality check: " + "; ".join(quality_warnings))
+    extra = []
+    if len(result["candidates"]) > 1:
+        folder = request.project_path / "candidates"
+        folder.mkdir(parents=True, exist_ok=True)
+        for index, candidate in enumerate(result["candidates"], 1):
+            path = folder / f"candidate_{index:02d}_{candidate['manifest']['backend']}_{candidate['manifest']['seed']}.png"
+            candidate["image"].save(path)
+            extra.append({"path": str(path), "score": candidate["score"], **{k: candidate["manifest"][k] for k in
+                          ("backend", "seed", "timing", "peak_vram_mib")}})
+    plan = build_prompt_plan(prompt, request.channel, text_side, preserve_people, person=people > 0)
+    total = round(time.perf_counter() - started, 3)
+    generation = {
+        "backend": f"Quality Engine V2: {record['model']} ({record['quantization']}, stable-diffusion.cpp)"
+                   if record["backend"] != "realvisxl_v5" else "Quality Engine V2: RealVisXL V5.0 (Diffusers)",
+        "generation_model": {"profile": record["backend"], "path": str(models_dir / "quality_v2"),
+                             "repository": record["repository"], "license": record["model_license"]},
+        "quality_profile": mode, "quality_mode": mode, "person_quality": people > 0, "people": people,
+        "composition_profile": composition, "face_detector": "yunet", "face_detail_applied": False,
+        "identity_backend": "none" if reference_image is None and edit_canvas is None else
+                            f"{record['backend']} " + ("full-canvas edit (people kept from the canvas)" if edit_canvas
+                            is not None else "reference image (PERSON role; similarity, not identity-locked)"),
+        "quality_warnings": quality_warnings, "user_prompt": prompt, "model_id": record["backend"],
+        "translated_terms": plan.translated_terms, "final_size": list(final_size),
+        "resize": "center crop to 16:9 + Lanczos (no stretch)", "total_seconds": total,
+        "generation_time_seconds": record["timing"]["engine_seconds"], "seed": record["seed"],
+        "translation_seconds": translation["seconds"],
+        "candidates": extra, "engine_plan": [list(item) for item in result["plan"]],
+        "mode_definition": QUALITY_MODES_V2[mode], **record,
+    }
+    manifest_fields = {key: generation[key] for key in ("generation_model", "quality_profile", "face_detector",
+                                                        "face_detail_applied", "identity_backend", "quality_warnings")}
+    manifest_fields.update({key: record[key] for key in (
+        "backend", "model", "quantization", "model_license", "commercial_use_flag", "original_prompt",
+        "translated_prompt", "translation_method", "edit_instruction", "translated_edit_instruction", "compiled_prompt", "reference_roles", "quality_mode", "memory_profile", "timing", "peak_vram_mib",
+        "system_commit_before_mib", "system_commit_after_mib")})
+    return {"canvas": canvas, "raw": image, "generation": generation, "plan": plan, "people": people,
+            "manifest_fields": manifest_fields}
+
+
+def _generate(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
+    from .thumbnail_bridge_assets import (
+        analyze_canvas,
+        build_sidecars,
+        cleanup_stale_staging,
+        flag_missing_faces,
+    )
+
+    warnings: list[str] = []
+    final_size, text_side, preserve_people = _canvas_options(request, warnings)
+    project_dir = request.project_path
+    if not _project_writable(project_dir):
+        raise _action_error("PROJECT_NOT_WRITABLE", f"project_dir is not writable: {project_dir}")
+    cleanup_stale_staging(project_dir)
+    options = request.options
+    rendered = _ai_render(request, prompt=request.prompt, text_side=text_side, preserve_people=preserve_people,
+                          final_size=final_size, warnings=warnings)
+    canvas, image, generation = rendered["canvas"], rendered["raw"], rendered["generation"]
+    analysis = analyze_canvas(canvas, preferred_side=text_side, protagonist_side=str(options.get("protagonist_side") or ""),
+                              expect_people=preserve_people)
+    expected = rendered["people"] or (_expected_people(rendered["plan"].prompt_parts[0]) if preserve_people else 0)
+    if warning := flag_missing_faces(analysis, expected):
+        warnings.append(warning)
+    if text_side in ("left", "right") and not any(region["name"].startswith(text_side) for region in analysis.preferred_regions):
+        warnings.append(f"The generated composition has no clean {text_side} text area (people are there). "
+                        f"Try another seed, or edit: move the people and widen the {text_side} text space.")
+    sidecars = build_sidecars(analysis, request=request, final_size=final_size, source_size=image.size,
+                              scene_type=rendered["plan"].scene_type, generation=generation,
+                              extra_manifest=rendered["manifest_fields"])
+    written = _commit(project_dir, canvas, sidecars, image)
+    return ThumbnailBridgeResponse(
+        request_id=request.request_id, action=request.action, project_dir=request.project_dir, ok=True,
+        outputs=_outputs_map(written), warnings=warnings, message="Generated thumbnail bridge assets.",
+        details={"generation": generation, "subjects": sidecars["subject_boxes"]["subjects"],
+                 "timing": {"total_seconds": generation["total_seconds"]}})
+
+
+def _expected_people(prompt: str) -> int:
+    """People count implied by the prompt wording (used only to flag missed face detections)."""
+    text = prompt.casefold()
+    if any(word in text for word in ("two people", "couple", " and a ", "two ", "pair")):
+        return 2
+    return 1 if any(word in text for word in ("man", "woman", "person", "girl", "boy", "people")) else 0
+
+
+def _action_error(code: str, message: str, details: dict[str, Any] | None = None):
+    from .thumbnail_bridge_ai import BridgeActionError
+
+    return BridgeActionError(code, message, details)
+
+
+# ------------------------------------------------------------------ edit
+def _reference_crop(canvas, subjects):
+    """Crop the people from the current canvas as the IP-Adapter person reference."""
+    width, height = canvas.size
+    people = [subject for subject in subjects if subject.role in ("protagonist", "counterpart")] or subjects
+    if not people:
+        return canvas.copy()
+    left = min(subject.box[0] for subject in people)
+    top = min(subject.box[1] for subject in people)
+    right = max(subject.box[0] + subject.box[2] for subject in people)
+    bottom = max(subject.box[1] + subject.box[3] for subject in people)
+    pad_x, pad_y = (right - left) * 0.08, (bottom - top) * 0.08
+    box = (int(max(0, left - pad_x) * width), int(max(0, top - pad_y) * height),
+           int(min(1, right + pad_x) * width), int(min(1, bottom + pad_y) * height))
+    return canvas.crop(box) if box[2] - box[0] > 32 and box[3] - box[1] > 32 else canvas.copy()
+
+
+def _edit(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
+    from PIL import Image
+
+    from .person_quality import inspect_yunet
+    from .project import utc_now
+    from .thumbnail_bridge_ai import EDIT_LEVELS, apply_recompose, parse_edit_instruction
+    from .thumbnail_bridge_assets import (
+        analyze_canvas,
+        build_sidecars,
+        cleanup_stale_staging,
+        configure_face_detector,
+        detect_subjects,
+        fit_16x9,
+        flag_missing_faces,
+        located_people,
+        merge_subjects,
+        read_json,
+        subjects_from_known,
+    )
+
+    warnings: list[str] = []
+    final_size, requested_side, _ = _canvas_options(request, warnings)
+    yunet = inspect_yunet(resolve_models_dir(request))
+    configure_face_detector(Path(yunet["path"]) if yunet["ready"] else None)
+    project_dir = request.project_path
+    paths = standard_output_paths(project_dir)
+    options = request.options
+    source = Path(str(options.get("source_image"))).expanduser() if options.get("source_image") else paths["canvas_clean"]
+    if options.get("source_image") and not source.is_absolute():
+        source = project_dir / source
+    if not source.is_file():
+        raise _action_error("NO_SOURCE_CANVAS", f"No canvas to edit: {source}. Run generate first.")
+    if not _project_writable(project_dir):
+        raise _action_error("PROJECT_NOT_WRITABLE", f"project_dir is not writable: {project_dir}")
+    cleanup_stale_staging(project_dir)
+    forced = str(options.get("edit_mode") or "")
+    if forced and forced not in EDIT_LEVELS:
+        raise _action_error("INVALID_REQUEST", f"edit_mode must be one of {', '.join(EDIT_LEVELS)}.")
+    plan = parse_edit_instruction(request.edit_instruction, forced)
+    env, models_dir, model_id = _environment(request)
+    capabilities = _capabilities(env, True)
+    details = {"edit": plan.to_dict(), "available_edit_levels": capabilities["edit"],
+               "edit_levels": capabilities["edit_levels"]}
+    if plan.unsupported:
+        raise _action_error("UNSUPPORTED_EDIT", "This edit needs capabilities the bridge does not have: "
+                            + "; ".join(plan.unsupported), details)
+    if not plan.level:
+        raise _action_error("UNSUPPORTED_EDIT", "The edit instruction was not recognized as a supported "
+                            "recompose/regenerate/reference_regenerate edit.", details)
+    if plan.level not in capabilities["edit"]:
+        raise _action_error("UNSUPPORTED_EDIT", f"Edit level '{plan.level}' is not available on this machine "
+                            "(model/adapter not ready).", details)
+
+    with Image.open(source) as opened:
+        before = opened.convert("RGB")
+    before = before if before.size == final_size else fit_16x9(before, final_size)
+    manifest = read_json(paths["project_manifest"])
+    composition = read_json(paths["composition"])
+    known = subjects_from_known(read_json(paths["subject_boxes"]).get("subjects")) if source == paths["canvas_clean"] else []
+    fresh, _ = detect_subjects(before, text_side=str(composition.get("recommended_text_side") or "left"), expect_people=not known)
+    subjects = merge_subjects(known, fresh) if known else fresh
+    text_side = plan.simplify_side or (requested_side if "prefer_text_space" in options else "") \
+        or str(composition.get("recommended_text_side") or "left")
+    generation = manifest.get("generation") if isinstance(manifest.get("generation"), dict) else None
+    edit_record: dict[str, Any] = {"at": utc_now(), "instruction": request.edit_instruction, "level": plan.level,
+                                   "recognized": plan.recognized}
+    notes: list[str] = []
+    # Recompose keeps the existing model/quality record; AI levels replace it below.
+    manifest_fields = {key: manifest[key] for key in ("generation_model", "quality_profile", "face_detector",
+                       "face_detail_applied", "identity_backend", "quality_warnings") if key in manifest}
+    if plan.level == "reference_regenerate" and not located_people(subjects):
+        raise _action_error("UNSUPPORTED_EDIT", "reference_regenerate needs the people in the current canvas, but none "
+                            "could be located (no face detected). Use a regenerate edit or mark the people first.", details)
+    if plan.level == "recompose" and subjects and not located_people(subjects):
+        warnings.append("People could not be located; the protected area is a composition-based guess.")
+    if plan.level == "recompose":
+        after, subjects, notes = apply_recompose(before, plan, subjects)
+        source_size = final_size
+        analysis = analyze_canvas(after, preferred_side=text_side, known_subjects=subjects)
+    else:
+        reference = plan.level == "reference_regenerate"
+        previous_prompt = str((generation or {}).get("user_prompt") or "")
+        prompt = request.prompt or (", ".join(plan.scene_terms) if plan.scene_terms else previous_prompt)
+        located = located_people(subjects)
+        reference_image = _reference_crop(before, located) if reference else None
+        if reference:
+            warnings.append("reference_regenerate keeps people similar via a reference image (FLUX.2-klein, or "
+                            "IP-Adapter on the SDXL path); exact pixels/poses are not guaranteed.")
+        request.channel = request.channel or str(manifest.get("channel") or "")
+        rendered = _ai_render(request, prompt=prompt, text_side=text_side, preserve_people=True, final_size=final_size,
+                              warnings=warnings, reference_image=reference_image,
+                              reference_strength=_float_option(options, "reference_strength", DEFAULT_REFERENCE_STRENGTH, 0.0, 1.0),
+                              people=sum(1 for subject in located if subject.role in ("protagonist", "counterpart")) or None,
+                              edit_canvas=before if reference else None,
+                              edit_instruction=request.edit_instruction if reference else "")
+        image, after = rendered["raw"], rendered["canvas"]
+        if plan.has_recompose_ops:
+            fresh, _ = detect_subjects(after, text_side=text_side)
+            after, _, notes = apply_recompose(after, plan, fresh)
+        source_size = image.size
+        analysis = analyze_canvas(after, preferred_side=text_side)
+        expected = rendered["people"] or _expected_people(prompt)
+        if warning := flag_missing_faces(analysis, expected):
+            warnings.append(warning)
+        generation = {**rendered["generation"], "edit_of": manifest.get("request_id") or ""}
+        manifest_fields = rendered["manifest_fields"]
+        edit_record["generation_seconds"] = generation.get("generation_time_seconds")
+    analysis.notes.extend(notes)
+    if plan.simplify_side and not any(region["name"].startswith(plan.simplify_side) for region in analysis.preferred_regions):
+        warnings.append(f"The {plan.simplify_side} side could not be fully cleared without cutting into people; "
+                        "background there was simplified around them. A regenerate edit can recompose the scene.")
+    history = list(manifest.get("edit_history") or []) + [edit_record]
+    sidecars = build_sidecars(analysis, request=_with_manifest_defaults(request, manifest), final_size=final_size,
+                              source_size=source_size, scene_type=str(composition.get("scene_type") or "story"),
+                              generation=generation, history=history, extra_manifest=manifest_fields)
+    written = _commit(project_dir, after, sidecars, before)
+    details.update({"generation": generation if plan.level != "recompose" else None, "notes": notes})
+    return ThumbnailBridgeResponse(
+        request_id=request.request_id, action=request.action, project_dir=request.project_dir, ok=True,
+        outputs=_outputs_map(written), warnings=warnings,
+        message=f"Edited canvas ({plan.level}: {', '.join(plan.recognized) or 'regenerated'}).", details=details)
+
+
+def _with_manifest_defaults(request: ThumbnailBridgeRequest, manifest: dict[str, Any]) -> ThumbnailBridgeRequest:
+    """Edits without metadata keep the project's existing channel/title fields."""
+    for name in ("channel", "story_type", "episode", "title", "subtitle", "preferred_typography"):
+        if not getattr(request, name) and manifest.get(name):
+            setattr(request, name, str(manifest[name]))
+    return request
+
+
+# ------------------------------------------------------------------ dispatch
+def handle_request(request: ThumbnailBridgeRequest) -> ThumbnailBridgeResponse:
+    from .thumbnail_bridge_ai import BridgeActionError
+    from .thumbnail_bridge_assets import BridgeOutputError
+
+    base = {"request_id": request.request_id, "action": request.action, "project_dir": request.project_dir}
+    if request.action == "status":
+        payload = _status_payload(request)
+        ready = bool(payload["project_dir_writable"])
+        return ThumbnailBridgeResponse(
+            **base, ok=ready, message="CoverMorph thumbnail bridge status.", outputs={"status": payload},
+            warnings=[] if ready else ["project_dir is not writable"], error_code="" if ready else "PROJECT_NOT_WRITABLE")
+    try:
+        return _generate(request) if request.action == "generate" else _edit(request)
+    except BridgeActionError as exc:
+        return ThumbnailBridgeResponse(**base, ok=False, message=str(exc), error_code=exc.code, details=exc.details)
+    except BridgeOutputError as exc:
+        return ThumbnailBridgeResponse(**base, ok=False, message=f"Outputs were not committed: {exc}",
+                                       error_code="OUTPUT_COMMIT_FAILED")
+    except Exception as exc:
+        from .generation import GenerationError
+
+        _write_exception(f"thumbnail bridge {request.action}", exc)
+        code = "GENERATION_FAILED" if isinstance(exc, GenerationError) else "INTERNAL_ERROR"
+        return ThumbnailBridgeResponse(**base, ok=False, message=f"{type(exc).__name__}: {exc}"[:800],
+                                       error_code=code, warnings=["Previous bridge outputs were left unchanged."])
+
+
+def _write_exception(prefix: str, exc: BaseException) -> None:
+    try:
+        from .logger import write_exception
+
+        write_exception(_app_root(), prefix, exc)
+    except Exception:
+        pass
+    _log(f"{prefix}: {type(exc).__name__}: {exc}")
+
+
+def request_from_youtubesum(data: dict[str, Any]) -> ThumbnailBridgeRequest:
+    """Map youtubesum's ``youtubesum-image-bridge/1`` payload onto the contract request."""
+    if not isinstance(data, dict):
+        raise ThumbnailBridgeError("Bridge request must be a JSON object.")
+    options = dict(data.get("options") or {})
+    mapped = {
+        "protocol_version": 1,
+        "request_id": str(data.get("request_id") or options.pop("request_id", "") or f"youtubesum-{uuid.uuid4().hex[:12]}"),
+        "action": data.get("action") or "status",
+        "project_dir": data.get("project_dir") or "",
+        "prompt": data.get("prompt") or "",
+        "edit_instruction": data.get("edit_instruction") or "",
+        "options": options,
+    }
+    for name in ("channel", "story_type", "episode", "title", "subtitle", "preferred_typography"):
+        mapped[name] = data.get(name) or options.pop(name, "") or ""
+    for name in ("channel", "story_type", "episode", "title", "subtitle", "preferred_typography"):
+        options.pop(name, None)
+    return ThumbnailBridgeRequest.from_dict(mapped)
+
+
+def parse_argv_request(argv: list[str]) -> ThumbnailBridgeRequest:
+    parser = argparse.ArgumentParser(prog="CoverMorphStudio", add_help=False, exit_on_error=False)
+    parser.add_argument("--action", required=True)
+    parser.add_argument("--project-dir", required=True)
+    for name in ("--channel", "--story-type", "--title", "--subtitle", "--episode", "--preferred-typography",
+                 "--prompt", "--edit-instruction", "--request-id"):
+        parser.add_argument(name, default="")
+    parser.add_argument("--options-json", default="{}")
+    try:
+        args, _unknown = parser.parse_known_args(argv)
+        options = json.loads(args.options_json or "{}")
+    except (argparse.ArgumentError, json.JSONDecodeError, SystemExit) as exc:
+        raise ThumbnailBridgeError(f"Invalid bridge arguments: {exc}") from exc
+    return request_from_youtubesum({
+        "action": args.action, "project_dir": args.project_dir, "channel": args.channel,
+        "story_type": args.story_type, "title": args.title, "subtitle": args.subtitle, "episode": args.episode,
+        "preferred_typography": args.preferred_typography, "prompt": args.prompt,
+        "edit_instruction": args.edit_instruction, "request_id": args.request_id,
+        "options": options if isinstance(options, dict) else {},
+    })
+
+
+def _read_stdin_text() -> str:
+    stream = getattr(sys.stdin, "buffer", None)
+    data = stream.read() if stream is not None else b""
+    if not data and sys.stdin is None:
+        chunks = []
+        try:
+            while chunk := os.read(0, 65536):
+                chunks.append(chunk)
+        except OSError:
+            pass
+        data = b"".join(chunks)
+    return data.decode("utf-8-sig")
+
+
+def parse_request(argv: list[str], stdin_text: str | None = None) -> ThumbnailBridgeRequest:
+    if "--thumbnail-bridge-json" in argv:
+        return read_request_json(_read_stdin_text() if stdin_text is None else stdin_text)
+    if "--image-bridge" in argv:
+        text = _read_stdin_text() if stdin_text is None else stdin_text
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ThumbnailBridgeError(f"Invalid request JSON: {exc}") from exc
+        if isinstance(data, dict) and "protocol_version" in data:
+            return ThumbnailBridgeRequest.from_dict(data)
+        return request_from_youtubesum(data)
+    return parse_argv_request(argv)
+
+
+@contextmanager
+def _stdout_reserved() -> Iterator[int | None]:
+    """Route Python and native stdout writes to stderr; yield a dup of the real stdout fd."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    elif hasattr(sys.stderr, "reconfigure"):
+        # Frozen/windowed builds default to the ANSI code page; callers decode logs as UTF-8.
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    saved_fd: int | None = None
+    try:
+        saved_fd = os.dup(1)
+        os.dup2(2, 1)
+    except OSError:
+        saved_fd = None
+    previous = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        yield saved_fd
+    finally:
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        sys.stdout = previous
+        if saved_fd is not None:
+            os.dup2(saved_fd, 1)
+            os.close(saved_fd)
+
+
+def _emit(text: str) -> None:
+    data = text.encode("utf-8")
+    try:
+        while data:
+            written = os.write(1, data)
+            data = data[written:]
+    except OSError:
+        if sys.stdout is not None:
+            sys.stdout.buffer.write(data)
+            sys.stdout.flush()
+
+
+def run_bridge_cli(stdin_text: str | None = None, argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not any(flag in argv for flag in BRIDGE_FLAGS) and "--action" not in argv:
+        argv.append("--thumbnail-bridge-json")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    with _stdout_reserved():
+        request: ThumbnailBridgeRequest | None = None
+        try:
+            request = parse_request(argv, stdin_text)
+            _log(f"request {request.request_id or '-'} action={request.action} project={request.project_dir}")
+            response = handle_request(request)
+        except ThumbnailBridgeError as exc:
+            response = ThumbnailBridgeResponse(request_id="", action="status", project_dir="", ok=False,
+                                               message=str(exc), error_code="INVALID_REQUEST")
+        except Exception as exc:  # structured boundary: never leak a traceback to stdout
+            _write_exception("thumbnail bridge", exc)
+            response = ThumbnailBridgeResponse(
+                request_id=request.request_id if request else "", action=request.action if request else "status",
+                project_dir=request.project_dir if request else "", ok=False, message=str(exc),
+                error_code="INTERNAL_ERROR")
+        _log(f"result ok={response.ok} code={response.error_code or '-'} {response.message}")
+    _emit(write_response_json(response))
+    return 0 if response.ok else 2
