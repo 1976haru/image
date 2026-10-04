@@ -239,7 +239,7 @@ CoverMorph는 YouTube Dynamic Thumbnail Studio v0.6(`1976haru/youtubesum`)의 �
 - 압축을 풀고 `CoverMorphStudio.exe`를 더블클릭하면 첫 실행 설정 마법사가 열립니다(모델 폴더 한 번 지정 → 용도 → 품질 → PC 사용 방식). 자세한 순서: `QUICKSTART_KO.txt`.
 - 설정·대기열·로그는 `%LOCALAPPDATA%\CoverMorphStudio`에 저장되어 EXE를 새로 빌드하거나 새 버전으로 바꿔도 유지됩니다. 기본 출력 폴더는 `문서\CoverMorphStudio`입니다.
 - Shopify 상품: '상품 처리'에서 원본 그대로 합성(권장) / 자연광 보정 합성 / AI 재구성을 고릅니다. 처음 한 번 상품 마스크를 확인·수정하고, 결과에서 '상품 위치·크기 조정'으로 AI 없이 다시 배치할 수 있습니다.
-- 문제가 생기면 설정 탭의 '진단 정보 복사'(프롬프트·이미지 미포함). 릴리스 검증 결과: `docs/V1_RELEASE_VALIDATION.md`. 릴리스 빌드: `python scriptsuild_release.py`.
+- 문제가 생기면 설정 탭의 '진단 정보 복사'(프롬프트·이미지 미포함). 릴리스 검증 결과: `docs/V1_RELEASE_VALIDATION.md`. 릴리스 빌드: `python scripts\build_release.py`.
 
 ### AI 이미지 스튜디오 (YouTube · Shopify)
 
