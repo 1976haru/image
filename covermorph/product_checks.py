@@ -159,10 +159,38 @@ def _place(canvas_size: tuple[int, int], cutout: Image.Image, placement: Placeme
     return size, left, bottom
 
 
+NATURAL_STRENGTHS = {
+    # brightness pull of the background toward the product, directional-shadow opacity, edge light-wrap
+    "weak": {"grade": 0.08, "shadow": 0.35, "wrap": 0.15},
+    "default": {"grade": 0.15, "shadow": 0.50, "wrap": 0.25},
+    "strong": {"grade": 0.25, "shadow": 0.65, "wrap": 0.35},
+}
+
+
+def _grounding(size_canvas: tuple[int, int], size: tuple[int, int], left: int, bottom: int,
+               strength: float = 1.0) -> Image.Image:
+    """Two-layer grounding mask: a tight dark contact line where the base touches the surface plus a wider, soft
+    ambient-occlusion pool. Only the background under/around the product is darkened."""
+    mask = Image.new("L", size_canvas, 0)
+    draw = ImageDraw.Draw(mask)
+    w, h = size
+    core_h = max(3, int(h * 0.025))
+    draw.ellipse((left + w * 0.10, bottom - core_h, left + w * 0.90, bottom + core_h), fill=int(200 * strength))
+    core = mask.filter(ImageFilter.GaussianBlur(max(2, w // 40)))
+    pool = Image.new("L", size_canvas, 0)
+    ImageDraw.Draw(pool).ellipse((left - w * 0.05, bottom - h * 0.05, left + w * 1.05, bottom + h * 0.06),
+                                 fill=int(110 * strength))
+    pool = pool.filter(ImageFilter.GaussianBlur(max(5, w // 9)))
+    return Image.fromarray(np.maximum(np.array(core), np.array(pool)), "L")
+
+
 def composite_product(background: Image.Image, cutout: Image.Image,
                       subject_region: tuple[float, float, float, float], fill: float = 0.5,
-                      shadow: bool = True, placement: Placement | None = None) -> tuple[Image.Image, list[float]]:
-    """원본 그대로 합성: the product's own pixels (only scaled) standing on the detected surface, contact shadow."""
+                      shadow: bool = True, placement: Placement | None = None,
+                      wrap: float = 0.0) -> tuple[Image.Image, list[float]]:
+    """원본 그대로 합성: the product's own pixels (only scaled) standing on the detected surface with a two-layer
+    contact shadow. Pixels where the product is fully opaque are never changed; ``wrap`` (natural-light mode only)
+    blends the semi-transparent anti-aliased rim a little toward the local background."""
     canvas = background.convert("RGB").copy()
     placement = placement or auto_placement(canvas, subject_region, fill)
     size, left, bottom = _place(canvas.size, cutout, placement)
@@ -170,42 +198,54 @@ def composite_product(background: Image.Image, cutout: Image.Image,
     product = cutout.resize(size, Image.Resampling.LANCZOS)
     top = bottom - size[1]
     if shadow:
-        contact = Image.new("L", canvas.size, 0)
-        ellipse = Image.new("L", (size[0], max(8, size[1] // 7)), 0)
-        ImageDraw.Draw(ellipse).ellipse((size[0] * 0.06, 0, size[0] * 0.94, ellipse.height - 1), fill=150)
-        contact.paste(ellipse, (left, bottom - ellipse.height // 2))
-        contact = contact.filter(ImageFilter.GaussianBlur(max(4, size[0] // 18)))
-        canvas = Image.composite(Image.new("RGB", canvas.size, (0, 0, 0)), canvas, contact.point(lambda v: v * 0.55))
+        ground = _grounding(canvas.size, size, left, bottom)
+        canvas = Image.composite(Image.new("RGB", canvas.size, (0, 0, 0)), canvas, ground.point(lambda v: v * 0.6))
+    if wrap > 0:
+        rgba = np.array(product).astype(np.float32)
+        alpha = rgba[..., 3]
+        rim = (alpha > 0) & (alpha < 255)                    # edge only: opaque product pixels are untouched
+        local = np.array(canvas.crop((left, top, left + size[0], top + size[1])).filter(
+            ImageFilter.GaussianBlur(max(2, size[0] // 30))), np.float32)
+        if local.shape[:2] == rgba.shape[:2]:
+            rgba[..., :3][rim] = rgba[..., :3][rim] * (1 - wrap) + local[rim] * wrap
+            product = Image.fromarray(rgba.clip(0, 255).astype(np.uint8), "RGBA")
     canvas.paste(product, (left, top), product)
     return canvas, [left / width, top / height, size[0] / width, size[1] / height]
 
 
 def natural_composite(background: Image.Image, cutout: Image.Image, subject_region: tuple[float, float, float, float],
-                      fill: float = 0.5, strength: float = 0.15, placement: Placement | None = None) -> tuple[Image.Image, list[float]]:
-    """자연광 보정 합성: the BACKGROUND's brightness moves a little toward the product's (no hue shift: grading toward
-    the product's color tinted whole scenes), plus a soft shadow falling away from the brighter side. The product's
-    pixels are never changed (only scaled), so logo/text/geometry stay exactly as photographed."""
+                      fill: float = 0.5, strength: str | float = "default",
+                      placement: Placement | None = None) -> tuple[Image.Image, list[float]]:
+    """자연광 보정 합성 (약하게/기본/강하게): the BACKGROUND's brightness moves a little toward the product's (no hue
+    shift: grading toward the product's color tinted whole scenes), a soft shadow falls away from the brighter side,
+    and only the anti-aliased rim is blended toward the surroundings. Opaque product pixels are never changed, so
+    logo/text/geometry/color stay exactly as photographed."""
+    if isinstance(strength, (int, float)):
+        level = {"grade": float(strength), "shadow": 0.5, "wrap": 0.25}
+    else:
+        level = NATURAL_STRENGTHS.get(str(strength), NATURAL_STRENGTHS["default"])
     base = background.convert("RGB")
     placement = placement or auto_placement(base, subject_region, fill)
     alpha = np.array(cutout.getchannel("A")) > 128
     product_l = np.array(cutout.convert("L"), np.float32)[alpha]
     lab = cv2.cvtColor(np.array(base), cv2.COLOR_RGB2LAB).astype(np.float32)
     if product_l.size:
-        lab[..., 0] = np.clip(lab[..., 0] + (product_l.mean() - lab[..., 0].mean()) * strength, 0, 255)
+        lab[..., 0] = np.clip(lab[..., 0] + (product_l.mean() - lab[..., 0].mean()) * level["grade"], 0, 255)
     graded = Image.fromarray(cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB))
     gray = np.array(base.convert("L"), np.float32)
     lean = 1 if gray[:, : gray.shape[1] // 2].mean() > gray[:, gray.shape[1] // 2:].mean() else -1
     size, left, bottom = _place(graded.size, cutout, placement)
-    shadow = Image.new("L", graded.size, 0)
-    draw = ImageDraw.Draw(shadow)
-    draw.ellipse((left + size[0] * 0.05, bottom - size[1] * 0.05, left + size[0] * 0.95, bottom + size[1] * 0.03), fill=170)
-    offset = int(size[0] * 0.35) * lean
-    draw.polygon([(left + size[0] * 0.15, bottom), (left + size[0] * 0.85, bottom),
-                  (left + size[0] * 0.85 + offset, bottom - size[1] * 0.08),
-                  (left + size[0] * 0.15 + offset, bottom - size[1] * 0.08)], fill=70)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(max(5, size[0] // 14)))
-    graded = Image.composite(Image.new("RGB", graded.size, (0, 0, 0)), graded, shadow.point(lambda v: v * 0.5))
-    return composite_product(graded, cutout, subject_region, fill, shadow=False, placement=placement)
+    cast = Image.new("L", graded.size, 0)
+    offset = int(size[0] * 0.45) * lean
+    ImageDraw.Draw(cast).polygon([(left + size[0] * 0.12, bottom), (left + size[0] * 0.88, bottom),
+                                  (left + size[0] * 0.88 + offset, bottom - size[1] * 0.10),
+                                  (left + size[0] * 0.12 + offset, bottom - size[1] * 0.10)], fill=120)
+    cast = cast.filter(ImageFilter.GaussianBlur(max(6, size[0] // 10)))
+    ground = Image.fromarray(np.maximum(np.array(cast), np.array(_grounding(graded.size, size, left, bottom))), "L")
+    graded = Image.composite(Image.new("RGB", graded.size, (0, 0, 0)), graded,
+                             ground.point(lambda v: v * level["shadow"]))
+    return composite_product(graded, cutout, subject_region, fill, shadow=False, placement=placement,
+                             wrap=level["wrap"])
 
 
 # ------------------------------------------------------------------ checks

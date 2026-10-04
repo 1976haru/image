@@ -5,7 +5,8 @@ A job payload (stored in the persistent queue) looks like::
     {"kind": "generate"|"edit", "purpose": "shopify_hero", "canvas": [1800, 700], "prompt": "...",
      "prompt_preset": "tc_solo_woman", "channel": "Tokyo Chill", "people": 1, "composition": "SOLO_MEDIUM",
      "references": [{"path": "...", "role": "PRODUCT", "mask": "<optional corrected mask png>"}],
-     "product_mode": "strict"|"natural"|"ai"|"none", "product_scale": 0.5,
+     "product_mode": "natural"(default)|"strict"|"ai"|"none", "natural_strength": "weak"|"default"|"strong",
+     "product_scale": 0.5,
      "quality": "balanced", "memory": "interactive_low_memory", "seed": 123, "candidates": 2,
      "edit_image": "...", "edit_instruction": "...", "title": "...", "subtitle": "...", "cta": "..."}
 
@@ -207,7 +208,8 @@ def run_creator_job(payload: dict[str, Any], cancel: Event | None, *, models_dir
     return summary
 
 
-PRODUCT_MODES = {"strict": "원본 그대로 합성", "natural": "자연광 보정 합성", "ai": "AI 재구성", "none": "보존 안 함"}
+PRODUCT_MODES = {"natural": "자연광 보정 합성", "strict": "원본 그대로 합성", "ai": "AI 재구성 · 변형 가능",
+                 "none": "보존 안 함"}
 COMPOSITE_NOTES = {
     "composite": "원본 그대로 합성: 상품 사진의 픽셀을 그대로 사용(크기 조절·가장자리·접지 그림자만).",
     "natural": "자연광 보정 합성: 배경만 상품 색감에 맞춰 살짝 보정하고 빛 방향 그림자를 더함. 상품 픽셀은 그대로.",
@@ -241,6 +243,7 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
     cutout.save(cutout_path)
     region = purpose.subject_region
     scale = float(payload.get("product_scale") or 0.5)
+    natural_strength = str(payload.get("natural_strength") or "default")
     mode = base["mode"]
     composites = 1 if mode == "preview" else max(1, int(payload.get("candidates") or 2)) if preserve != "ai" else 2
     stage("배경 생성 중", 0.15)
@@ -255,8 +258,11 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
     backgrounds_dir.mkdir(exist_ok=True)
     for index, candidate in enumerate(backgrounds["candidates"][:composites], 1):
         placement = auto_placement(candidate["image"], region, scale)
-        compose = natural_composite if kind == "natural" else composite_product
-        image, box = compose(candidate["image"], cutout, region, scale, placement=placement)
+        if kind == "natural":
+            image, box = natural_composite(candidate["image"], cutout, region, scale, placement=placement,
+                                           strength=natural_strength)
+        else:
+            image, box = composite_product(candidate["image"], cutout, region, scale, placement=placement)
         meta = _meta_from(candidate, kind)
         background_path = backgrounds_dir / f"bg{index:02d}_{candidate['manifest']['seed']}.png"
         candidate["image"].save(background_path)
@@ -265,6 +271,8 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
         meta["warnings"] = [w for w in meta["warnings"] if "face" not in w.casefold()]
         meta["product_check"] = composite_check(box).to_dict()
         meta["product_mode"] = preserve
+        if kind == "natural":
+            meta["natural_strength"] = natural_strength
         meta["note"] = COMPOSITE_NOTES[kind]
         exact.append((image, meta, box))
     for image, meta, box in exact:
@@ -311,8 +319,11 @@ def recomposite(job_dir: Path, record: dict[str, Any], purpose: Purpose, *, base
     with Image.open(record["background"]) as opened:
         background = opened.convert("RGB")
     placement = Placement(baseline, center_x, scale)
-    compose = natural_composite if record.get("kind") == "natural" else composite_product
-    image, box = compose(background, cutout, purpose.subject_region, scale, placement=placement)
+    if record.get("kind") == "natural":
+        image, box = natural_composite(background, cutout, purpose.subject_region, scale, placement=placement,
+                                       strength=record.get("natural_strength") or "default")
+    else:
+        image, box = composite_product(background, cutout, purpose.subject_region, scale, placement=placement)
     existing = sorted((job_dir / "candidates").glob("c*.json"))
     meta = {key: record[key] for key in record if key not in ("index", "files")}
     meta.update(placement=placement.to_dict(), product_check=composite_check(box).to_dict(),

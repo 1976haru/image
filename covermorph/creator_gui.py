@@ -47,11 +47,14 @@ from .job_queue import CANCELLED, DONE, FAILED, PENDING, RUNNING, JobQueue
 from .quality_engines import resource_snapshot
 
 STATE_LABELS = {PENDING: "대기", RUNNING: "실행 중", DONE: "완료", FAILED: "실패", CANCELLED: "취소됨"}
-ENGINE_NAMES = {"zimage_turbo": "Z-Image", "flux2_klein_4b": "FLUX.2", "realvisxl_v5": "RealVis"}
-PRODUCT_MODE_LABELS = {"strict": "원본 그대로 합성 (권장)", "natural": "자연광 보정 합성",
-                       "ai": "AI 재구성 (형태가 바뀔 수 있음)", "none": "보존 안 함 (참조로만 사용)"}
-KIND_LABELS = {"generated": "생성", "composite": "원본 그대로 합성", "natural": "자연광 보정 합성", "harmonized": "합성+조명 보정(AI)",
-               "regenerated": "상품 참조 생성(AI)", "edit": "편집"}
+# Normal screens use plain words; model names only appear in 설정 → 엔진 상태 / 진단 정보 and the review's 기술 정보.
+ENGINE_NAMES = {"zimage_turbo": "사실적 생성", "flux2_klein_4b": "레퍼런스·편집", "realvisxl_v5": "대체 엔진"}
+TECH_NAMES = {"zimage_turbo": "Z-Image-Turbo Q6_K", "flux2_klein_4b": "FLUX.2-klein-4B Q8_0", "realvisxl_v5": "RealVisXL V5"}
+NATURAL_STRENGTH_LABELS = {"weak": "약하게", "default": "기본", "strong": "강하게"}
+PRODUCT_MODE_LABELS = {"natural": "자연광 보정 합성 (추천)", "strict": "원본 그대로 합성",
+                       "ai": "AI 재구성 · 상품 형태/라벨 변형 가능", "none": "보존 안 함 (참조로만 사용)"}
+KIND_LABELS = {"generated": "생성", "composite": "원본 그대로 합성", "natural": "자연광 보정 합성", "harmonized": "합성+AI 조명 보정 · 변형 가능",
+               "regenerated": "AI 재구성 · 상품 형태/라벨 변형 가능", "edit": "편집"}
 MAX_REFERENCES = 4
 IMAGE_TYPES = [("이미지", "*.png *.jpg *.jpeg *.webp *.bmp"), ("모든 파일", "*.*")]
 
@@ -232,16 +235,23 @@ class StudioWindow(ctk.CTkToplevel):
         product_row = ctk.CTkFrame(form, fg_color="transparent")
         product_row.pack(fill="x", padx=10, pady=4)
         ctk.CTkLabel(product_row, text="상품 처리").pack(side="left")
-        self.product_mode_var = ctk.StringVar(value=PRODUCT_MODE_LABELS[self.settings.get("product_mode") or "strict"])
+        saved_mode = self.settings.get("product_mode") if self.settings.get("product_mode") in PRODUCT_MODE_LABELS else "natural"
+        self.product_mode_var = ctk.StringVar(value=PRODUCT_MODE_LABELS[saved_mode])
         ctk.CTkOptionMenu(product_row, variable=self.product_mode_var, values=list(PRODUCT_MODE_LABELS.values()),
-                          width=230, command=lambda _v: self._update_engine_note()).pack(side="left", padx=6)
+                          width=260, command=lambda _v: self._update_engine_note()).pack(side="left", padx=6)
+        ctk.CTkLabel(product_row, text="자연광 강도").pack(side="left", padx=(10, 2))
+        self.natural_strength_var = ctk.StringVar(
+            value=NATURAL_STRENGTH_LABELS.get(self.settings.get("natural_strength") or "default", "기본"))
+        ctk.CTkSegmentedButton(product_row, values=list(NATURAL_STRENGTH_LABELS.values()),
+                               variable=self.natural_strength_var, width=170).pack(side="left", padx=4)
         ctk.CTkLabel(product_row, text="상품 크기").pack(side="left", padx=(16, 4))
         self.product_scale = ctk.CTkSlider(product_row, from_=0.25, to=0.9, number_of_steps=13, width=160)
         self.product_scale.set(0.5)
         self.product_scale.pack(side="left")
-        ctk.CTkLabel(form, text="원본 그대로 합성: 상품 사진의 픽셀을 그대로 씁니다(가장 안전) · 자연광 보정 합성: 배경 밝기와 "
-                                "그림자만 맞춥니다(상품 픽셀 그대로) · AI 재구성: 조명이 가장 자연스럽지만 AI가 상품을 다시 그려 "
-                                "모양·로고가 바뀔 수 있습니다.",
+        product_row.pack_configure(pady=(4, 0))
+        ctk.CTkLabel(form, text="자연광 보정 합성(추천): 상품 사진 픽셀은 그대로, 배경 밝기·그림자·가장자리만 맞춥니다 · "
+                                "원본 그대로 합성: 절대 보존 — 크기 조절과 접지 그림자만 · AI 재구성: 장면은 자연스럽지만 "
+                                "AI가 상품을 다시 그려 라벨·로고·모양이 바뀔 수 있습니다.",
                      anchor="w", justify="left", wraplength=620, text_color="#94a3b8").pack(fill="x", padx=10)
 
         heading("4. 품질과 PC 사용")
@@ -368,16 +378,16 @@ class StudioWindow(ctk.CTkToplevel):
         quality = QUALITY_LABELS.get(self.quality_var.get(), "balanced") if hasattr(self, "quality_var") else "balanced"
         mode = self._product_mode()
         if mode != "none" and any(r["role"] == "PRODUCT" for r in refs):
-            text = {"strict": "엔진: 배경 Z-Image → 원본 상품 픽셀 합성 (AI가 상품을 그리지 않음)",
-                    "natural": "엔진: 배경 Z-Image → 원본 상품 합성 + 배경 밝기·그림자 보정 (상품 픽셀 그대로)",
-                    "ai": "엔진: 원본 합성 → FLUX.2 조명 보정" + (" → FLUX.2 상품 재구성" if quality == "best" else "")
-                          + "  ⚠ AI 후보는 상품 모양이 바뀔 수 있음"}[mode]
+            text = {"strict": "처리: 배경 생성 → 원본 상품 그대로 합성 (AI가 상품을 그리지 않음)",
+                    "natural": "처리: 배경 생성 → 원본 상품 합성 + 배경 밝기·그림자·가장자리 보정 (상품 픽셀 그대로)",
+                    "ai": "처리: 원본 합성 → AI 조명 보정" + (" → AI 상품 재구성" if quality == "best" else "")
+                          + "\n⚠ AI 재구성 후보는 상품 라벨·로고·모양이 바뀔 수 있습니다"}[mode]
         elif refs:
-            text = "엔진: FLUX.2-klein (레퍼런스 반영)" + (" + RealVis(IP-Adapter) 비교 후보" if quality == "best" else "")
+            text = "처리: 레퍼런스를 반영해 생성" + (" + 대체 엔진 비교 후보" if quality == "best" else "")
         else:
-            text = {"preview": "엔진: FLUX.2-klein 1장 (약 20초)", "balanced": "엔진: Z-Image-Turbo (장당 약 35초)",
-                    "best": "엔진: Z-Image-Turbo → FLUX.2-klein 순차 비교"}[quality]
-        self.engine_note.configure(text=text + "\n엔진이 없거나 실패하면 RealVisXL로 자동 대체합니다.")
+            text = {"preview": "처리: 빠른 생성 1장 (약 20초)", "balanced": "처리: 사실적 생성 (장당 약 35초)",
+                    "best": "처리: 두 가지 방식으로 차례로 만들어 비교"}[quality]
+        self.engine_note.configure(text=text + "\n기본 엔진이 없거나 실패하면 대체 엔진으로 자동 전환합니다.")
 
     # ---------------------------------------------------------------- references
     def _add_references(self) -> None:
@@ -420,7 +430,7 @@ class StudioWindow(ctk.CTkToplevel):
             def set_role(choice: str, ref=ref) -> None:
                 ref["role"] = ROLE_LABELS[choice]
                 if ref["role"] == "PRODUCT" and self._product_mode() == "none":
-                    self.product_mode_var.set(PRODUCT_MODE_LABELS["strict"])
+                    self.product_mode_var.set(PRODUCT_MODE_LABELS["natural"])
                 self._render_references()
 
             ctk.CTkOptionMenu(row, values=list(ROLE_LABELS), variable=var, command=set_role, width=90).pack(side="left")
@@ -435,7 +445,7 @@ class StudioWindow(ctk.CTkToplevel):
 
     def _product_mode(self) -> str:
         label = self.product_mode_var.get() if hasattr(self, "product_mode_var") else ""
-        return next((key for key, value in PRODUCT_MODE_LABELS.items() if value == label), "strict")
+        return next((key for key, value in PRODUCT_MODE_LABELS.items() if value == label), "natural")
 
     def _edit_mask(self, ref: dict[str, Any], then: Any = None) -> None:
         def saved(path: Path) -> None:
@@ -476,6 +486,8 @@ class StudioWindow(ctk.CTkToplevel):
                 "people": people_n, "composition": composition,
                 "references": [dict(r) for r in self.references],
                 "product_mode": self._product_mode(), "product_scale": round(float(self.product_scale.get()), 2),
+                "natural_strength": next((k for k, v in NATURAL_STRENGTH_LABELS.items()
+                                          if v == self.natural_strength_var.get()), "default"),
                 "quality": QUALITY_LABELS[self.quality_var.get()], "memory": MEMORY_LABELS[self.memory_var.get()],
                 "seed": seed, "candidates": int(self.count_var.get()), "title": self.title_var.get(),
                 "subtitle": self.subtitle_var.get(), "cta": self.cta_var.get()}
@@ -501,6 +513,7 @@ class StudioWindow(ctk.CTkToplevel):
         self.queue.add(payload)
         self.settings["quality_label"], self.settings["memory_label"] = self.quality_var.get(), self.memory_var.get()
         self.settings["product_mode"] = payload["product_mode"]
+        self.settings["natural_strength"] = payload["natural_strength"]
         self.settings["last_purpose"] = payload["purpose"]
         purpose = self._purpose()
         if list(payload["canvas"]) != [purpose.width, purpose.height]:
@@ -558,7 +571,7 @@ class StudioWindow(ctk.CTkToplevel):
         style.configure("Studio.Treeview.Heading", background="#334155", foreground="#f8fafc", font=("Malgun Gothic", 10, "bold"))
         style.map("Studio.Treeview", background=[("selected", "#2563eb")])
         columns = ("status", "purpose", "prompt", "engine", "quality", "progress", "elapsed", "folder")
-        headings = ("상태", "목적", "프롬프트/제목", "엔진", "품질", "진행률", "경과", "출력 폴더")
+        headings = ("상태", "목적", "프롬프트/제목", "방식", "품질", "진행률", "경과", "출력 폴더")
         widths = (90, 160, 360, 150, 100, 220, 70, 300)
         frame = ctk.CTkFrame(tab)
         frame.pack(fill="both", expand=True)
@@ -622,13 +635,14 @@ class StudioWindow(ctk.CTkToplevel):
             engines = dict.fromkeys(ENGINE_NAMES.get(c["engine"], c["engine"]) for c in job.result["candidates"])
             return " + ".join(engines)
         payload = job.payload
+        from .creator_jobs import product_mode
         if payload.get("kind") == "edit":
-            return "FLUX.2 편집"
-        if payload.get("product_preserve") and any(r["role"] == "PRODUCT" for r in payload.get("references") or []):
-            return "합성 + FLUX.2"
+            return "편집"
+        if any(r["role"] == "PRODUCT" for r in payload.get("references") or []) and product_mode(payload) != "none":
+            return {"natural": "자연광 보정 합성", "strict": "원본 그대로 합성", "ai": "AI 재구성"}[product_mode(payload)]
         if payload.get("references"):
-            return "FLUX.2"
-        return {"preview": "FLUX.2", "balanced": "Z-Image", "best": "Z-Image + FLUX.2"}.get(payload.get("quality"), "")
+            return "레퍼런스·편집"
+        return {"preview": "빠른 생성", "balanced": "사실적 생성", "best": "사실적 + 레퍼런스 비교"}.get(payload.get("quality"), "")
 
     def _refresh_queue(self) -> None:
         selected = set(self.tree.selection())
@@ -775,7 +789,8 @@ class StudioWindow(ctk.CTkToplevel):
             else:
                 label.configure(image=None, text="")
         lines = [f"종류: {KIND_LABELS.get(candidate.get('kind'), candidate.get('kind'))}",
-                 f"엔진: {candidate.get('model')} · seed {candidate['seed']} · {candidate.get('seconds')}초 · "
+                 f"방식: {ENGINE_NAMES.get(candidate['engine'], candidate['engine'])} · seed {candidate['seed']} · "
+                 f"{candidate.get('seconds')}초 · "
                  f"GPU 피크 {candidate.get('peak_vram_mib')} MiB",
                  f"라이선스: {candidate.get('license')} · 상업적 사용 {'가능' if candidate.get('commercial_use') else '확인 필요'}",
                  f"번역 적용: {'예' if candidate.get('translation_applied') else '아니오'}",
@@ -789,7 +804,8 @@ class StudioWindow(ctk.CTkToplevel):
                       f"상품 글자: '{check.get('text_reference')}' → '{check.get('text_candidate')}'"]
         lines += ["", f"원본 프롬프트: {candidate.get('original_prompt')}",
                   f"번역: {candidate.get('translated_prompt')}" if candidate.get("translation_applied") else "",
-                  "", f"엔진 프롬프트: {candidate.get('compiled_prompt')}"]
+                  "", "— 기술 정보 —", f"엔진: {TECH_NAMES.get(candidate['engine'], candidate.get('model'))}",
+                  f"엔진 프롬프트: {candidate.get('compiled_prompt')}"]
         self.info_box.delete("1.0", "end")
         self.info_box.insert("1.0", "\n".join(line for line in lines if line is not None))
 

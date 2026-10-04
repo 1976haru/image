@@ -27,7 +27,10 @@ DEFAULTS: dict[str, Any] = {
     "setup_completed": False,
     "last_purpose": "youtube_thumbnail",
     "custom_sizes": {},             # purpose key -> [w, h] last used
-    "product_mode": "strict",       # strict | natural | ai (원본 그대로 / 자연광 보정 / AI 재구성)
+    # natural | strict | ai. Default chosen from the RC1 visual review: natural-light composite keeps the product's
+    # pixels and fits the scene best; strict is the absolute-preservation option; ai can change label/shape.
+    "product_mode": "natural",
+    "natural_strength": "default",  # weak | default | strong (약하게 / 기본 / 강하게)
     "last_export_dir": "",
     "last_project_dir": "",
     "last_reference_dir": "",

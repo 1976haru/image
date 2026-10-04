@@ -462,3 +462,36 @@ def test_qa_warnings_are_shown_in_korean():
     assert korean_warning("expected 2 face(s), found 1") == "얼굴 2명을 기대했지만 1명만 찾았습니다"
     assert korean_warning("main face is soft/low-detail").startswith("주 인물 얼굴")
     assert korean_warning("상품 색상이 참조와 다릅니다(ΔE 20.1)") == "상품 색상이 참조와 다릅니다(ΔE 20.1)"
+
+
+# ------------------------------------------------------------------ RC2 defaults / natural strength
+def test_rc2_product_defaults(tmp_path):
+    from covermorph.creator_gui import PRODUCT_MODE_LABELS
+    assert cs.load_creator_settings(tmp_path)["product_mode"] == "natural"
+    assert cs.load_creator_settings(tmp_path)["natural_strength"] == "default"
+    assert list(PRODUCT_MODE_LABELS)[0] == "natural" and "추천" in PRODUCT_MODE_LABELS["natural"]
+    assert "변형 가능" in PRODUCT_MODE_LABELS["ai"]
+    assert cj.product_mode({"product_mode": "natural"}) == "natural"
+
+
+def test_natural_strengths_keep_opaque_product_pixels_and_differ(tmp_path):
+    from covermorph.product_checks import Placement, composite_product, natural_composite
+    product = Image.new("RGBA", (120, 160), (0, 0, 0, 0))
+    ImageDraw.Draw(product).rectangle((10, 10, 110, 150), fill=(150, 80, 30, 255))
+    ImageDraw.Draw(product).rectangle((30, 60, 90, 90), fill=(250, 250, 250, 255))
+    background = Image.new("RGB", (800, 600), (90, 100, 110))
+    ImageDraw.Draw(background).rectangle((0, 0, 400, 600), fill=(200, 200, 190))
+    placement = Placement(0.85, 0.5, 0.4)
+    strict, box = composite_product(background, product, (0.3, 0.1, 0.4, 0.8), placement=placement)
+    x0, y0 = round(box[0] * 800), round(box[1] * 600)
+    w, h = round(box[2] * 800), round(box[3] * 600)
+    expected = product.resize((w, h), Image.Resampling.LANCZOS)
+    opaque = [(x, y) for x in range(0, w, 3) for y in range(0, h, 3) if expected.getpixel((x, y))[3] == 255]
+    outputs = {}
+    for level in ("weak", "default", "strong"):
+        image, _ = natural_composite(background, product, (0.3, 0.1, 0.4, 0.8), strength=level, placement=placement)
+        outputs[level] = image
+        assert all(image.getpixel((x0 + x, y0 + y)) == expected.getpixel((x, y))[:3] for x, y in opaque), level
+    assert all(strict.getpixel((x0 + x, y0 + y)) == expected.getpixel((x, y))[:3] for x, y in opaque)
+    probe = (x0 + w // 2, y0 + h + 4)          # surface just under the product: stronger = darker shadow
+    assert sum(outputs["strong"].getpixel(probe)) < sum(outputs["weak"].getpixel(probe))
