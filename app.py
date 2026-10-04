@@ -38,6 +38,9 @@ def main() -> int:
     argv = sys.argv[1:]
     if not argv or argv[0] in ("--studio-selftest", "--studio-endurance"):
         _record_exe_path()
+    if argv[:1] in (["--studio-job"], ["--editor-project"], ["--backend-status"]):  # youtubesum backend commands
+        from covermorph.backend_cli import main as backend_main
+        return backend_main(argv)
     if argv[:1] == ["--studio-selftest"]:  # packaged-app acceptance run of the AI 이미지 스튜디오
         from covermorph.creator_gui import app_root_dir, run_selftest
         return run_selftest(app_root_dir(), argv[1] if len(argv) > 1 else "studio_selftest")
