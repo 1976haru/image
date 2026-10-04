@@ -158,6 +158,12 @@ COMPOSITION_PROFILES: dict[str, dict[str, Any]] = {
                       "framing": "medium-wide shot of exactly two people, upper bodies and surroundings visible"},
     "COUPLE_EMOTIONAL": {"people": 2, "min_face_height": 0.12, "max_face_height": 0.35,
                          "framing": "medium shot of exactly two people facing each other, upper bodies visible"},
+    # RC2 (preset-only): Tokyo Chill couple. Same seeds: the old wording gave two women (9301) and stiff forward stares;
+    # this two-shot gave a man and a woman interacting with readable faces and the city still visible.
+    "COUPLE_CLOSE": {"people": 2, "min_face_height": 0.14, "max_face_height": 0.38,
+                     "framing": "medium-close two-shot of exactly two people, both faces clearly visible and turned "
+                                "slightly toward each other, shoulders and a little of the surroundings visible, the pair "
+                                "placed off-center"},
     "SCENERY_WITH_PERSON": {"people": 1, "min_face_height": 0.0, "max_face_height": 0.15,
                             "framing": "wide cinematic shot, a small person in the scene"},
 }

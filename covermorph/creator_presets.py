@@ -87,6 +87,9 @@ class PromptPreset:
         return asdict(self)
 
 
+OLD_POP_LIVED = ("candid unposed moment, natural skin texture with fine lines and real complexion, lived-in setting "
+                 "with personal objects, {light}, gentle film grain, not a stock photo, not a studio")
+
 BUILTIN_PROMPT_PRESETS: dict[str, PromptPreset] = {p.key: p for p in [
     PromptPreset("tc_solo_woman", "Tokyo Chill · 여성 1인", "youtube_thumbnail",
                  "side profile of a young woman on a quiet Tokyo street at dusk", "Tokyo Chill", 1, "SOLO_MEDIUM",
@@ -95,13 +98,28 @@ BUILTIN_PROMPT_PRESETS: dict[str, PromptPreset] = {p.key: p for p in [
                  "a young man standing on a train platform in the evening", "Tokyo Chill", 1, "SOLO_MEDIUM",
                  locale="ja-JP", language="ja", audience="Japanese city-pop listeners", appearance_hint="Japanese"),
     PromptPreset("tc_couple", "Tokyo Chill · 커플", "youtube_thumbnail",
-                 "a young man and woman couple sitting by a cafe window", "Tokyo Chill", 2, "COUPLE_MEDIUM",
+                 "a young man and woman couple sharing a quiet moment by a cafe window, she glances at him and he "
+                 "smiles softly, candid and unposed, everyday clothes, the city street softly visible outside",
+                 "Tokyo Chill", 2, "COUPLE_CLOSE",
                  locale="ja-JP", language="ja", audience="Japanese city-pop listeners", appearance_hint="Japanese"),
-    # OLD POP: no appearance hint by default (do not force Asian or Western); set one in the JSON if wanted.
+    # OLD POP (RC2): lived-in, story-telling wording replaced the plain "in an autumn park" style, which read as stock
+    # photos with flat light. No appearance hint by default (do not force Asian or Western); set one in the JSON or
+    # write it in the prompt if the channel needs it.
     PromptPreset("op_mature_couple", "OLD POP · 중년 커플", "youtube_thumbnail",
-                 "a mature man and woman couple in their fifties in an autumn park", "OLD POP LOUNGE", 2, "COUPLE_MEDIUM"),
-    PromptPreset("op_mature_solo", "OLD POP · 중년 1인", "youtube_thumbnail",
-                 "a mature woman in her fifties sitting by a retro coffee shop window", "OLD POP LOUNGE", 1, "SOLO_CLOSE"),
+                 "a mature man and woman couple in their fifties walking arm in arm on a quiet autumn path, laughing at "
+                 "a shared memory, " + OLD_POP_LIVED.format(light="soft late-afternoon light"),
+                 "OLD POP LOUNGE", 2, "COUPLE_MEDIUM"),
+    PromptPreset("op_mature_solo", "OLD POP · 중년 여성", "youtube_thumbnail",
+                 "a mature woman in her fifties sitting by the window of a small retro coffee shop she has visited for "
+                 "years, holding a warm cup, " + OLD_POP_LIVED.format(light="warm practical lamp light"),
+                 "OLD POP LOUNGE", 1, "SOLO_CLOSE"),
+    PromptPreset("op_mature_man", "OLD POP · 중년 남성", "youtube_thumbnail",
+                 "a mature man in his fifties at the counter of an old record shop, flipping through vinyl records, "
+                 + OLD_POP_LIVED.format(light="warm practical lamp light"), "OLD POP LOUNGE", 1, "SOLO_MEDIUM"),
+    PromptPreset("op_seasonal", "OLD POP · 계절 장면", "youtube_thumbnail",
+                 "a mature woman in her fifties stepping out of a small neighborhood bakery into the first snow of "
+                 "winter, scarf and wool coat, " + OLD_POP_LIVED.format(light="warm shop light spilling onto the snowy street"),
+                 "OLD POP LOUNGE", 1, "SOLO_CLOSE"),
     PromptPreset("sh_clean_studio", "Shopify · 깔끔한 스튜디오", "shopify_product_lifestyle",
                  "the product on a clean seamless studio backdrop with soft even light and a gentle shadow"),
     PromptPreset("sh_editorial", "Shopify · 에디토리얼 라이프스타일", "shopify_hero",
