@@ -114,7 +114,10 @@ def find_surface(background: Image.Image, region: tuple[float, float, float, flo
     band = cv2.GaussianBlur(gray[:, x0:x1], (0, 0), 3)
     dy = cv2.Sobel(band, cv2.CV_32F, 0, 1, ksize=5)
     score = np.abs(dy).mean(axis=1) * np.clip(-np.sign(dy).mean(axis=1), 0, None)
-    score[: int(0.30 * height)] = 0
+    # Only the lower half of the subject area can hold the edge the product stands in front of: a table that runs
+    # past the bottom of the frame has no visible front edge, and a window/shelf line higher up must not win
+    # (it made a mug float mid-air, 2026-10-04). Without a valid edge the default near the bottom is used.
+    score[: int(max(0.30, region[1] + 0.5 * region[3]) * height)] = 0
     score[int(0.97 * height):] = 0
     score = np.convolve(score, np.ones(9) / 9, mode="same")
     y = int(score.argmax())

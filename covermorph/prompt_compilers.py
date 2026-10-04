@@ -34,8 +34,8 @@ FLUX_TEXTLESS = "Every surface is free of lettering and logos; any signs are blu
 SHOPIFY_PRODUCT_RULE = ("Show the product from the same viewing angle as its reference, with an identical silhouette, "
                         "the same number of parts and the same colors, materials and logo; "
                         "do not add new claims, labels or packaging text.")
-PRODUCT_WARNING = ("Product reference: check shape/part count against the reference (FLUX.2-klein can duplicate "
-                   "parts such as handles on some seeds); keep 2+ candidates for product shots.")
+PRODUCT_WARNING = ("상품 참조: AI가 상품을 다시 그리면 모양·부품 수·로고가 바뀔 수 있습니다(예: 손잡이 중복, 라벨 글자 누락). "
+                   "형태가 중요하면 '원본 그대로 합성'을 쓰고, AI 후보는 2장 이상 비교하세요.")
 
 
 @dataclass(slots=True)
