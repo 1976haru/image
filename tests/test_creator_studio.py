@@ -441,3 +441,14 @@ def test_diagnostics_report_is_sanitized_and_prompt_free(tmp_path, monkeypatch):
     assert "비밀 프롬프트" not in report and "%USERPROFILE%" in report and Path.home().name not in report.split("Windows")[0]
     assert "zimage_turbo" in report and "6900" in report
     assert "비밀 프롬프트" in build_report(tmp_path, settings, queue, include_prompts=True)
+
+
+def test_job_with_no_candidates_fails_instead_of_done(tmp_path, monkeypatch):
+    from covermorph.errors import classify
+    from covermorph.quality_engines import EngineError
+    monkeypatch.setattr(cj, "run_quality_job", lambda payload, cancel=None, progress=None: {
+        "candidates": [], "warnings": ["zimage_turbo failed: zimage_turbo sd-cli exited with 1:"], "plan": [], "mode": "preview"})
+    with pytest.raises(EngineError) as caught:
+        cj.run_creator_job({"purpose": "youtube_thumbnail", "prompt": "x", "quality": "preview", "seed": 1}, None,
+                           models_dir=tmp_path, output_root=tmp_path / "out")
+    assert classify(caught.value).code == "BACKEND_CRASH"

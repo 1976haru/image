@@ -45,3 +45,4 @@ models/
 *.pth
 *.onnx
 tools/realesrgan-ncnn-vulkan/
+covermorph/_build_info.py

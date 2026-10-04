@@ -194,6 +194,9 @@ def run_creator_job(payload: dict[str, Any], cancel: Event | None, *, models_dir
                                            purpose, yunet, people, None))
     if cancel.is_set():
         raise EngineCancelled("Cancelled.")
+    if not records:  # every engine failed (e.g. the backend process crashed): this is a failure, not "done"
+        from .quality_engines import EngineError
+        raise EngineError("No candidate was produced: " + "; ".join(warnings or ["engine failed"]))
     time.sleep(1.0)  # let the driver report freed memory after the engine process exited
     memory_after = resource_snapshot().to_dict()
     summary = {"job_dir": str(job_dir), "purpose": purpose.key, "canvas": list(canvas), "candidates": records,

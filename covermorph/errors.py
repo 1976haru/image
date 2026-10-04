@@ -75,7 +75,7 @@ def classify(exc: BaseException) -> UserError:
         return UserError("CANCELLED", "취소되었습니다.", details)
     if "missing files" in lower or "is not installed" in lower or "no image engine is installed" in lower:
         return UserError("MODELS_MISSING", "필요한 모델 파일을 찾지 못했습니다.", details)
-    if "sd-cli exited" in lower or "terminated" in lower or name == "EngineError" and "exited" in lower:
+    if "sd-cli exited" in lower or "terminated" in lower or "no candidate was produced" in lower:
         return UserError("BACKEND_CRASH", "이미지 엔진 프로세스가 정상적으로 끝나지 않았습니다.", details)
     if "out of memory" in lower or name == "OutOfMemoryError":
         return UserError("VRAM_LOW", "그래픽 메모리가 부족해 생성하지 못했습니다.", details)

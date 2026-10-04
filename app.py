@@ -28,6 +28,9 @@ def main() -> int:
     if argv[:1] == ["--studio-selftest"]:  # packaged-app acceptance run of the AI 이미지 스튜디오
         from covermorph.creator_gui import app_root_dir, run_selftest
         return run_selftest(app_root_dir(), argv[1] if len(argv) > 1 else "studio_selftest")
+    if argv[:1] == ["--studio-endurance"]:  # packaged-app endurance phases (scripts/validate_endurance.py)
+        from covermorph.creator_gui import app_root_dir, run_endurance_phase
+        return run_endurance_phase(app_root_dir(), argv[1], argv[2])
     if argv[:1] == ["--ocr-worker"]:  # short-lived OCR process for the product logo check
         from covermorph.ocr_worker import main as ocr_main
         return ocr_main(argv[1:])

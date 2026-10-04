@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-title CoverMorph Studio v0.5.4 - EXE Build
+title CoverMorph Studio v1.0.0-rc1 - EXE Build
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" goto no_venv

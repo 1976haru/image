@@ -1099,3 +1099,93 @@ def run_selftest(app_root: Path, out_dir: Path, timeout: float = 900.0) -> int:
     root.after(1500, begin)
     root.mainloop()
     return 0 if report.get("state") == DONE else 1
+
+
+def run_endurance_phase(app_root: Path, phase: str, out_dir: Path, timeout: float = 3600.0) -> int:
+    """Packaged-app endurance hooks, driven by scripts/validate_endurance.py (data dir given by COVERMORPH_DATA_DIR).
+
+    a: start the queue, press 현재 작업 후 일시정지 as soon as job 1 runs, wait for the pause, close the app.
+    b: reopen, record states, 재개, close the app while a later job is running (it must return to pending).
+    c: reopen, 재개 and run to the end (the harness kills one backend process and holds GPU memory meanwhile);
+       then 실패 재시도 for failed jobs and finish.
+    Writes <out_dir>/phase_<x>.json with the queue states seen at start and end.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ctk.set_appearance_mode("dark")
+    root = ctk.CTk()
+    root.withdraw()
+    studio = StudioWindow(root, app_root)
+    report: dict[str, Any] = {"phase": phase, "start_states": [j.state for j in studio.queue.jobs],
+                              "start_paused": studio.queue.paused, "events": []}
+    started = time.time()
+
+    def log(text: str) -> None:
+        report["events"].append(f"{time.time() - started:7.1f}s {text}")
+
+    def close(reason: str) -> None:
+        log(f"close app: {reason}")
+        report["end_states"] = [j.state for j in studio.queue.jobs]
+        report["end_paused"] = studio.queue.paused
+        report["errors"] = [j.error for j in studio.queue.jobs if j.error]
+        (out_dir / f"phase_{phase}.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        studio.shutdown()          # same path as closing the main window
+        root.after(1500, root.destroy)
+
+    def phase_a() -> None:
+        running = studio.runner.runner.current
+        if running is not None and "paused_pressed" not in report:
+            report["paused_pressed"] = True
+            studio.runner.pause_after_current()
+            log(f"현재 작업 후 일시정지 while {running.payload.get('name')} runs")
+        if report.get("paused_pressed") and studio.runner.runner.current is None and studio.queue.paused:
+            return close("paused after current job")
+        if not studio.runner.running and "started" not in report:
+            report["started"] = True
+            studio.runner.start()
+            log("시작")
+        tick(phase_a)
+
+    def phase_b() -> None:
+        if "resumed" not in report:
+            report["resumed"] = True
+            studio.runner.start()
+            log("재개")
+        current = studio.runner.runner.current
+        done = sum(1 for j in studio.queue.jobs if j.state == DONE)
+        if current is not None and done >= 2 and studio.runner.progress.get(current.id, {}).get("fraction", 0) >= 0.1:
+            report["closed_during"] = current.payload.get("name")
+            return close(f"while {current.payload.get('name')} is running")
+        tick(phase_b)
+
+    def phase_c() -> None:
+        if "resumed" not in report:
+            report["resumed"] = True
+            studio.runner.start()
+            log("재개")
+        pending = [j for j in studio.queue.jobs if j.state in (PENDING, RUNNING)]
+        failed = [j for j in studio.queue.jobs if j.state == FAILED]
+        if pending:
+            waiting = [j for j in pending if j.waiting_reason]
+            if waiting and "saw_wait" not in report:
+                report["saw_wait"] = waiting[0].waiting_reason
+                log(f"자원 대기: {waiting[0].waiting_reason}")
+            return tick(phase_c)
+        if failed and "retried" not in report:
+            report["retried"] = [j.payload.get("name") for j in failed]
+            report["failed_errors"] = [j.error for j in failed]
+            for job in failed:
+                studio.queue.retry(job.id)
+            log(f"실패 재시도: {report['retried']}")
+            studio.runner.start()
+            return tick(phase_c)
+        return close("queue finished")
+
+    def tick(step) -> None:
+        if time.time() - started > timeout:
+            return close("timeout")
+        root.after(1000, step)
+
+    root.after(2000, {"a": phase_a, "b": phase_b, "c": phase_c}[phase])
+    root.mainloop()
+    return 0
