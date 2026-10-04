@@ -20,7 +20,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 
 COLOR_DRIFT_CEILING = 14.0       # ΔE (CIE76) between median product colors
 MIN_PRODUCT_AREA = 0.004         # product-colored region must cover this fraction of the candidate
@@ -28,14 +28,18 @@ REGENERATED_WARNING = "AI가 다시 그린 상품 — 형태·부품 수·로고
 
 
 # ------------------------------------------------------------------ cutout
-def extract_product(reference: Image.Image) -> Image.Image:
-    """RGBA cutout cropped to the product. Uses alpha when present, else GrabCut seeded from the border color."""
+def extract_product(reference: Image.Image, mask: Image.Image | None = None) -> Image.Image:
+    """RGBA cutout cropped to the product, from a given (user-corrected) mask or the automatic one."""
+    from .product_masks import cutout
+    return cutout(reference, mask if mask is not None else auto_mask(reference))
+
+
+def auto_mask(reference: Image.Image) -> Image.Image:
+    """Full-size "L" mask (255 = product). Alpha channel when present, else GrabCut seeded from the backdrop."""
     if reference.mode in ("RGBA", "LA") or "transparency" in reference.info:
-        rgba = reference.convert("RGBA")
-        alpha = np.array(rgba.getchannel("A"))
-        if (alpha < 250).mean() > 0.02:
-            box = Image.fromarray(alpha).point(lambda v: 255 if v > 16 else 0).getbbox()
-            return rgba.crop(box) if box else rgba
+        alpha = reference.convert("RGBA").getchannel("A")
+        if (np.array(alpha) < 250).mean() > 0.02:
+            return alpha
     rgb = np.array(reference.convert("RGB"))
     height, width = rgb.shape[:2]
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -66,10 +70,7 @@ def extract_product(reference: Image.Image) -> Image.Image:
     big = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= 0.05 * stats[keep, cv2.CC_STAT_AREA]]
     fg = np.isin(labels, big).astype(np.uint8) * 255
     fg = _fill_logo_holes(fg, lab, background)
-    fg = cv2.GaussianBlur(fg, (3, 3), 0)
-    rgba = np.dstack([rgb, fg])
-    box = Image.fromarray(fg).point(lambda v: 255 if v > 16 else 0).getbbox()
-    return Image.fromarray(rgba, "RGBA").crop(box)
+    return Image.fromarray(cv2.GaussianBlur(fg, (3, 3), 0), "L")
 
 
 def _fill_logo_holes(fg: np.ndarray, lab: np.ndarray, background: np.ndarray) -> np.ndarray:
@@ -97,28 +98,111 @@ def _fill_logo_holes(fg: np.ndarray, lab: np.ndarray, background: np.ndarray) ->
 
 
 # ------------------------------------------------------------------ composite
-def composite_product(background: Image.Image, cutout: Image.Image,
-                      subject_region: tuple[float, float, float, float], fill: float = 0.5) -> tuple[Image.Image, list[float]]:
-    """Paste the exact product pixels into the subject region, standing on its lower part, with a soft shadow."""
-    canvas = background.convert("RGB").copy()
-    width, height = canvas.size
-    rx, ry, rw, rh = subject_region
-    region_w, region_h = rw * width, rh * height
-    scale = min(region_w * fill / cutout.width, region_h * fill / cutout.height)
+SURFACE_MARGIN = 0.035   # product base this far (of image height) above the surface's front edge
+
+
+def find_surface(background: Image.Image, region: tuple[float, float, float, float]) -> float | None:
+    """Height (0..1) of the supporting surface's front edge under the subject region, or None.
+
+    A front edge is a long horizontal transition that gets darker going down (lit top surface -> front face),
+    strongest in the subject's column. Measured on generated table/counter/desk/windowsill scenes (2026-10-04);
+    the back edge of a table goes dark -> bright and is ignored.
+    """
+    gray = np.array(background.convert("L"), np.float32)
+    height, width = gray.shape
+    x0, x1 = int(region[0] * width), max(int(region[0] * width) + 8, int((region[0] + region[2]) * width))
+    band = cv2.GaussianBlur(gray[:, x0:x1], (0, 0), 3)
+    dy = cv2.Sobel(band, cv2.CV_32F, 0, 1, ksize=5)
+    score = np.abs(dy).mean(axis=1) * np.clip(-np.sign(dy).mean(axis=1), 0, None)
+    score[: int(0.30 * height)] = 0
+    score[int(0.97 * height):] = 0
+    score = np.convolve(score, np.ones(9) / 9, mode="same")
+    y = int(score.argmax())
+    if score[y] < 25:   # no clear surface edge (soft/flat backgrounds)
+        return None
+    return y / height
+
+
+@dataclass(slots=True)
+class Placement:
+    baseline: float      # product bottom, fraction of image height
+    center_x: float      # product center, fraction of image width
+    scale: float         # product height as a fraction of image height
+
+    def to_dict(self) -> dict[str, float]:
+        return {"baseline": round(self.baseline, 4), "center_x": round(self.center_x, 4), "scale": round(self.scale, 4)}
+
+
+def auto_placement(background: Image.Image, region: tuple[float, float, float, float], fill: float = 0.5) -> Placement:
+    rx, ry, rw, rh = region
+    surface = find_surface(background, region)
+    baseline = (surface - SURFACE_MARGIN) if surface is not None else ry + rh * 0.94
+    baseline = min(0.97, max(ry + 0.2 * rh, baseline))
+    return Placement(baseline, rx + rw / 2, rh * fill)
+
+
+def _place(canvas_size: tuple[int, int], cutout: Image.Image, placement: Placement) -> tuple[tuple[int, int], int, int]:
+    width, height = canvas_size
+    target_h = max(1.0, placement.scale * height)
+    target_h = min(target_h, placement.baseline * height * 0.98)       # never past the top edge
+    scale = target_h / cutout.height
     size = (max(1, round(cutout.width * scale)), max(1, round(cutout.height * scale)))
+    if size[0] > width * 0.95:
+        factor = width * 0.95 / size[0]
+        size = (max(1, round(size[0] * factor)), max(1, round(size[1] * factor)))
+    left = round(placement.center_x * width - size[0] / 2)
+    left = min(max(0, left), width - size[0])
+    bottom = round(placement.baseline * height)
+    return size, left, bottom
+
+
+def composite_product(background: Image.Image, cutout: Image.Image,
+                      subject_region: tuple[float, float, float, float], fill: float = 0.5,
+                      shadow: bool = True, placement: Placement | None = None) -> tuple[Image.Image, list[float]]:
+    """원본 그대로 합성: the product's own pixels (only scaled) standing on the detected surface, contact shadow."""
+    canvas = background.convert("RGB").copy()
+    placement = placement or auto_placement(canvas, subject_region, fill)
+    size, left, bottom = _place(canvas.size, cutout, placement)
+    width, height = canvas.size
     product = cutout.resize(size, Image.Resampling.LANCZOS)
-    left = round(rx * width + (region_w - size[0]) / 2)
-    bottom = round(ry * height + region_h * 0.94)
     top = bottom - size[1]
-    shadow = Image.new("L", canvas.size, 0)
-    ellipse = Image.new("L", (size[0], max(8, size[1] // 7)), 0)
-    from PIL import ImageDraw
-    ImageDraw.Draw(ellipse).ellipse((size[0] * 0.06, 0, size[0] * 0.94, ellipse.height - 1), fill=150)
-    shadow.paste(ellipse, (left, bottom - ellipse.height // 2))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(max(4, size[0] // 18)))
-    canvas = Image.composite(Image.new("RGB", canvas.size, (0, 0, 0)), canvas, shadow.point(lambda v: v * 0.55))
+    if shadow:
+        contact = Image.new("L", canvas.size, 0)
+        ellipse = Image.new("L", (size[0], max(8, size[1] // 7)), 0)
+        ImageDraw.Draw(ellipse).ellipse((size[0] * 0.06, 0, size[0] * 0.94, ellipse.height - 1), fill=150)
+        contact.paste(ellipse, (left, bottom - ellipse.height // 2))
+        contact = contact.filter(ImageFilter.GaussianBlur(max(4, size[0] // 18)))
+        canvas = Image.composite(Image.new("RGB", canvas.size, (0, 0, 0)), canvas, contact.point(lambda v: v * 0.55))
     canvas.paste(product, (left, top), product)
     return canvas, [left / width, top / height, size[0] / width, size[1] / height]
+
+
+def natural_composite(background: Image.Image, cutout: Image.Image, subject_region: tuple[float, float, float, float],
+                      fill: float = 0.5, strength: float = 0.15, placement: Placement | None = None) -> tuple[Image.Image, list[float]]:
+    """자연광 보정 합성: the BACKGROUND's brightness moves a little toward the product's (no hue shift: grading toward
+    the product's color tinted whole scenes), plus a soft shadow falling away from the brighter side. The product's
+    pixels are never changed (only scaled), so logo/text/geometry stay exactly as photographed."""
+    base = background.convert("RGB")
+    placement = placement or auto_placement(base, subject_region, fill)
+    alpha = np.array(cutout.getchannel("A")) > 128
+    product_l = np.array(cutout.convert("L"), np.float32)[alpha]
+    lab = cv2.cvtColor(np.array(base), cv2.COLOR_RGB2LAB).astype(np.float32)
+    if product_l.size:
+        lab[..., 0] = np.clip(lab[..., 0] + (product_l.mean() - lab[..., 0].mean()) * strength, 0, 255)
+    graded = Image.fromarray(cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB))
+    gray = np.array(base.convert("L"), np.float32)
+    lean = 1 if gray[:, : gray.shape[1] // 2].mean() > gray[:, gray.shape[1] // 2:].mean() else -1
+    size, left, bottom = _place(graded.size, cutout, placement)
+    shadow = Image.new("L", graded.size, 0)
+    draw = ImageDraw.Draw(shadow)
+    draw.ellipse((left + size[0] * 0.05, bottom - size[1] * 0.05, left + size[0] * 0.95, bottom + size[1] * 0.03), fill=170)
+    offset = int(size[0] * 0.35) * lean
+    draw.polygon([(left + size[0] * 0.15, bottom), (left + size[0] * 0.85, bottom),
+                  (left + size[0] * 0.85 + offset, bottom - size[1] * 0.08),
+                  (left + size[0] * 0.15 + offset, bottom - size[1] * 0.08)], fill=70)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(max(5, size[0] // 14)))
+    graded = Image.composite(Image.new("RGB", graded.size, (0, 0, 0)), graded, shadow.point(lambda v: v * 0.5))
+    return composite_product(graded, cutout, subject_region, fill, shadow=False, placement=placement)
 
 
 # ------------------------------------------------------------------ checks

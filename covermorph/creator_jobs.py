@@ -4,7 +4,8 @@ A job payload (stored in the persistent queue) looks like::
 
     {"kind": "generate"|"edit", "purpose": "shopify_hero", "canvas": [1800, 700], "prompt": "...",
      "prompt_preset": "tc_solo_woman", "channel": "Tokyo Chill", "people": 1, "composition": "SOLO_MEDIUM",
-     "references": [{"path": "...", "role": "PRODUCT"}], "product_preserve": true, "product_scale": 0.5,
+     "references": [{"path": "...", "role": "PRODUCT", "mask": "<optional corrected mask png>"}],
+     "product_mode": "strict"|"natural"|"ai"|"none", "product_scale": 0.5,
      "quality": "balanced", "memory": "interactive_low_memory", "seed": 123, "candidates": 2,
      "edit_image": "...", "edit_instruction": "...", "title": "...", "subtitle": "...", "cta": "..."}
 
@@ -84,7 +85,12 @@ def _copy_references(job_dir: Path, references: list[dict[str, Any]]) -> list[di
         source = Path(ref["path"])
         destination = target / f"{index:02d}_{ref['role'].lower()}{source.suffix.lower() or '.png'}"
         shutil.copy2(source, destination)
-        copied.append({"path": str(destination), "role": ref["role"], "source": str(source)})
+        entry = {"path": str(destination), "role": ref["role"], "source": str(source)}
+        if ref.get("mask") and Path(ref["mask"]).exists():  # the corrected mask is part of the project
+            mask_copy = target / f"{index:02d}_{ref['role'].lower()}_mask.png"
+            shutil.copy2(ref["mask"], mask_copy)
+            entry["mask"] = str(mask_copy)
+        copied.append(entry)
     return copied
 
 
@@ -175,7 +181,7 @@ def run_creator_job(payload: dict[str, Any], cancel: Event | None, *, models_dir
         for candidate in result["candidates"]:
             records.append(_save_candidate(job_dir, len(records) + 1, candidate["image"], _meta_from(candidate, "edit"),
                                            purpose, yunet, people, None))
-    elif product_refs and payload.get("product_preserve"):
+    elif product_refs and product_mode(payload) != "none":
         records, extra = _product_job(payload, base, prompt, purpose, canvas, product_refs, other_refs, job_dir,
                                       yunet, people, cancel, note, stage)
         warnings += extra
@@ -198,37 +204,70 @@ def run_creator_job(payload: dict[str, Any], cancel: Event | None, *, models_dir
     return summary
 
 
+PRODUCT_MODES = {"strict": "원본 그대로 합성", "natural": "자연광 보정 합성", "ai": "AI 재구성", "none": "보존 안 함"}
+COMPOSITE_NOTES = {
+    "composite": "원본 그대로 합성: 상품 사진의 픽셀을 그대로 사용(크기 조절·가장자리·접지 그림자만).",
+    "natural": "자연광 보정 합성: 배경만 상품 색감에 맞춰 살짝 보정하고 빛 방향 그림자를 더함. 상품 픽셀은 그대로.",
+}
+
+
+def product_mode(payload: dict[str, Any]) -> str:
+    """strict / natural / ai / none. Older payloads: product_preserve=True meant the AI path."""
+    mode = str(payload.get("product_mode") or "")
+    if mode in PRODUCT_MODES:
+        return mode
+    return "ai" if payload.get("product_preserve") else "none"
+
+
 def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_refs, job_dir, yunet, people,
                  cancel, note, stage) -> tuple[list[dict[str, Any]], list[str]]:
-    """Exact composites first (reference pixels), then FLUX.2 candidates that are checked and labelled."""
+    """Original-pixel composites first; only the AI mode adds FLUX.2 redraws (checked and labelled)."""
+    from .product_checks import natural_composite
+    from .product_masks import load_mask
+
     records: list[dict[str, Any]] = []
     warnings: list[str] = []
+    preserve = product_mode(payload)
     stage("상품 분리 중", 0.05)
     with Image.open(product_refs[0]["path"]) as opened:
-        cutout = extract_product(opened)
+        mask = load_mask(product_refs[0].get("mask"), opened.size)
+        cutout = extract_product(opened, mask)
+    if mask is None:
+        warnings.append("자동 상품 마스크를 사용했습니다. 결과에서 상품 가장자리를 확인하세요.")
     cutout_path = job_dir / "refs" / "product_cutout.png"
     cutout.save(cutout_path)
     region = purpose.subject_region
     scale = float(payload.get("product_scale") or 0.5)
     mode = base["mode"]
-    composites = 1 if mode == "preview" else 2
+    composites = 1 if mode == "preview" else max(1, int(payload.get("candidates") or 2)) if preserve != "ai" else 2
     stage("배경 생성 중", 0.15)
     backgrounds = run_quality_job({**base, "purpose": "background_scene",
                                    "prompt": background_prompt(prompt, region), "original_prompt": prompt,
                                    "references": other_refs, "max_candidates_per_engine": composites}, cancel, note)
     warnings += backgrounds["warnings"]
     exact = []
-    for candidate in backgrounds["candidates"][:composites]:
-        image, box = composite_product(candidate["image"], cutout, region, scale)
-        meta = _meta_from(candidate, "composite")
+    from .product_checks import auto_placement
+    kind = "natural" if preserve == "natural" else "composite"
+    backgrounds_dir = job_dir / "backgrounds"
+    backgrounds_dir.mkdir(exist_ok=True)
+    for index, candidate in enumerate(backgrounds["candidates"][:composites], 1):
+        placement = auto_placement(candidate["image"], region, scale)
+        compose = natural_composite if kind == "natural" else composite_product
+        image, box = compose(candidate["image"], cutout, region, scale, placement=placement)
+        meta = _meta_from(candidate, kind)
+        background_path = backgrounds_dir / f"bg{index:02d}_{candidate['manifest']['seed']}.png"
+        candidate["image"].save(background_path)
+        meta["background"] = str(background_path)       # kept so position/size can be adjusted without regenerating
+        meta["placement"] = placement.to_dict()
         meta["warnings"] = [w for w in meta["warnings"] if "face" not in w.casefold()]
         meta["product_check"] = composite_check(box).to_dict()
-        meta["note"] = "참조 상품 픽셀 그대로 합성(형태 보존). 조명은 그림자만 맞춤."
+        meta["product_mode"] = preserve
+        meta["note"] = COMPOSITE_NOTES[kind]
         exact.append((image, meta, box))
     for image, meta, box in exact:
         records.append(_save_candidate(job_dir, len(records) + 1, image, meta, purpose, yunet, people, box))
-    if mode == "preview" or cancel.is_set():
-        return records, warnings
+    if preserve != "ai" or mode == "preview" or cancel.is_set():
+        return records, warnings  # strict / natural never redraw the product
     regenerated = []
     if exact:  # lighting harmonization of the best composite (FLUX.2 redraws it: checked like any regeneration)
         stage("합성 조명 보정 중 (FLUX.2)", 0.55)
@@ -258,6 +297,26 @@ def _product_job(payload, base, prompt, purpose, canvas, product_refs, other_ref
         meta["score"] = round(meta["score"] - 2.0, 3)  # never ranked above an exact composite
         records.append(_save_candidate(job_dir, len(records) + 1, candidate["image"], meta, purpose, yunet, people, check.box))
     return records, warnings
+
+
+def recomposite(job_dir: Path, record: dict[str, Any], purpose: Purpose, *, baseline: float, center_x: float,
+                scale: float) -> dict[str, Any]:
+    """'상품 위치·크기 조정': re-place the original product on the same background (no AI, exact pixels)."""
+    from .product_checks import Placement, natural_composite
+    job_dir = Path(job_dir)
+    cutout = Image.open(job_dir / "refs" / "product_cutout.png").convert("RGBA")
+    with Image.open(record["background"]) as opened:
+        background = opened.convert("RGB")
+    placement = Placement(baseline, center_x, scale)
+    compose = natural_composite if record.get("kind") == "natural" else composite_product
+    image, box = compose(background, cutout, purpose.subject_region, scale, placement=placement)
+    existing = sorted((job_dir / "candidates").glob("c*.json"))
+    meta = {key: record[key] for key in record if key not in ("index", "files")}
+    meta.update(placement=placement.to_dict(), product_check=composite_check(box).to_dict(),
+                note=(record.get("note") or "") + " (위치·크기 직접 조정)")
+    people = 0
+    yunet = Path("__none__")
+    return _save_candidate(job_dir, len(existing) + 1, image, meta, purpose, yunet, people, box)
 
 
 # ------------------------------------------------------------------ export

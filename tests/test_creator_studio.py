@@ -321,3 +321,69 @@ def test_queue_remove_and_retry(tmp_path):
     queue.save()
     assert queue.retry(a.id) and a.state == PENDING and not queue.retry(c.id)
     assert queue.remove([b.id, c.id]) == 2 and [j.id for j in queue.jobs] == [a.id]
+
+
+
+# ------------------------------------------------------------------ v1.0 product modes / masks
+def test_strict_and_natural_modes_never_redraw_the_product(tmp_path, fake_run):
+    mug = _studio_mug(tmp_path / "mug.png")
+    for mode, kind in (("strict", "composite"), ("natural", "natural")):
+        fake_run.calls.clear()
+        result = cj.run_creator_job({"purpose": "shopify_product_lifestyle", "prompt": "a wooden table",
+                                     "references": [{"path": str(mug), "role": "PRODUCT"}], "product_mode": mode,
+                                     "quality": "best", "seed": 2, "candidates": 3}, None,
+                                    models_dir=tmp_path, output_root=tmp_path / "out")
+        assert [c["kind"] for c in result["candidates"]] == [kind] * 3
+        assert len(fake_run.calls) == 1 and fake_run.calls[0]["purpose"] == "background_scene"
+        assert all(c["product_check"]["exact"] for c in result["candidates"])
+
+
+def test_composites_keep_product_pixels_exactly(tmp_path):
+    from covermorph.product_checks import composite_product, natural_composite
+    product = Image.new("RGBA", (120, 160), (0, 0, 0, 0))
+    ImageDraw.Draw(product).rectangle((10, 10, 110, 150), fill=(40, 140, 150, 255))
+    ImageDraw.Draw(product).text((30, 60), "LOGO", fill=(250, 250, 250, 255))
+    background = Image.new("RGB", (800, 600), (180, 120, 60))
+    for compose in (composite_product, natural_composite):
+        image, box = compose(background, product, (0.3, 0.1, 0.4, 0.8), 0.5)
+        x0, y0 = round(box[0] * 800), round(box[1] * 600)
+        w, h = round(box[2] * 800), round(box[3] * 600)
+        expected = product.resize((w, h), Image.Resampling.LANCZOS)
+        alpha = expected.getchannel("A")
+        for x in range(0, w, 7):
+            for y in range(0, h, 7):
+                if alpha.getpixel((x, y)) == 255:
+                    assert image.getpixel((x0 + x, y0 + y)) == expected.getpixel((x, y))[:3], compose.__name__
+
+
+def test_corrected_mask_is_used_and_stored_in_the_job(tmp_path, fake_run):
+    from covermorph.product_masks import save_mask
+    mug = _studio_mug(tmp_path / "mug.png")
+    mask = Image.new("L", (400, 300), 0)
+    ImageDraw.Draw(mask).rectangle((150, 80, 270, 240), fill=255)   # body only, user removed the handle
+    mask_path = save_mask(mug, mask)
+    result = cj.run_creator_job({"purpose": "shopify_promo_tile", "prompt": "x", "product_mode": "strict",
+                                 "references": [{"path": str(mug), "role": "PRODUCT", "mask": str(mask_path)}],
+                                 "quality": "preview", "seed": 1, "candidates": 1}, None,
+                                models_dir=tmp_path, output_root=tmp_path / "out")
+    refs = Path(result["job_dir"]) / "refs"
+    assert (refs / "01_product_mask.png").exists()
+    cutout = Image.open(refs / "product_cutout.png")
+    assert cutout.size == (121, 161)            # cropped to the corrected mask, not the auto mask
+    assert not any("자동 상품 마스크" in w for w in result["warnings"])
+
+
+def test_mask_tools():
+    from covermorph.product_masks import assess, paint, refine
+    mask = Image.new("L", (100, 100), 0)
+    ImageDraw.Draw(mask).rectangle((30, 30, 70, 70), fill=255)
+    assert refine(mask, invert=True).getpixel((5, 5)) == 255
+    assert refine(mask, grow=5).getpixel((27, 50)) == 255 and refine(mask, grow=-5).getpixel((32, 50)) == 0
+    assert 0 < refine(mask, feather=3).getpixel((30, 50)) < 255
+    painted = paint(mask, [(10, 10, 4, True), (50, 50, 4, False)])
+    assert painted.getpixel((10, 10)) == 255 and painted.getpixel((50, 50)) == 0
+    image = Image.new("RGB", (100, 100), (200, 200, 200))
+    ImageDraw.Draw(image).rectangle((30, 30, 70, 70), fill=(30, 60, 200))
+    report = assess(image, mask)
+    assert not report.uncertain and 0.1 < report.coverage < 0.2
+    assert assess(image, Image.new("L", (100, 100), 0)).uncertain
