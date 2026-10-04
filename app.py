@@ -22,9 +22,22 @@ def _run_gui() -> int:
         raise
 
 
+def _record_exe_path() -> None:
+    """Let youtubesum find this EXE without environment variables (it reads state.exe_path)."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        from covermorph import __version__, app_paths
+        app_paths.update_section("state", {"exe_path": sys.executable, "exe_version": __version__})
+    except Exception:
+        pass
+
+
 def main() -> int:
     # Headless bridge: --thumbnail-bridge-json (contract), or youtubesum's --image-bridge / --action forms.
     argv = sys.argv[1:]
+    if not argv or argv[0] in ("--studio-selftest", "--studio-endurance"):
+        _record_exe_path()
     if argv[:1] == ["--studio-selftest"]:  # packaged-app acceptance run of the AI 이미지 스튜디오
         from covermorph.creator_gui import app_root_dir, run_selftest
         return run_selftest(app_root_dir(), argv[1] if len(argv) > 1 else "studio_selftest")
