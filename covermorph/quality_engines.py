@@ -138,11 +138,11 @@ def check_resources(policy: str, snapshot: ResourceSnapshot | None = None,
     reasons: list[str] = []
     need_gpu = max(rules["min_gpu_free_mib"], engine_vram_mib or 0)
     if snap.gpu_free_mib is not None and snap.gpu_free_mib < need_gpu:
-        reasons.append(f"GPU free {snap.gpu_free_mib} MiB < {need_gpu} MiB")
+        reasons.append(f"GPU 여유 {snap.gpu_free_mib} MiB (필요 {need_gpu} MiB)")
     if snap.commit_free_mib is not None and snap.commit_free_mib < rules["min_commit_free_mib"]:
-        reasons.append(f"commit free {snap.commit_free_mib} MiB < {rules['min_commit_free_mib']} MiB")
+        reasons.append(f"가상 메모리 여유 {snap.commit_free_mib} MiB (필요 {rules['min_commit_free_mib']} MiB)")
     if snap.ram_available_mib is not None and snap.ram_available_mib < rules["min_ram_available_mib"]:
-        reasons.append(f"RAM available {snap.ram_available_mib} MiB < {rules['min_ram_available_mib']} MiB")
+        reasons.append(f"RAM 여유 {snap.ram_available_mib} MiB (필요 {rules['min_ram_available_mib']} MiB)")
     return not reasons, reasons
 
 

@@ -103,7 +103,7 @@ def test_check_resources_thresholds():
     ok, reasons = check_resources("interactive_low_memory", low)
     assert not ok and len(reasons) == 3
     ok, reasons = check_resources("night_best", ok_snap, engine_vram_mib=12000)
-    assert not ok and "GPU free" in reasons[0]
+    assert not ok and "GPU 여유" in reasons[0]
 
 
 # ------------------------------------------------------------------ backends

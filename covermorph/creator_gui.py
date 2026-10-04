@@ -31,7 +31,9 @@ from .creator_presets import (
     load_presets,
     validate_canvas,
 )
+from .creator_dialogs import ErrorDialog, MaskEditor, PlacementDialog, SetupWizard, show_error
 from .creator_runner import StudioRunner, queue_path
+from .errors import parse_stored
 from .creator_settings import (
     apply_backend_paths,
     engine_readiness,
@@ -39,13 +41,16 @@ from .creator_settings import (
     resolve_models_dir,
     resolve_output_dir,
     save_creator_settings,
+    setup_needed,
 )
 from .job_queue import CANCELLED, DONE, FAILED, PENDING, RUNNING, JobQueue
 from .quality_engines import resource_snapshot
 
 STATE_LABELS = {PENDING: "대기", RUNNING: "실행 중", DONE: "완료", FAILED: "실패", CANCELLED: "취소됨"}
 ENGINE_NAMES = {"zimage_turbo": "Z-Image", "flux2_klein_4b": "FLUX.2", "realvisxl_v5": "RealVis"}
-KIND_LABELS = {"generated": "생성", "composite": "상품 합성(형태 보존)", "harmonized": "합성+조명 보정(AI)",
+PRODUCT_MODE_LABELS = {"strict": "원본 그대로 합성 (권장)", "natural": "자연광 보정 합성",
+                       "ai": "AI 재구성 (형태가 바뀔 수 있음)", "none": "보존 안 함 (참조로만 사용)"}
+KIND_LABELS = {"generated": "생성", "composite": "원본 그대로 합성", "natural": "자연광 보정 합성", "harmonized": "합성+조명 보정(AI)",
                "regenerated": "상품 참조 생성(AI)", "edit": "편집"}
 MAX_REFERENCES = 4
 IMAGE_TYPES = [("이미지", "*.png *.jpg *.jpeg *.webp *.bmp"), ("모든 파일", "*.*")]
@@ -62,6 +67,25 @@ def fit_image(image: Image.Image, box: tuple[int, int]) -> ctk.CTkImage:
     copy = image.copy()
     copy.thumbnail(box, Image.Resampling.LANCZOS)
     return ctk.CTkImage(light_image=copy, dark_image=copy, size=copy.size)
+
+
+def execute_job(app_root: Path, settings: dict[str, Any], payload: dict[str, Any], cancel: threading.Event,
+                progress=None) -> dict[str, Any]:
+    """Queue executor: preflight checks, then the job; any failure becomes a UserError ("CODE|message" on the job,
+    technical details in the log folder)."""
+    from .errors import classify, preflight, remember_last_error, write_details
+    models_dir = resolve_models_dir(app_root, settings)
+    output_root = resolve_output_dir(app_root, settings)
+    try:
+        preflight(payload, models_dir, output_root)
+        return run_creator_job(payload, cancel, models_dir=models_dir, output_root=output_root, progress=progress,
+                               app_root=app_root)
+    except Exception as exc:
+        error = classify(exc)
+        if error.code != "CANCELLED":
+            path = write_details(error, str(payload.get("_job_id") or "job"))
+            remember_last_error(error, path)
+        raise error from exc
 
 
 class StudioWindow(ctk.CTkToplevel):
@@ -98,8 +122,11 @@ class StudioWindow(ctk.CTkToplevel):
         notes = problems + recovery_notes()
         if notes:
             messagebox.showwarning("알림", "\n".join(notes), parent=self)
-        self._set_purpose_key("youtube_thumbnail")
+        start_key = self.settings.get("last_purpose") or {"shopify": "shopify_hero"}.get(self.settings.get("usage"), "youtube_thumbnail")
+        self._set_purpose_key(start_key if start_key in self.purposes else "youtube_thumbnail")
         self.after(400, self._poll)
+        if setup_needed(self.app_root, self.settings):
+            self.after(700, self._open_wizard)
         threading.Thread(target=self._resource_loop, daemon=True).start()
         if self.settings.get("auto_start_when_free") and self.queue.pending() and not self.queue.paused:
             self.runner.start()
@@ -184,15 +211,17 @@ class StudioWindow(ctk.CTkToplevel):
         self.ref_frame.pack(fill="x", padx=10, pady=6)
         product_row = ctk.CTkFrame(form, fg_color="transparent")
         product_row.pack(fill="x", padx=10, pady=4)
-        self.preserve_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(product_row, text="상품 형태 보존", variable=self.preserve_var,
-                        command=self._update_engine_note).pack(side="left")
+        ctk.CTkLabel(product_row, text="상품 처리").pack(side="left")
+        self.product_mode_var = ctk.StringVar(value=PRODUCT_MODE_LABELS[self.settings.get("product_mode") or "strict"])
+        ctk.CTkOptionMenu(product_row, variable=self.product_mode_var, values=list(PRODUCT_MODE_LABELS.values()),
+                          width=230, command=lambda _v: self._update_engine_note()).pack(side="left", padx=6)
         ctk.CTkLabel(product_row, text="상품 크기").pack(side="left", padx=(16, 4))
         self.product_scale = ctk.CTkSlider(product_row, from_=0.25, to=0.9, number_of_steps=13, width=160)
         self.product_scale.set(0.5)
         self.product_scale.pack(side="left")
-        ctk.CTkLabel(form, text="상품 형태 보존: 상품 사진의 실제 픽셀을 생성 배경에 합성한 후보가 맨 앞에 옵니다(형태 그대로). "
-                                "AI가 다시 그린 후보는 '형태 확인 필요'로 표시되며 최상위로 올라가지 않습니다.",
+        ctk.CTkLabel(form, text="원본 그대로 합성: 상품 사진의 픽셀을 그대로 씁니다(가장 안전) · 자연광 보정 합성: 배경 밝기와 "
+                                "그림자만 맞춥니다(상품 픽셀 그대로) · AI 재구성: 조명이 가장 자연스럽지만 AI가 상품을 다시 그려 "
+                                "모양·로고가 바뀔 수 있습니다.",
                      anchor="w", justify="left", wraplength=620, text_color="#94a3b8").pack(fill="x", padx=10)
 
         heading("4. 품질과 PC 사용")
@@ -265,8 +294,10 @@ class StudioWindow(ctk.CTkToplevel):
 
     def _apply_purpose(self) -> None:
         purpose = self._purpose()
-        self.width_var.set(str(purpose.width))
-        self.height_var.set(str(purpose.height))
+        saved = (self.settings.get("custom_sizes") or {}).get(purpose.key)
+        width, height = saved if saved and len(saved) == 2 else (purpose.width, purpose.height)
+        self.width_var.set(str(width))
+        self.height_var.set(str(height))
         self.alternate_menu.configure(values=["기본 크기", *purpose.alternates])
         self.alternate_var.set("기본 크기")
         self._draw_layout()
@@ -315,10 +346,12 @@ class StudioWindow(ctk.CTkToplevel):
     def _update_engine_note(self) -> None:
         refs = self.references
         quality = QUALITY_LABELS.get(self.quality_var.get(), "balanced") if hasattr(self, "quality_var") else "balanced"
-        if self.preserve_var.get() and any(r["role"] == "PRODUCT" for r in refs):
-            text = ("엔진: 배경 Z-Image → 실제 상품 픽셀 합성"
-                    + ("" if quality == "preview" else " → FLUX.2 조명 보정 후보")
-                    + (" → FLUX.2 상품 참조 후보" if quality == "best" else ""))
+        mode = self._product_mode()
+        if mode != "none" and any(r["role"] == "PRODUCT" for r in refs):
+            text = {"strict": "엔진: 배경 Z-Image → 원본 상품 픽셀 합성 (AI가 상품을 그리지 않음)",
+                    "natural": "엔진: 배경 Z-Image → 원본 상품 합성 + 배경 밝기·그림자 보정 (상품 픽셀 그대로)",
+                    "ai": "엔진: 원본 합성 → FLUX.2 조명 보정" + (" → FLUX.2 상품 재구성" if quality == "best" else "")
+                          + "  ⚠ AI 후보는 상품 모양이 바뀔 수 있음"}[mode]
         elif refs:
             text = "엔진: FLUX.2-klein (레퍼런스 반영)" + (" + RealVis(IP-Adapter) 비교 후보" if quality == "best" else "")
         else:
@@ -328,12 +361,22 @@ class StudioWindow(ctk.CTkToplevel):
 
     # ---------------------------------------------------------------- references
     def _add_references(self) -> None:
-        paths = filedialog.askopenfilenames(parent=self, title="레퍼런스 이미지", filetypes=IMAGE_TYPES)
+        from .errors import UserError, validate_reference
+        paths = filedialog.askopenfilenames(parent=self, title="레퍼런스 이미지", filetypes=IMAGE_TYPES,
+                                            initialdir=self.settings.get("last_reference_dir") or None)
         for path in paths:
             if len(self.references) >= MAX_REFERENCES:
                 messagebox.showinfo("레퍼런스", f"레퍼런스는 최대 {MAX_REFERENCES}장입니다.", parent=self)
                 break
-            self.references.append({"path": path, "role": "PERSON"})
+            try:
+                validate_reference(Path(path))
+            except UserError as exc:
+                show_error(self, exc, "reference")
+                continue
+            entry = {"path": path, "role": "PERSON"}
+            self.references.append(entry)
+            self.settings["last_reference_dir"] = str(Path(path).parent)
+        save_creator_settings(self.app_root, self.settings)
         self._render_references()
 
     def _render_references(self) -> None:
@@ -356,14 +399,31 @@ class StudioWindow(ctk.CTkToplevel):
 
             def set_role(choice: str, ref=ref) -> None:
                 ref["role"] = ROLE_LABELS[choice]
-                if ref["role"] == "PRODUCT":
-                    self.preserve_var.set(True)
-                self._update_engine_note()
+                if ref["role"] == "PRODUCT" and self._product_mode() == "none":
+                    self.product_mode_var.set(PRODUCT_MODE_LABELS["strict"])
+                self._render_references()
 
             ctk.CTkOptionMenu(row, values=list(ROLE_LABELS), variable=var, command=set_role, width=90).pack(side="left")
+            if ref["role"] == "PRODUCT":
+                state = "수정됨" if ref.get("mask") else "확인 필요"
+                ctk.CTkButton(row, text=f"마스크 ({state})", width=120,
+                              fg_color="#16a34a" if ref.get("mask") else "#b45309",
+                              command=lambda ref=ref: self._edit_mask(ref)).pack(side="left", padx=6)
             ctk.CTkButton(row, text="삭제", width=50, fg_color="#7f1d1d",
                           command=lambda i=index: (self.references.pop(i), self._render_references())).pack(side="left", padx=6)
         self._update_engine_note()
+
+    def _product_mode(self) -> str:
+        label = self.product_mode_var.get() if hasattr(self, "product_mode_var") else ""
+        return next((key for key, value in PRODUCT_MODE_LABELS.items() if value == label), "strict")
+
+    def _edit_mask(self, ref: dict[str, Any], then: Any = None) -> None:
+        def saved(path: Path) -> None:
+            ref["mask"] = str(path)
+            self._render_references()
+            if then:
+                then()
+        MaskEditor(self, Path(ref["path"]), ref.get("mask"), saved)
 
     # ---------------------------------------------------------------- payload
     def _payload(self) -> dict[str, Any] | None:
@@ -395,7 +455,7 @@ class StudioWindow(ctk.CTkToplevel):
                 "prompt": prompt, "prompt_preset": preset.key if preset else "", "channel": self.channel_var.get(),
                 "people": people_n, "composition": composition,
                 "references": [dict(r) for r in self.references],
-                "product_preserve": bool(self.preserve_var.get()), "product_scale": round(float(self.product_scale.get()), 2),
+                "product_mode": self._product_mode(), "product_scale": round(float(self.product_scale.get()), 2),
                 "quality": QUALITY_LABELS[self.quality_var.get()], "memory": MEMORY_LABELS[self.memory_var.get()],
                 "seed": seed, "candidates": int(self.count_var.get()), "title": self.title_var.get(),
                 "subtitle": self.subtitle_var.get(), "cta": self.cta_var.get()}
@@ -404,8 +464,29 @@ class StudioWindow(ctk.CTkToplevel):
         payload = self._payload()
         if payload is None:
             return
+        if payload["product_mode"] != "none":
+            from .product_masks import stored_mask_path
+            for ref in self.references:
+                if ref["role"] != "PRODUCT" or ref.get("mask"):
+                    continue
+                stored = stored_mask_path(Path(ref["path"]))
+                if stored.exists():
+                    ref["mask"] = str(stored)
+                    continue
+                # the automatic mask can miss parts that match the backdrop: the user checks it once per image
+                messagebox.showinfo("상품 마스크", "상품 마스크를 한 번 확인해 주세요. 빨간 부분은 상품에서 빠집니다.", parent=self)
+                self._edit_mask(ref, then=lambda: self._enqueue(start))
+                return
+            payload = self._payload()
         self.queue.add(payload)
         self.settings["quality_label"], self.settings["memory_label"] = self.quality_var.get(), self.memory_var.get()
+        self.settings["product_mode"] = payload["product_mode"]
+        self.settings["last_purpose"] = payload["purpose"]
+        purpose = self._purpose()
+        if list(payload["canvas"]) != [purpose.width, purpose.height]:
+            self.settings.setdefault("custom_sizes", {})[purpose.key] = list(payload["canvas"])
+        else:
+            self.settings.setdefault("custom_sizes", {}).pop(purpose.key, None)
         save_creator_settings(self.app_root, self.settings)
         self.seed_var.set(str(random.randint(1, 999999)))
         if start or self.settings.get("auto_start_when_free"):
@@ -426,7 +507,8 @@ class StudioWindow(ctk.CTkToplevel):
         self.channel_var.set(payload.get("channel", ""))
         self.people_var.set(str(payload.get("people", "자동")))
         self.references = [dict(r) for r in payload.get("references") or [] if Path(r["path"]).exists()]
-        self.preserve_var.set(bool(payload.get("product_preserve")))
+        from .creator_jobs import product_mode
+        self.product_mode_var.set(PRODUCT_MODE_LABELS[product_mode(payload)])
         self.quality_var.set(label_for(QUALITY_LABELS, payload.get("quality", "balanced")))
         self.memory_var.set(label_for(MEMORY_LABELS, payload.get("memory", "interactive_low_memory")))
         self.seed_var.set(str(payload.get("seed", "")))
@@ -502,6 +584,14 @@ class StudioWindow(ctk.CTkToplevel):
         if not jobs:
             return
         job = jobs[0]
+        if job.state == FAILED:
+            from .errors import UserError
+            code, message = parse_stored(job.error)
+            from .app_paths import logs_dir
+            details = sorted(logs_dir().glob(f"error_*_{job.id}.txt"))
+            text = details[-1].read_text(encoding="utf-8") if details else ""
+            ErrorDialog(self, UserError(code or "UNKNOWN", message, text), details[-1] if details else None)
+            return
         if job.state == DONE and job.result:
             self._show_review(job.id)
         elif job.result and job.result.get("job_dir"):
@@ -532,7 +622,7 @@ class StudioWindow(ctk.CTkToplevel):
             elif job.state == PENDING and job.waiting_reason:
                 progress_text = "PC 사용 중 — 자원 대기"
             elif job.state == FAILED:
-                progress_text = job.error[:80]
+                progress_text = parse_stored(job.error)[1][:80]
             else:
                 progress_text = "100%" if job.state == DONE else ""
             elapsed = ""
@@ -601,7 +691,8 @@ class StudioWindow(ctk.CTkToplevel):
         actions.pack(fill="x", pady=4)
         for index, (text, command) in enumerate((("채택", self._adopt), ("다시 생성", self._regenerate),
                                                  ("seed만 변경", self._reseed), ("프롬프트 수정", self._edit_prompt),
-                                                 ("편집으로 보내기", self._send_to_edit), ("기존 후보와 비교", self._compare))):
+                                                 ("편집으로 보내기", self._send_to_edit), ("기존 후보와 비교", self._compare),
+                                                 ("상품 위치·크기 조정", self._adjust_product))):
             ctk.CTkButton(actions, text=text, width=120, command=command,
                           fg_color="#16a34a" if text == "채택" else None).grid(row=index // 3, column=index % 3, padx=3, pady=3)
 
@@ -749,6 +840,23 @@ class StudioWindow(ctk.CTkToplevel):
         self._requeue({**payload, "kind": "edit", "edit_image": candidate["files"]["full"], "edit_instruction": instruction,
                        "prompt": "", "candidates": 1, "seed": random.randint(1, 999999)})
 
+    def _adjust_product(self) -> None:
+        current = self._current()
+        if not current:
+            return
+        job, candidate = current
+        if not candidate.get("background"):
+            messagebox.showinfo("상품 위치·크기 조정", "원본 상품 합성 후보에서만 쓸 수 있습니다.", parent=self)
+            return
+        purpose = self.purposes.get(job.payload.get("purpose", "")) or next(iter(self.purposes.values()))
+
+        def done(record: dict[str, Any]) -> None:
+            job.result["candidates"].append(record)
+            self.queue.save()
+            self._show_review(job.id, len(job.result["candidates"]) - 1)
+
+        PlacementDialog(self, Path(job.result["job_dir"]), candidate, purpose, done)
+
     def _compare(self) -> None:
         current = self._current()
         if not current:
@@ -809,6 +917,12 @@ class StudioWindow(ctk.CTkToplevel):
         ctk.CTkButton(buttons, text="저장", command=self._save_settings).pack(side="left", padx=4)
         ctk.CTkButton(buttons, text="엔진 상태 확인", command=self._check_engines).pack(side="left", padx=4)
         ctk.CTkButton(buttons, text="출력 폴더 열기", command=lambda: open_path(resolve_output_dir(self.app_root, self.settings))).pack(side="left", padx=4)
+        ctk.CTkButton(buttons, text="처음 설정 다시 하기", fg_color="#475569", command=self._open_wizard).pack(side="left", padx=4)
+        diag = ctk.CTkFrame(tab, fg_color="transparent")
+        diag.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkButton(diag, text="진단 정보 복사", command=self._copy_diagnostics).pack(side="left", padx=4)
+        self.diag_prompts_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(diag, text="마지막 프롬프트 포함 (이미지는 포함하지 않음)", variable=self.diag_prompts_var).pack(side="left", padx=8)
         self.engine_status = ctk.CTkTextbox(tab, height=260)
         self.engine_status.pack(fill="both", expand=True, padx=10, pady=6)
 
@@ -830,6 +944,27 @@ class StudioWindow(ctk.CTkToplevel):
         messagebox.showinfo("설정", "저장했습니다. 설정은 사용자 폴더에 보관되어 EXE를 새로 빌드·업데이트해도 유지됩니다.",
                             parent=self)
 
+    def _copy_diagnostics(self) -> None:
+        from .diagnostics import build_report
+        report = build_report(self.app_root, self.settings, self.queue, bool(self.diag_prompts_var.get()))
+        self.clipboard_clear()
+        self.clipboard_append(report)
+        self.engine_status.delete("1.0", "end")
+        self.engine_status.insert("1.0", report)
+        messagebox.showinfo("진단 정보", "진단 정보를 클립보드에 복사했습니다. 아래 칸에서 내용을 확인할 수 있습니다.", parent=self)
+
+    def _open_wizard(self) -> None:
+        def finish(values: dict[str, Any]) -> None:
+            self.settings.update(values)
+            save_creator_settings(self.app_root, self.settings)
+            for key, var in self.setting_vars.items():
+                var.set(self.settings.get(key) or "")
+            self.quality_var.set(self.settings["quality_label"])
+            self.memory_var.set(self.settings["memory_label"])
+            self._set_purpose_key({"shopify": "shopify_hero"}.get(self.settings.get("usage"), "youtube_thumbnail"))
+            self._check_engines()
+        SetupWizard(self, self.app_root, self.settings, finish)
+
     def _check_engines(self) -> None:
         models = resolve_models_dir(self.app_root, self.settings)
         status = engine_readiness(models)
@@ -847,9 +982,7 @@ class StudioWindow(ctk.CTkToplevel):
 
     # ================================================================== plumbing
     def _execute(self, payload: dict[str, Any], cancel: threading.Event, progress) -> dict[str, Any]:
-        return run_creator_job(payload, cancel, models_dir=resolve_models_dir(self.app_root, self.settings),
-                               output_root=resolve_output_dir(self.app_root, self.settings), progress=progress,
-                               app_root=self.app_root)
+        return execute_job(self.app_root, self.settings, payload, cancel, progress)
 
     def _mark_dirty(self) -> None:
         self._dirty = True

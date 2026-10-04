@@ -192,11 +192,12 @@ class QueueRunner:
         self.cancel_event.clear()
         self.on_event("started", job)
         try:
+            job.payload["_job_id"] = job.id
             job.result = self.executor(job.payload, self.cancel_event)
             job.state = CANCELLED if self.cancel_event.is_set() else DONE
         except Exception as exc:  # recorded on the job; the queue keeps going
             job.state = CANCELLED if self.cancel_event.is_set() else FAILED
-            job.error = f"{type(exc).__name__}: {exc}"
+            job.error = exc.stored() if hasattr(exc, "stored") else f"{type(exc).__name__}: {exc}"
         finally:
             job.finished = time.time()
             self.current = None

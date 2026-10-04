@@ -387,3 +387,57 @@ def test_mask_tools():
     report = assess(image, mask)
     assert not report.uncertain and 0.1 < report.coverage < 0.2
     assert assess(image, Image.new("L", (100, 100), 0)).uncertain
+
+
+# ------------------------------------------------------------------ v1.0 errors / diagnostics
+def test_errors_are_classified_with_plain_messages(tmp_path):
+    from covermorph.errors import UserError, classify, parse_stored, preflight, validate_reference
+    assert classify(RuntimeError("flux2_klein_4b sd-cli exited with 3221225477:\nboom")).code == "BACKEND_CRASH"
+    assert classify(PermissionError("denied")).code == "OUTPUT_WRITE"
+    assert classify(OSError(28, "No space left on device")).code == "DISK_LOW"
+    error = classify(ValueError("weird"))
+    assert error.code == "UNKNOWN" and "Traceback" not in error.message and error.action
+    assert parse_stored(error.stored()) == ("UNKNOWN", error.message)
+    assert parse_stored("RuntimeError: old style") == ("UNKNOWN", "RuntimeError: old style")
+    bad = tmp_path / "깨진.png"
+    bad.write_bytes(b"not an image")
+    with pytest.raises(UserError) as caught:
+        validate_reference(bad)
+    assert caught.value.code == "REFERENCE_INVALID"
+    with pytest.raises(UserError) as caught:
+        preflight({"references": []}, tmp_path / "없는 폴더", tmp_path / "out")
+    assert caught.value.code == "MODELS_DIR_INVALID"
+
+
+def test_failed_job_keeps_queue_and_stores_code(tmp_path, monkeypatch):
+    from covermorph import creator_gui
+    from covermorph.job_queue import JobQueue, QueueRunner
+    monkeypatch.setattr(creator_gui, "resolve_models_dir", lambda root, settings: tmp_path / "missing")
+    queue = JobQueue(tmp_path / "q.json")
+    bad, good = queue.add({"prompt": "a"}), queue.add({"prompt": "b"})
+    calls = []
+
+    def executor(payload, cancel):
+        if payload["prompt"] == "a":
+            return creator_gui.execute_job(tmp_path, {}, payload, cancel)
+        calls.append(payload)
+        return {}
+
+    QueueRunner(queue, executor).run()
+    assert bad.state == FAILED and bad.error.startswith("MODELS_DIR_INVALID|") and good.state == DONE
+    from covermorph.app_paths import logs_dir, section
+    assert list(logs_dir().glob(f"error_*_{bad.id}.txt"))
+    assert section("state")["last_error"]["code"] == "MODELS_DIR_INVALID"
+
+
+def test_diagnostics_report_is_sanitized_and_prompt_free(tmp_path, monkeypatch):
+    from covermorph.diagnostics import build_report
+    from covermorph.job_queue import JobQueue
+    queue = JobQueue(tmp_path / "q.json")
+    job = queue.add({"prompt": "비밀 프롬프트", "purpose": "youtube_thumbnail", "quality": "balanced"})
+    job.state, job.finished, job.result = DONE, time.time(), {"candidates": [{"engine": "zimage_turbo", "peak_vram_mib": 6900}], "seconds": 35}
+    settings = {"models_dir": str(Path.home() / "models"), "quality_label": "일반", "memory_label": "균형"}
+    report = build_report(tmp_path, settings, queue)
+    assert "비밀 프롬프트" not in report and "%USERPROFILE%" in report and Path.home().name not in report.split("Windows")[0]
+    assert "zimage_turbo" in report and "6900" in report
+    assert "비밀 프롬프트" in build_report(tmp_path, settings, queue, include_prompts=True)
