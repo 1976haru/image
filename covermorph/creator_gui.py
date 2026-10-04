@@ -69,6 +69,26 @@ def fit_image(image: Image.Image, box: tuple[int, int]) -> ctk.CTkImage:
     return ctk.CTkImage(light_image=copy, dark_image=copy, size=copy.size)
 
 
+_QA_KO = [
+    (r"expected (\d+) face\(s\), found (\d+)", r"얼굴 \1명을 기대했지만 \2명만 찾았습니다"),
+    (r"(\d+) faces found for a (\d+)-person scene.*", r"\2인 장면에서 얼굴 \1개가 보입니다(중복/추가 인물 가능)"),
+    (r"face smaller than (\d+%) of frame height", r"얼굴이 화면 높이의 \1보다 작습니다"),
+    (r"face taller than (\d+%) of frame height; little room for typography",
+     r"얼굴이 화면 높이의 \1보다 커서 제목 공간이 좁습니다"),
+    (r"main face is soft/low-detail", "주 인물 얼굴이 흐리거나 디테일이 부족합니다(얕은 심도일 수 있음)"),
+    (r"gross exposure problem", "노출(밝기)이 지나치게 어둡거나 밝습니다"),
+]
+
+
+def korean_warning(text: str) -> str:
+    """Technical QA messages are stored in English (manifests/bridge); the studio shows them in Korean."""
+    import re
+    for pattern, replacement in _QA_KO:
+        if re.fullmatch(pattern, text):
+            return re.sub(pattern, replacement, text)
+    return text
+
+
 def execute_job(app_root: Path, settings: dict[str, Any], payload: dict[str, Any], cancel: threading.Event,
                 progress=None) -> dict[str, Any]:
     """Queue executor: preflight checks, then the job; any failure becomes a UserError ("CODE|message" on the job,
@@ -693,8 +713,8 @@ class StudioWindow(ctk.CTkToplevel):
                                                  ("seed만 변경", self._reseed), ("프롬프트 수정", self._edit_prompt),
                                                  ("편집으로 보내기", self._send_to_edit), ("기존 후보와 비교", self._compare),
                                                  ("상품 위치·크기 조정", self._adjust_product))):
-            ctk.CTkButton(actions, text=text, width=120, command=command,
-                          fg_color="#16a34a" if text == "채택" else None).grid(row=index // 3, column=index % 3, padx=3, pady=3)
+            ctk.CTkButton(actions, text=text, width=104, command=command,
+                          fg_color="#16a34a" if text == "채택" else None).grid(row=index // 3, column=index % 3, padx=2, pady=3)
 
     def _done_jobs(self) -> list[Any]:
         return [job for job in self.queue.jobs if job.state == DONE and (job.result or {}).get("candidates")]
@@ -760,7 +780,7 @@ class StudioWindow(ctk.CTkToplevel):
                  f"라이선스: {candidate.get('license')} · 상업적 사용 {'가능' if candidate.get('commercial_use') else '확인 필요'}",
                  f"번역 적용: {'예' if candidate.get('translation_applied') else '아니오'}",
                  "", "경고:" if candidate.get("warnings") else "경고: 없음"]
-        lines += [f" • {w}" for w in candidate.get("warnings") or []]
+        lines += [f" • {korean_warning(w)}" for w in candidate.get("warnings") or []]
         if candidate.get("note"):
             lines += ["", candidate["note"]]
         check = candidate.get("product_check")

@@ -452,3 +452,13 @@ def test_job_with_no_candidates_fails_instead_of_done(tmp_path, monkeypatch):
         cj.run_creator_job({"purpose": "youtube_thumbnail", "prompt": "x", "quality": "preview", "seed": 1}, None,
                            models_dir=tmp_path, output_root=tmp_path / "out")
     assert classify(caught.value).code == "BACKEND_CRASH"
+
+
+
+def test_qa_warnings_are_shown_in_korean():
+    from covermorph.creator_gui import korean_warning
+    assert korean_warning("face taller than 30% of frame height; little room for typography") == \
+        "얼굴이 화면 높이의 30%보다 커서 제목 공간이 좁습니다"
+    assert korean_warning("expected 2 face(s), found 1") == "얼굴 2명을 기대했지만 1명만 찾았습니다"
+    assert korean_warning("main face is soft/low-detail").startswith("주 인물 얼굴")
+    assert korean_warning("상품 색상이 참조와 다릅니다(ΔE 20.1)") == "상품 색상이 참조와 다릅니다(ΔE 20.1)"
