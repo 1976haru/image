@@ -1032,8 +1032,6 @@ def run_selftest(app_root: Path, out_dir: Path, timeout: float = 900.0) -> int:
         CoverMorphStudio.exe --studio-selftest <out_dir>
     Uses only config/creator_settings.json for paths (no environment variables).
     """
-    from PIL import ImageGrab
-
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ctk.set_appearance_mode("dark")
@@ -1046,12 +1044,8 @@ def run_selftest(app_root: Path, out_dir: Path, timeout: float = 900.0) -> int:
     started = time.time()
 
     def shot(name: str) -> None:
-        studio.update()
-        studio.lift()
-        studio.attributes("-topmost", True)
-        studio.update()
-        x, y = studio.winfo_rootx(), studio.winfo_rooty()
-        ImageGrab.grab((x, y, x + studio.winfo_width(), y + studio.winfo_height())).save(out_dir / f"{name}.png")
+        from .window_capture import capture   # this window only, never the user's desktop
+        capture(studio).save(out_dir / f"{name}.png")
 
     def begin() -> None:
         studio._set_purpose_key("youtube_thumbnail")
