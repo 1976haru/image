@@ -82,9 +82,7 @@ class StudioWindow(ctk.CTkToplevel):
         self._resources_text = ""
         self._images: list[Any] = []  # keep CTkImage references alive
 
-        output_root = resolve_output_dir(self.app_root, self.settings)
-        output_root.mkdir(parents=True, exist_ok=True)
-        self.queue = JobQueue(queue_path(output_root))
+        self.queue = JobQueue(queue_path())  # per-user, survives rebuilds and output-folder changes
         self.runner = StudioRunner(self.queue, self._execute, self.settings, on_change=self._mark_dirty)
 
         self.tabs = ctk.CTkTabview(self)
@@ -96,8 +94,10 @@ class StudioWindow(ctk.CTkToplevel):
         self._build_review(self.tabs.tab("후보 비교"))
         self._build_settings(self.tabs.tab("설정"))
         self.protocol("WM_DELETE_WINDOW", self.withdraw)  # closing the studio keeps the queue running
-        if problems:
-            messagebox.showwarning("프리셋", "\n".join(problems), parent=self)
+        from .app_paths import recovery_notes
+        notes = problems + recovery_notes()
+        if notes:
+            messagebox.showwarning("알림", "\n".join(notes), parent=self)
         self._set_purpose_key("youtube_thumbnail")
         self.after(400, self._poll)
         threading.Thread(target=self._resource_loop, daemon=True).start()
@@ -820,18 +820,15 @@ class StudioWindow(ctk.CTkToplevel):
         except ValueError:
             messagebox.showwarning("설정", "숫자를 확인하세요.", parent=self)
             return
-        output_before = resolve_output_dir(self.app_root, self.settings)
         for key, var in self.setting_vars.items():
             self.settings[key] = var.get().strip()
         self.settings.update(jpg_quality=jpg, require_idle_minutes=idle, recheck_seconds=recheck,
                              auto_start_when_free=bool(self.auto_var.get()))
         save_creator_settings(self.app_root, self.settings)
         apply_backend_paths(self.settings)
-        note = ""
-        if resolve_output_dir(self.app_root, self.settings) != output_before:
-            note = "\n출력 폴더를 바꾸면 새 대기열은 앱을 다시 열 때 적용됩니다."
         self._check_engines()
-        messagebox.showinfo("설정", "저장했습니다. 환경변수 없이 다음 실행에도 이 경로를 씁니다." + note, parent=self)
+        messagebox.showinfo("설정", "저장했습니다. 설정은 사용자 폴더에 보관되어 EXE를 새로 빌드·업데이트해도 유지됩니다.",
+                            parent=self)
 
     def _check_engines(self) -> None:
         models = resolve_models_dir(self.app_root, self.settings)
