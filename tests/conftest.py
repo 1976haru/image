@@ -4,6 +4,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolated_user_data(tmp_path_factory, monkeypatch):
+    """Never touch the real %LOCALAPPDATA%\CoverMorphStudio (settings/queue/logs) from tests."""
+    monkeypatch.setenv("COVERMORPH_DATA_DIR", str(tmp_path_factory.mktemp("user_data")))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_v2_engines(request, monkeypatch):
     """Keep tests hermetic: a machine with real Z-Image/FLUX.2 files must not route bridge tests to them.
 

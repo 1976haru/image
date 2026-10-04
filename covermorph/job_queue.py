@@ -47,9 +47,19 @@ class JobQueue:
         with self._lock:
             if not self.path.exists():
                 return
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("jobs", []), list):
+                    raise ValueError("unexpected structure")
+                jobs = [QueueJob(**job) for job in data.get("jobs", [])]
+            except (OSError, ValueError, TypeError) as exc:
+                # never crash or silently drop: keep the damaged file and start an empty queue
+                from .app_paths import quarantine
+                quarantine(self.path, str(exc)[:80])
+                self.jobs, self.paused = [], False
+                return
             self.paused = bool(data.get("paused", False))
-            self.jobs = [QueueJob(**job) for job in data.get("jobs", [])]
+            self.jobs = jobs
             for job in self.jobs:
                 if job.state == RUNNING:  # interrupted by a crash/exit: run it again
                     job.state, job.started = PENDING, None

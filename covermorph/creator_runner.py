@@ -136,5 +136,7 @@ class StudioRunner:
         self.on_change()
 
 
-def queue_path(output_root: Path) -> Path:
-    return Path(output_root) / "studio_queue.json"
+def queue_path(output_root: Path | None = None) -> Path:
+    """The queue lives with the per-user settings (survives rebuilds and output-folder changes)."""
+    from .app_paths import queue_file
+    return queue_file()

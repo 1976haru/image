@@ -1,51 +1,66 @@
-"""Creator settings saved from the UI (no environment variables needed for normal use).
+"""Studio settings, saved per user in %LOCALAPPDATA%\\CoverMorphStudio\\settings.json ("studio" section).
 
-``config/creator_settings.json`` next to the EXE (or repo root). Resolution order for the models folder:
-saved setting > COVERMORPH_MODELS_DIR > <app>/models. The bridge reads the same file, so a path chosen in
-the UI also works for youtubesum calls.
+They survive EXE rebuilds/updates (see app_paths). Resolution order for the models folder: saved setting >
+COVERMORPH_MODELS_DIR > <app>/models. The youtubesum bridge reads the same file, so a path chosen in the UI also
+works for bridge calls. ``app_root`` is only used to migrate settings that older builds kept in the EXE folder.
 """
 from __future__ import annotations
 
-import json
 import os
-import tempfile
 from pathlib import Path
 from typing import Any
+
+from . import app_paths
 
 DEFAULTS: dict[str, Any] = {
     "models_dir": "",
     "sdcpp_dir": "",            # blank = <models>/quality_v2/sdcpp
-    "output_dir": "",           # blank = <app>/creator_output
+    "output_dir": "",           # blank = Documents\\CoverMorphStudio
     "quality_label": "일반",
     "memory_label": "작업 중 PC 우선",
     "jpg_quality": 92,
     "auto_start_when_free": True,   # queue starts by itself when resources allow
     "require_idle_minutes": 0,      # >0: in 자리 비움 mode only start after this much keyboard/mouse idle
     "recheck_seconds": 20,
+    # remembered between sessions
+    "usage": "both",                # youtube | shopify | both (first-run wizard)
+    "setup_completed": False,
+    "last_purpose": "youtube_thumbnail",
+    "custom_sizes": {},             # purpose key -> [w, h] last used
+    "product_mode": "strict",       # strict | natural | ai (원본 그대로 / 자연광 보정 / AI 재구성)
+    "last_export_dir": "",
+    "last_project_dir": "",
+    "last_reference_dir": "",
 }
+_migrated: set[str] = set()
 
 
-def settings_file(app_root: Path) -> Path:
-    return Path(app_root) / "config" / "creator_settings.json"
+def _migrate_once(app_root: Path) -> None:
+    key = str(Path(app_root).resolve())
+    if key not in _migrated:
+        _migrated.add(key)
+        app_paths.migrate_from_app_folder(Path(app_root))
+
+
+def settings_file(app_root: Path | None = None) -> Path:
+    return app_paths.settings_file()
 
 
 def load_creator_settings(app_root: Path) -> dict[str, Any]:
-    data: dict[str, Any] = {}
+    _migrate_once(app_root)
+    data = app_paths.section("studio")
+    settings = {**DEFAULTS, **{key: data[key] for key in DEFAULTS if key in data}}
+    if not isinstance(settings["custom_sizes"], dict):
+        settings["custom_sizes"] = {}
     try:
-        data = json.loads(settings_file(app_root).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    return {**DEFAULTS, **{key: data[key] for key in DEFAULTS if key in data}}
+        settings["jpg_quality"] = max(50, min(100, int(settings["jpg_quality"])))
+    except (TypeError, ValueError):
+        settings["jpg_quality"] = DEFAULTS["jpg_quality"]
+    return settings
 
 
 def save_creator_settings(app_root: Path, settings: dict[str, Any]) -> None:
-    path = settings_file(app_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    clean = {**DEFAULTS, **{key: settings[key] for key in DEFAULTS if key in settings}}
-    fd, tmp = tempfile.mkstemp(prefix=".creator_", suffix=".json", dir=path.parent)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(clean, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    app_paths.update_section("studio", {key: settings[key] for key in DEFAULTS if key in settings})
 
 
 def resolve_models_dir(app_root: Path, settings: dict[str, Any] | None = None) -> Path:
@@ -57,7 +72,7 @@ def resolve_models_dir(app_root: Path, settings: dict[str, Any] | None = None) -
 def resolve_output_dir(app_root: Path, settings: dict[str, Any] | None = None) -> Path:
     settings = settings if settings is not None else load_creator_settings(app_root)
     configured = str(settings.get("output_dir") or "")
-    return Path(configured).expanduser() if configured else Path(app_root) / "creator_output"
+    return Path(configured).expanduser() if configured else app_paths.default_output_dir()
 
 
 def apply_backend_paths(settings: dict[str, Any]) -> None:
@@ -76,3 +91,12 @@ def engine_readiness(models_dir: Path) -> dict[str, Any]:
         engines[name] = {"ready": status["ready"],
                          "missing": [f"{k}: {v}" for k, v in status["files"].items() if not Path(v).exists()]}
     return {"engines": engines, "translator": translator_ready(models_dir)}
+
+
+def setup_needed(app_root: Path, settings: dict[str, Any] | None = None) -> bool:
+    """First-run wizard: not completed yet, or the default engines cannot be found."""
+    settings = settings if settings is not None else load_creator_settings(app_root)
+    if not settings.get("setup_completed"):
+        return True
+    ready = engine_readiness(resolve_models_dir(app_root, settings))["engines"]
+    return not (ready["zimage_turbo"]["ready"] and ready["flux2_klein_4b"]["ready"])

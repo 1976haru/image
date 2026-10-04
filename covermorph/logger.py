@@ -5,15 +5,14 @@ from pathlib import Path
 
 
 def log_dir(root: Path) -> Path:
-    primary = root / "logs"
+    """Per-user logs (%LOCALAPPDATA%\\CoverMorphStudio\\logs) so a rebuild never loses them."""
     try:
+        from .app_paths import logs_dir
+        return logs_dir()
+    except OSError:
+        primary = root / "logs"
         primary.mkdir(parents=True, exist_ok=True)
         return primary
-    except OSError:
-        fallback_base = Path(os.environ.get("LOCALAPPDATA", Path.cwd()))
-        fallback = fallback_base / "CoverMorphStudio" / "logs"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
 
 
 def write_log(root: Path, message: str) -> None:
