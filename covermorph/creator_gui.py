@@ -595,7 +595,7 @@ class StudioWindow(ctk.CTkToplevel):
         self.face_label.pack(side="left", padx=4)
         self.product_label = ctk.CTkLabel(crops, text="")
         self.product_label.pack(side="left", padx=4)
-        self.info_box = ctk.CTkTextbox(side, height=260, wrap="word")
+        self.info_box = ctk.CTkTextbox(side, height=170, wrap="word")
         self.info_box.pack(fill="x", pady=4)
         actions = ctk.CTkFrame(side, fg_color="transparent")
         actions.pack(fill="x", pady=4)
